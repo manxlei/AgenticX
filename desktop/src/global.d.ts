@@ -116,6 +116,7 @@ type AvatarItem = {
   system_prompt?: string;
   tools_enabled?: Record<string, boolean>;
   skills_enabled?: Record<string, boolean> | null;
+  brains_enabled?: "*" | string[] | null;
   /** Default provider/model the avatar falls back to when a session has none. */
   default_provider?: string;
   default_model?: string;
@@ -325,6 +326,7 @@ declare global {
       getApiBase: () => Promise<string>;
       getApiAuthToken: () => Promise<string>;
       platform: () => Promise<string>;
+      syncTitleBarOverlay: (theme: "dark" | "light" | "dim") => Promise<{ ok: boolean; skipped?: boolean; error?: string }>;
       getConnectionMode: () => Promise<"local" | "remote">;
       focusModeEnter: () => Promise<{ ok: boolean; alreadyActive?: boolean; error?: string }>;
       focusModeExit: () => Promise<{ ok: boolean; alreadyInactive?: boolean; error?: string }>;
@@ -394,6 +396,7 @@ declare global {
         system_prompt?: string;
         tools_enabled?: Record<string, boolean>;
         skills_enabled?: Record<string, boolean> | null;
+        brains_enabled?: "*" | string[] | null;
         default_provider?: string;
         default_model?: string;
       }) => Promise<{ ok: boolean; avatar?: AvatarItem; error?: string }>;
@@ -415,16 +418,77 @@ declare global {
       installTool: (payload: { requestId: string; toolId: string }) => Promise<{ ok: boolean; error?: string }>;
       onToolInstallProgress: (cb: (payload: ToolInstallProgress) => void) => () => void;
 
-      listSessions: (avatarId?: string) => Promise<{ ok: boolean; sessions: Array<{ session_id: string; avatar_id: string | null; avatar_name?: string | null; session_name: string | null; updated_at: number; created_at?: number; pinned?: boolean; archived?: boolean; execution_state?: "idle" | "running" | "interrupted"; provider?: string; model?: string }> }>;
+      listSessions: (avatarId?: string) => Promise<{
+        ok: boolean;
+        sessions: Array<{
+          session_id: string;
+          avatar_id: string | null;
+          avatar_name?: string | null;
+          session_name: string | null;
+          updated_at: number;
+          created_at?: number;
+          pinned?: boolean;
+          archived?: boolean;
+          execution_state?: "idle" | "running" | "interrupted" | "failed";
+          provider?: string;
+          model?: string;
+          session_mode?: "code_dev" | "daily_office";
+          harness_phase?: "explore" | "read" | "author";
+          read_files_count?: number;
+        }>;
+      }>;
       interruptSession: (sessionId: string) => Promise<{ ok: boolean; session_id?: string; error?: string }>;
-      loadRuntimeConfig: () => Promise<{ ok: boolean; max_tool_rounds: number; auto_resume_on_exhaustion: boolean; max_auto_resumes: number; error?: string }>;
-      saveRuntimeConfig: (payload: { max_tool_rounds?: number; auto_resume_on_exhaustion?: boolean; max_auto_resumes?: number }) => Promise<{ ok: boolean; error?: string }>;
+      loadRuntimeConfig: () => Promise<{
+        ok: boolean;
+        max_tool_rounds: number;
+        auto_resume_on_exhaustion: boolean;
+        max_auto_resumes: number;
+        stall_detect_silence_seconds?: number;
+        stall_auto_nudge_enabled?: boolean;
+        stall_auto_nudge_after_seconds?: number;
+        stall_auto_nudge_max_per_session?: number;
+        unattended_enabled?: boolean;
+        unattended_max_continuations_per_session?: number;
+        unattended_max_wall_clock_hours?: number;
+        unattended_stall_continue_after_seconds?: number;
+        unattended_auto_resume_exhausted?: boolean;
+        unattended_auto_resume_interrupted?: boolean;
+        error?: string;
+      }>;
+      saveRuntimeConfig: (payload: {
+        max_tool_rounds?: number;
+        auto_resume_on_exhaustion?: boolean;
+        max_auto_resumes?: number;
+        stall_detect_silence_seconds?: number;
+        stall_auto_nudge_enabled?: boolean;
+        stall_auto_nudge_after_seconds?: number;
+        stall_auto_nudge_max_per_session?: number;
+        unattended_enabled?: boolean;
+        unattended_max_continuations_per_session?: number;
+        unattended_max_wall_clock_hours?: number;
+        unattended_stall_continue_after_seconds?: number;
+        unattended_auto_resume_exhausted?: boolean;
+        unattended_auto_resume_interrupted?: boolean;
+      }) => Promise<{ ok: boolean; error?: string }>;
       searchSessions: (payload: { q: string; avatarId?: string }) => Promise<{
         ok: boolean;
         hits?: Array<{ session_id: string; snippet: string }>;
         error?: string;
       }>;
-      createSession: (payload: { avatar_id?: string; name?: string; inherit_from_session_id?: string }) => Promise<{ ok: boolean; session_id?: string; inherited?: boolean; error?: string }>;
+      createSession: (payload: {
+        avatar_id?: string;
+        name?: string;
+        inherit_from_session_id?: string;
+        session_mode?: "code_dev" | "daily_office";
+        provider?: string;
+        model?: string;
+      }) => Promise<{
+        ok: boolean;
+        session_id?: string;
+        inherited?: boolean;
+        session_mode?: "code_dev" | "daily_office";
+        error?: string;
+      }>;
       renameSession: (payload: { sessionId: string; name: string }) => Promise<{ ok: boolean; error?: string }>;
       deleteSession: (sessionId: string) => Promise<{ ok: boolean; error?: string }>;
       deleteSessionsBatch: (sessionIds: string[]) => Promise<{ ok: boolean; deleted?: string[]; failed?: string[]; error?: string }>;
@@ -440,7 +504,9 @@ declare global {
           modelName: string;
         }>;
         activePaneId: string;
+        theme?: string;
       }>;
+      saveUiPrefs: (payload: { theme: "dark" | "light" | "dim" }) => Promise<{ ok: boolean; error?: string }>;
       saveLayout: (payload: {
         panes?: Array<{
           id: string;
@@ -521,12 +587,28 @@ declare global {
       }) => Promise<{ ok: boolean; error?: string }>;
       loadComputerUseConfig: () => Promise<{ ok: boolean; config?: ComputerUseConfig; error?: string }>;
       saveComputerUseConfig: (payload: ComputerUseConfig) => Promise<{ ok: boolean; error?: string }>;
+      loadCodeIndexConfig: () => Promise<{
+        ok: boolean;
+        config?: {
+          enabled: boolean;
+          backend: string;
+          preload_model: boolean;
+          max_index_memory_mb: number;
+          semble: {
+            search_mode: string;
+            default_top_k: number;
+            include_text_files: boolean;
+            model: string;
+          };
+        };
+        error?: string;
+      }>;
+      saveCodeIndexConfig: (payload: Record<string, unknown>) => Promise<{ ok: boolean; error?: string }>;
+      openCodeIndexModelCache: () => Promise<{ ok: boolean; path?: string; error?: string }>;
       loadTrinityConfig: () => Promise<{ ok: boolean; config?: TrinityConfig; error?: string }>;
       saveTrinityConfig: (payload: TrinityConfig) => Promise<{ ok: boolean; error?: string }>;
       loadAutomationConfig: () => Promise<{ ok: boolean; config?: AutomationConfig; error?: string }>;
       saveAutomationConfig: (payload: AutomationConfig) => Promise<{ ok: boolean; error?: string }>;
-      loadRuntimeConfig: () => Promise<{ ok: boolean; config?: RuntimeConfig; error?: string }>;
-      saveRuntimeConfig: (payload: RuntimeConfig) => Promise<{ ok: boolean; error?: string }>;
       confirmDialog: (payload: {
         title?: string;
         message: string;
@@ -639,6 +721,7 @@ declare global {
         error?: string;
       }>;
       shellOpenPath: (path: string) => Promise<{ ok: boolean; error?: string }>;
+      shellShowItemInFolder: (path: string) => Promise<{ ok: boolean; error?: string }>;
       connectMcp: (payload: { sessionId: string; name: string }) => Promise<{ ok: boolean; error?: string }>;
       disconnectMcp: (payload: { sessionId: string; name: string }) => Promise<{ ok: boolean; error?: string }>;
       saveUserMode: (mode: "pro" | "lite") => Promise<{ ok: boolean }>;

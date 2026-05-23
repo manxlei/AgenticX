@@ -41,6 +41,25 @@ _PLACEHOLDER_SESSION_TITLE_CF: frozenset[str] = frozenset(
 LLM_TITLE_SCRATCH_KEY = "__agx_llm_title_done__"
 
 from agenticx.cli.studio import StudioSession
+from agenticx.runtime.session_mode import (
+    READ_FILES_SCRATCH_PREFIX,
+    normalize_session_mode,
+    is_code_dev,
+    get_session_phase,
+)
+
+
+def _harness_list_fields(session: StudioSession) -> dict[str, Any]:
+    if not is_code_dev(session):
+        return {}
+    scratch = getattr(session, "scratchpad", None) or {}
+    read_count = 0
+    if isinstance(scratch, dict):
+        read_count = sum(1 for k in scratch if str(k).startswith(READ_FILES_SCRATCH_PREFIX))
+    return {
+        "harness_phase": get_session_phase(session),
+        "read_files_count": read_count,
+    }
 from agenticx.memory.session_store import SessionStore, session_fts_enabled
 from agenticx.runtime import AsyncConfirmGate
 from agenticx.runtime.team_manager import AgentTeamManager, SubAgentContext
@@ -84,7 +103,7 @@ class ManagedSession:
     pinned: bool = False
     archived: bool = False
     taskspaces: list[dict[str, str]] = field(default_factory=list)
-    execution_state: str = "idle"  # idle | running | interrupted
+    execution_state: str = "idle"  # idle | running | interrupted | failed
 
     def get_confirm_gate(self, agent_id: str = "meta") -> AsyncConfirmGate:
         if not agent_id or agent_id == "meta":
@@ -192,7 +211,7 @@ class SessionManager:
         return True
 
     def set_execution_state(self, session_id: str, state: str) -> None:
-        """Update execution_state for a session (idle | running | interrupted)."""
+        """Update execution_state for a session (idle | running | interrupted | failed)."""
         managed = self._sessions.get(session_id)
         if managed is not None:
             managed.execution_state = state
@@ -201,16 +220,21 @@ class SessionManager:
     def _normalize_execution_state_for_listing(self, session_id: str, state: Any) -> str:
         """Normalize execution_state for session list display.
 
-        Persisted stale `interrupted` states (left by old flows or historical data)
-        should not be shown forever. Only keep `interrupted` visible when there is
-        an active interrupt request in this process.
+        In-memory sessions keep ``interrupted`` after LLM timeout / runtime failure
+        even though ``clear_interrupt`` removed the active stop flag. Only hide
+        stale ``interrupted`` rows loaded from disk without a live managed session.
         """
         raw = str(state or "idle").strip().lower()
-        if raw not in {"idle", "running", "interrupted"}:
+        if raw not in {"idle", "running", "interrupted", "failed"}:
             raw = "idle"
-        if raw == "interrupted" and not self.should_interrupt(session_id):
-            return "idle"
-        return raw
+        if raw != "interrupted":
+            return raw
+        managed = self._sessions.get(session_id)
+        if managed is not None and str(getattr(managed, "execution_state", "")).strip().lower() == "interrupted":
+            return "interrupted"
+        if self.should_interrupt(session_id):
+            return "interrupted"
+        return "idle"
 
     def request_interrupt(self, session_id: str) -> bool:
         sid = str(session_id or "").strip()
@@ -284,21 +308,8 @@ class SessionManager:
 
     @staticmethod
     def _close_mcp_hub_sync(managed: ManagedSession) -> None:
-        hub = getattr(managed.studio_session, "mcp_hub", None)
-        if hub is None:
-            return
-        try:
-            import asyncio
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-            if loop is not None and loop.is_running():
-                loop.create_task(hub.close())
-            else:
-                asyncio.run(hub.close())
-        except Exception:
-            pass
+        """No-op: MCP children are now process-level resources owned by GlobalMcpManager.
+        They are closed once at server shutdown via GlobalMcpManager.close_all()."""
 
     def delete(self, session_id: str) -> bool:
         sid = str(session_id or "").strip()
@@ -308,7 +319,7 @@ class SessionManager:
         if managed is not None:
             if managed.team_manager is not None:
                 managed.team_manager.shutdown_now()
-            self._close_mcp_hub_sync(managed)
+            # MCP hub is global; do NOT kill child processes on session delete.
         purged = self._purge_session_state(sid)
         if managed is not None and not existed_in_persistence:
             return True
@@ -341,6 +352,10 @@ class SessionManager:
                 ),
                 "provider": str(getattr(managed.studio_session, "provider_name", "") or ""),
                 "model": str(getattr(managed.studio_session, "model_name", "") or ""),
+                "session_mode": normalize_session_mode(
+                    getattr(managed.studio_session, "session_mode", None)
+                ),
+                **_harness_list_fields(managed.studio_session),
             })
         for row in self._list_persisted_sessions():
             sid = str(row.get("session_id", "")).strip()
@@ -803,9 +818,15 @@ class SessionManager:
             self._sessions.pop(sid, None)
             if managed.team_manager is not None:
                 managed.team_manager.shutdown_now()
-            self._close_mcp_hub_sync(managed)
+            # MCP hub is global; do NOT kill child processes on session cleanup.
 
     def _restore_persisted_state(self, session_id: str, session: StudioSession) -> None:
+        try:
+            metadata = self._session_store._load_latest_session_metadata_sync(session_id)
+            if isinstance(metadata, dict) and "session_mode" in metadata:
+                session.session_mode = normalize_session_mode(str(metadata.get("session_mode")))
+        except Exception:
+            pass
         try:
             todos = self._session_store._load_todos_sync(session_id)
             if todos:
@@ -869,10 +890,14 @@ class SessionManager:
             )
         if "execution_state" in metadata:
             raw_state = str(metadata.get("execution_state", "idle")).strip().lower()
-            if raw_state in ("idle", "running", "interrupted"):
+            if raw_state in ("idle", "running", "interrupted", "failed"):
                 managed.execution_state = raw_state
             else:
                 managed.execution_state = "idle"
+        if "session_mode" in metadata:
+            managed.studio_session.session_mode = normalize_session_mode(
+                str(metadata.get("session_mode"))
+            )
 
     def _persist_session_state(self, session_id: str, session: StudioSession) -> None:
         self._ensure_session_title_from_chat_history(session_id, session)
@@ -897,6 +922,10 @@ class SessionManager:
                 "archived": bool(getattr(managed_ref, "archived", False)),
                 "taskspaces": list(getattr(managed_ref, "taskspaces", []) or []),
                 "execution_state": getattr(managed_ref, "execution_state", "idle"),
+                "session_mode": normalize_session_mode(
+                    getattr(session, "session_mode", None)
+                ),
+                **_harness_list_fields(session),
             }
             self._session_store._save_session_summary_sync(session_id, summary, metadata)
             self._save_messages_snapshot(session_id, session.chat_history or [])
@@ -994,38 +1023,115 @@ class SessionManager:
                 "timestamp": parsed_timestamp,
                 "forwarded_history": item.get("forwarded_history"),
             }
+            raw_meta = item.get("metadata")
+            if isinstance(raw_meta, dict) and raw_meta:
+                row["metadata"] = dict(raw_meta)
+            if role == "tool":
+                tool_call_id = str(
+                    item.get("tool_call_id", item.get("toolCallId", "")) or ""
+                ).strip()
+                tool_name = str(item.get("tool_name", item.get("toolName", "")) or "").strip()
+                tool_status = str(
+                    item.get("tool_status", item.get("toolStatus", "")) or ""
+                ).strip()
+                tool_group_id = str(
+                    item.get("tool_group_id", item.get("toolGroupId", "")) or ""
+                ).strip()
+                if tool_call_id:
+                    row["tool_call_id"] = tool_call_id
+                if tool_name:
+                    row["tool_name"] = tool_name
+                raw_tool_args = item.get("tool_args", item.get("toolArgs"))
+                if isinstance(raw_tool_args, dict):
+                    row["tool_args"] = raw_tool_args
+                if tool_status in {"pending", "running", "done", "error", "cancelled"}:
+                    row["tool_status"] = tool_status
+                raw_elapsed = item.get("tool_elapsed_sec", item.get("toolElapsedSec"))
+                try:
+                    elapsed = int(raw_elapsed) if raw_elapsed is not None else None
+                except (TypeError, ValueError):
+                    elapsed = None
+                if elapsed is not None and elapsed >= 0:
+                    row["tool_elapsed_sec"] = elapsed
+                preview = str(
+                    item.get("tool_result_preview", item.get("toolResultPreview", "")) or ""
+                ).strip()
+                if preview:
+                    row["tool_result_preview"] = preview
+                if tool_group_id:
+                    row["tool_group_id"] = tool_group_id
+                raw_stream = item.get("tool_stream_lines", item.get("toolStreamLines"))
+                if isinstance(raw_stream, list):
+                    row["tool_stream_lines"] = [str(line) for line in raw_stream[:200]]
             raw_atts = item.get("attachments")
             if isinstance(raw_atts, list) and raw_atts:
                 clean_atts: list[dict[str, Any]] = []
-                for a in raw_atts[:8]:
+                image_n = 0
+                file_n = 0
+                for a in raw_atts[:24]:
                     if not isinstance(a, dict):
                         continue
                     du = str(a.get("data_url", "")).strip()
-                    if not du.startswith("data:image/") or len(du) > max_data_url:
+                    kind = str(a.get("kind", "") or "").strip()
+                    is_context = kind == "context_file"
+                    if du.startswith("data:image/") and len(du) <= max_data_url:
+                        if image_n >= 4:
+                            continue
+                        mime = str(a.get("mime_type", "") or "").strip()
+                        if not mime and du.startswith("data:"):
+                            semi = du.find(";")
+                            if semi > 5:
+                                mime = du[5:semi]
+                        if not mime:
+                            mime = "image/png"
+                        try:
+                            sz = int(a.get("size", 0) or 0)
+                        except (TypeError, ValueError):
+                            sz = 0
+                        clean_atts.append(
+                            {
+                                "name": str(a.get("name", "") or "").strip() or "image",
+                                "mime_type": mime,
+                                "size": sz,
+                                "data_url": du,
+                            }
+                        )
+                        image_n += 1
                         continue
-                    mime = str(a.get("mime_type", "") or "").strip()
-                    if not mime and du.startswith("data:"):
-                        semi = du.find(";")
-                        if semi > 5:
-                            mime = du[5:semi]
-                    if not mime:
-                        mime = "image/png"
-                    try:
-                        sz = int(a.get("size", 0) or 0)
-                    except (TypeError, ValueError):
-                        sz = 0
-                    clean_atts.append(
-                        {
-                            "name": str(a.get("name", "") or "").strip() or "image",
+                    if is_context or (not du and str(a.get("name", "") or "").strip()):
+                        name = str(a.get("name", "") or "").strip()
+                        if not name:
+                            continue
+                        if file_n >= 8:
+                            continue
+                        sp = str(a.get("source_path", "") or "").strip()
+                        rt = bool(a.get("reference_token", False))
+                        crl = str(a.get("composer_ref_label", "") or "").strip()
+                        mime = str(a.get("mime_type", "") or "").strip() or "application/octet-stream"
+                        try:
+                            sz = int(a.get("size", 0) or 0)
+                        except (TypeError, ValueError):
+                            sz = 0
+                        att_dict = {
+                            "name": name,
                             "mime_type": mime,
                             "size": sz,
-                            "data_url": du,
+                            "source_path": sp,
+                            "reference_token": rt,
+                            "kind": "context_file",
                         }
-                    )
-                    if len(clean_atts) >= 4:
-                        break
+                        if crl:
+                            att_dict["composer_ref_label"] = crl
+                        clean_atts.append(att_dict)
+                        file_n += 1
                 if clean_atts:
                     row["attachments"] = clean_atts
+            if role == "assistant":
+                raw_sq = item.get("suggested_questions")
+                if isinstance(raw_sq, list) and raw_sq:
+                    row["suggested_questions"] = [
+                        str(x).strip() for x in raw_sq[:5] if str(x).strip()
+                    ]
             normalized.append(row)
         return normalized
 

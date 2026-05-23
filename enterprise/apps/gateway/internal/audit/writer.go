@@ -34,12 +34,35 @@ type Event struct {
 	Provider     string      `json:"provider,omitempty"`
 	Model        string      `json:"model,omitempty"`
 	Route        string      `json:"route"`
+	ChannelID       string      `json:"channel_id,omitempty"`
+	ChannelKeyRef   string      `json:"channel_key_ref,omitempty"`
+	APITokenID      int64       `json:"api_token_id,omitempty"`
+	AttemptIndex int         `json:"attempt_index,omitempty"`
+	RetryReason  string      `json:"retry_reason,omitempty"`
+	InboundProtocol  string  `json:"inbound_protocol,omitempty"`
+	OutboundProtocol string  `json:"outbound_protocol,omitempty"`
+	ReasoningEffort  string  `json:"reasoning_effort,omitempty"`
+	ThinkingMode     string  `json:"thinking_mode,omitempty"`
+	CacheLayer           string  `json:"cache_layer,omitempty"`
+	CacheKeyHash         string  `json:"cache_key_hash,omitempty"`
+	SemanticSimilarity   float64 `json:"semantic_similarity,omitempty"`
+	LatencyMSUpstream    int64   `json:"latency_ms_upstream,omitempty"`
+	EstimatedTokens int      `json:"estimated_tokens,omitempty"`
+	ActualTokens    int      `json:"actual_tokens,omitempty"`
+	SettleDelta     int64     `json:"settle_delta,omitempty"`
+	Attempts     json.RawMessage `json:"attempts,omitempty"`
 	InputTokens  int         `json:"input_tokens,omitempty"`
 	OutputTokens int         `json:"output_tokens,omitempty"`
 	TotalTokens  int         `json:"total_tokens,omitempty"`
 	LatencyMS    int64       `json:"latency_ms,omitempty"`
 	Digest       *Digest     `json:"digest,omitempty"`
 	PoliciesHit  []PolicyHit `json:"policies_hit,omitempty"`
+	MCPStatus      string      `json:"mcp_status,omitempty"`
+	MCPServer      string      `json:"mcp_server,omitempty"`
+	MCPToolName    string      `json:"mcp_tool_name,omitempty"`
+	MCPInputHash   string      `json:"mcp_input_hash,omitempty"`
+	MCPOutputHash  string      `json:"mcp_output_hash,omitempty"`
+	PluginsInvoked []string    `json:"plugins_invoked,omitempty"`
 	PrevChecksum string      `json:"prev_checksum"`
 	Checksum     string      `json:"checksum"`
 }
@@ -62,7 +85,10 @@ func NewFileWriter(dir string) *FileWriter {
 	return &FileWriter{dir: dir}
 }
 
-func (w *FileWriter) Write(event Event) error {
+func (w *FileWriter) Write(event *Event) error {
+	if event == nil {
+		return os.ErrInvalid
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 

@@ -15,15 +15,18 @@ $DistArchDir = Join-Path $PackagingDir 'dist\win-amd64'
 $WorkArchDir = Join-Path $PackagingDir 'build\win-amd64'
 $BundledDir = Join-Path $DesktopDir 'bundled-backend\win-amd64'
 $SkipPyInstaller = ($env:SKIP_BACKEND -eq '1')
-
+Write-Host "$ProjectRoot[desktop-runtime]"
 function Find-PythonLauncher {
     $ver = 'import sys; raise SystemExit(0 if sys.version_info>=(3,10) else 1)'
     $py = Get-Command py -ErrorAction SilentlyContinue
     if ($py) {
-        & $py.Source @('-3.12', '-c', $ver) 2>$null
-        if ($LASTEXITCODE -eq 0) { return @{ Kind = 'py312'; Exe = $py.Source } }
+        # Try 3.13 first (most likely available), then 3.12
+        foreach ($verFlag in @('-3.13', '-3.12')) {
+            & $py.Source @($verFlag, '-c', $ver) 2>$null
+            if ($LASTEXITCODE -eq 0) { return @{ Kind = 'py3'; Exe = $py.Source; VerFlag = $verFlag } }
+        }
     }
-    foreach ($name in @('python3.12', 'python3', 'python')) {
+    foreach ($name in @('python3.13', 'python3.12', 'python3', 'python')) {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
         if (-not $cmd) { continue }
         & $cmd.Source '-c' $ver 2>$null
@@ -33,6 +36,8 @@ function Find-PythonLauncher {
 }
 
 Write-Host '=== Building Machi (Windows x64, bundled backend) ==='
+
+$env:PIP_DISABLE_PIP_VERSION_CHECK='1'
 
 $PyLaunch = Find-PythonLauncher
 if (-not $PyLaunch) {
@@ -44,26 +49,62 @@ $VenvPip = Join-Path $VenvDir 'Scripts\pip.exe'
 
 if (-not (Test-Path $VenvPython)) {
     Write-Host '--- Creating packaging venv ---'
-    if ($PyLaunch.Kind -eq 'py312') {
-        & $PyLaunch.Exe @('-3.12', '-m', 'venv', $VenvDir)
+    if ($PyLaunch.VerFlag) {
+        & $PyLaunch.Exe @($PyLaunch.VerFlag, '-m', 'venv', $VenvDir)
     } else {
         & $PyLaunch.Exe @('-m', 'venv', $VenvDir)
     }
 }
 
-& $VenvPip install -q -U pip
-& $VenvPip install -q pyinstaller
+# Upgrade pip + install pyinstaller silently (suppress all output and ignore exit code)
+$pipUpgradePsi = New-Object System.Diagnostics.ProcessStartInfo
+$pipUpgradePsi.FileName = $VenvPip
+$pipUpgradePsi.Arguments = 'install -q -U pip'
+$pipUpgradePsi.RedirectStandardOutput = $true
+$pipUpgradePsi.RedirectStandardError = $true
+$pipUpgradePsi.UseShellExecute = $false
+$pipUpgradePsi.CreateNoWindow = $true
+$pipUpgrade = [System.Diagnostics.Process]::Start($pipUpgradePsi)
+$pipUpgrade.WaitForExit()
+
+$pyinstallerPsi = New-Object System.Diagnostics.ProcessStartInfo
+$pyinstallerPsi.FileName = $VenvPip
+$pyinstallerPsi.Arguments = 'install -q pyinstaller'
+$pyinstallerPsi.RedirectStandardOutput = $true
+$pyinstallerPsi.RedirectStandardError = $true
+$pyinstallerPsi.UseShellExecute = $false
+$pyinstallerPsi.CreateNoWindow = $true
+$pyinstallerProc = [System.Diagnostics.Process]::Start($pyinstallerPsi)
+$pyinstallerProc.WaitForExit()
 
 $ExePath = Join-Path $DistArchDir 'agx-server.exe'
 $HaveCachedBackend = Test-Path $ExePath
 
 if (-not $SkipPyInstaller) {
+
     Write-Host '--- Step 1: PyInstaller (agx-server.exe) ---'
-    & $VenvPip uninstall -y agenticx 2>$null
+    # Uninstall agenticx silently (ignore if not installed)
+    $uninstallPsi = New-Object System.Diagnostics.ProcessStartInfo
+    $uninstallPsi.FileName = $VenvPip
+    $uninstallPsi.Arguments = 'uninstall -y agenticx'
+    $uninstallPsi.RedirectStandardOutput = $true
+    $uninstallPsi.RedirectStandardError = $true
+    $uninstallPsi.UseShellExecute = $false
+    $uninstallPsi.CreateNoWindow = $true
+    $uninstallProc = [System.Diagnostics.Process]::Start($uninstallPsi)
+    $uninstallProc.WaitForExit() | Out-Null
     # Install with `desktop-runtime` extras so the bundled exe ships with PDF /
     # Office readers and numpy (GitHub issue #10: "Document ingestion fails for
     # PDF files (missing PDF reader libs / missing numpy)" on Windows).
-    & $VenvPip install -q "$ProjectRoot[desktop-runtime]"
+    $installPsi = New-Object System.Diagnostics.ProcessStartInfo
+    $installPsi.FileName = $VenvPip
+    $installPsi.Arguments = "install -q $ProjectRoot[desktop-runtime]"
+    $installPsi.RedirectStandardOutput = $true
+    $installPsi.RedirectStandardError = $true
+    $installPsi.UseShellExecute = $false
+    $installPsi.CreateNoWindow = $true
+    $installProc = [System.Diagnostics.Process]::Start($installPsi)
+    $installProc.WaitForExit() | Out-Null
 
     New-Item -ItemType Directory -Force -Path $DistArchDir | Out-Null
     New-Item -ItemType Directory -Force -Path $WorkArchDir | Out-Null

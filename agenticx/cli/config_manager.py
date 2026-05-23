@@ -122,6 +122,19 @@ class ExtensionsConfig:
 
 
 @dataclass
+class LongRunSettings:
+    """Optional Symphony-style long-running task orchestration."""
+
+    enabled: bool = False
+    workspace_root: str = "~/.agenticx/task-workspaces"
+    stall_threshold_sec: float = 300.0
+    poll_interval_sec: float = 30.0
+    worker_session_id: str = "__longrun_worker__"
+    linear_api_key: str = ""
+    linear_team_ids: str = ""
+
+
+@dataclass
 class PermissionsConfig:
     """Tool execution permission settings.
 
@@ -154,6 +167,9 @@ class AgxConfig:
     extensions: ExtensionsConfig = field(default_factory=ExtensionsConfig)
     computer_use: ComputerUseSettings = field(default_factory=ComputerUseSettings)
     permissions: PermissionsConfig = field(default_factory=PermissionsConfig)
+    longrun: LongRunSettings = field(default_factory=LongRunSettings)
+    # Built-in web search (duckduckgo + optional API providers); see studio web_search routes.
+    web_search: Dict[str, Any] = field(default_factory=dict)
 
     def get_provider(self, name: Optional[str] = None) -> ProviderConfig:
         """Get provider config by name or default provider."""
@@ -268,6 +284,14 @@ class ConfigManager:
         if not isinstance(cu_raw, dict):
             cu_raw = {}
 
+        longrun_raw = merged.get("longrun", {}) or {}
+        if not isinstance(longrun_raw, dict):
+            longrun_raw = {}
+
+        web_search_raw = merged.get("web_search", {}) or {}
+        if not isinstance(web_search_raw, dict):
+            web_search_raw = {}
+
         config = AgxConfig(
             version=str(merged.get("version", "1")),
             default_provider=str(merged.get("default_provider", "openai")).lower(),
@@ -292,6 +316,20 @@ class ConfigManager:
                 scheduler_enabled=bool(cu_raw.get("scheduler_enabled", True)),
                 scheduler_max_concurrent=int(cu_raw.get("scheduler_max_concurrent", 5)),
             ),
+            longrun=LongRunSettings(
+                enabled=bool(longrun_raw.get("enabled", False)),
+                workspace_root=str(longrun_raw.get("workspace_root", "~/.agenticx/task-workspaces") or "").strip()
+                or "~/.agenticx/task-workspaces",
+                stall_threshold_sec=float(longrun_raw.get("stall_threshold_sec", 300.0) or 300.0),
+                poll_interval_sec=float(longrun_raw.get("poll_interval_sec", 30.0) or 30.0),
+                worker_session_id=str(
+                    longrun_raw.get("worker_session_id", "__longrun_worker__") or "__longrun_worker__"
+                ).strip()
+                or "__longrun_worker__",
+                linear_api_key=str(longrun_raw.get("linear_api_key", "") or "").strip(),
+                linear_team_ids=str(longrun_raw.get("linear_team_ids", "") or "").strip(),
+            ),
+            web_search=dict(web_search_raw),
         )
         return cls._env_fallback(config)
 
@@ -378,6 +416,17 @@ class ConfigManager:
                 value = cfg.get(secret_field)
                 if isinstance(value, str) and value:
                     cfg[secret_field] = cls._mask(value)
+        ws = merged.get("web_search")
+        if isinstance(ws, dict):
+            prov = ws.get("providers")
+            if isinstance(prov, dict):
+                for _, pcfg in prov.items():
+                    if not isinstance(pcfg, dict):
+                        continue
+                    for secret_field in ("api_key", "cx"):
+                        value = pcfg.get(secret_field)
+                        if isinstance(value, str) and value and secret_field == "api_key":
+                            pcfg[secret_field] = cls._mask(value)
         return merged
 
     @staticmethod

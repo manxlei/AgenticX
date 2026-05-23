@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { cookies } from "next/headers";
 import { getSessionFromCookies } from "../../../../lib/session";
 import { ACCESS_COOKIE } from "../../../../lib/session";
+import { isChatSessionOwned } from "../../../../lib/chat-history";
+import { toChatHistoryContext } from "../../../../lib/chat-history-http";
 
 const GATEWAY_COMPLETIONS_URL =
   process.env.GATEWAY_COMPLETIONS_URL ?? "http://127.0.0.1:8088/v1/chat/completions";
@@ -33,6 +35,33 @@ export async function POST(request: Request) {
     );
   }
 
+  const chatSessionId = request.headers.get("x-chat-session-id")?.trim();
+  if (!chatSessionId) {
+    return NextResponse.json(
+      {
+        error: {
+          code: "40001",
+          message: "missing chat session",
+        },
+      },
+      { status: 400 }
+    );
+  }
+
+  const ctx = toChatHistoryContext(session);
+  const owned = await isChatSessionOwned(ctx, chatSessionId);
+  if (!owned) {
+    return NextResponse.json(
+      {
+        error: {
+          code: "40301",
+          message: "forbidden",
+        },
+      },
+      { status: 403 }
+    );
+  }
+
   const rawBody = await request.text();
   let providerHint = "";
   let forwardBody = rawBody;
@@ -52,20 +81,34 @@ export async function POST(request: Request) {
     // body 不是 JSON 时维持原样转发
   }
 
-  const upstream = await fetch(GATEWAY_COMPLETIONS_URL, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${accessToken}`,
-      "x-tenant-id": session.tenantId,
-      "x-user-id": session.userId,
-      "x-dept-id": session.deptId ?? "",
-      "x-user-email": session.email,
-      "x-session-id": session.sessionId,
-      ...(providerHint ? { "x-agenticx-provider": providerHint } : {}),
-    },
-    body: forwardBody,
-  });
+  let upstream: Response;
+  try {
+    upstream = await fetch(GATEWAY_COMPLETIONS_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${accessToken}`,
+        "x-tenant-id": session.tenantId,
+        "x-user-id": session.userId,
+        "x-dept-id": session.deptId ?? "",
+        "x-user-email": session.email,
+        "x-session-id": session.sessionId,
+        ...(providerHint ? { "x-agenticx-provider": providerHint } : {}),
+      },
+      body: forwardBody,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : "gateway unreachable";
+    return NextResponse.json(
+      {
+        error: {
+          code: "50301",
+          message: `Gateway 不可用（${GATEWAY_COMPLETIONS_URL}）：${detail}。请确认已执行 bash scripts/start-dev.sh 且 :8088 网关进程正常。`,
+        },
+      },
+      { status: 503 },
+    );
+  }
 
   if (!upstream.ok) {
     const errorBody = await upstream.text();

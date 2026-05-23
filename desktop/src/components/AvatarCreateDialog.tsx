@@ -130,8 +130,8 @@ export function AvatarCreateDialog({ open, onClose, onCreate }: Props) {
   return (
     <>
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-        <div className="w-[440px] max-w-[95vw] rounded-xl border border-border bg-surface-panel p-5">
-        <h3 className="mb-4 text-base font-semibold text-text-primary">创建数字分身</h3>
+        <div className="agx-avatar-create-dialog w-[440px] max-w-[95vw] rounded-xl border border-border bg-surface-panel p-5">
+        <h3 className="mb-4 text-[16px] font-semibold text-text-primary">创建数字分身</h3>
 
         <div className="mb-4 flex gap-1 rounded-lg bg-surface-card p-0.5">
           {([["manual", "手动创建"], ["ai", "AI 生成"]] as const).map(([key, label]) => (

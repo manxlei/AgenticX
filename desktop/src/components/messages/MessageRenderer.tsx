@@ -6,7 +6,9 @@ import { TerminalLine } from "./TerminalLine";
 import { CleanBlock } from "./CleanBlock";
 import { ToolCallCard } from "./ToolCallCard";
 import { SystemNotice } from "./SystemNotice";
-import { TodoUpdateCard } from "../TodoUpdateCard";
+import { ContextNoticeLine } from "./ContextNoticeLine";
+import { parseContextNotice } from "../../utils/context-notice";
+import { parseTodoMessage, TodoUpdateCard } from "../TodoUpdateCard";
 
 type Props = {
   message: Message;
@@ -15,6 +17,12 @@ type Props = {
   onRevealPath?: (path: string) => void;
   assistantName?: string;
   assistantAvatarUrl?: string;
+  /** IM assistant: align with ReAct block tool column (no duplicate avatar). */
+  imAssistantVisual?: "default" | "compact-inline" | "compact-inline-with-actions";
+  /** Pass-through to ImBubble: remove inner bubble border when inside unified ReAct container. */
+  noBubbleBorder?: boolean;
+  /** IM default ToolCallCard: omit w-8 left spacer when inside ReAct work column */
+  toolCardOmitLeadingSpacer?: boolean;
   /** IM 风格下用户气泡旁显示名（默认「我」） */
   userName?: string;
   userAvatarUrl?: string;
@@ -24,9 +32,13 @@ type Props = {
   onToggleSelectMessage?: (message: Message) => void;
   onForwardMessage?: (message: Message, selectedText?: string) => void;
   onRetryMessage?: (message: Message) => void;
+  onEditMessage?: (message: Message, newContent: string) => void;
   selectable?: boolean;
   selected?: boolean;
   onResolveInlineConfirm?: (confirm: NonNullable<Message["inlineConfirm"]>, approved: boolean) => void;
+  onFollowupClick?: (text: string) => void;
+  /** When true, assistant suggested-question chips are not rendered here (parent renders them outside unified ReAct card). */
+  omitSuggestedQuestions?: boolean;
 };
 
 function extractPathFromToolResult(msg: string): string {
@@ -34,8 +46,63 @@ function extractPathFromToolResult(msg: string): string {
   return (match?.[1] ?? "").trim();
 }
 
-function isTodoUpdateToolMessage(content: string): boolean {
-  return content.includes("Todos have been modified successfully.");
+export function isTodoUpdateToolMessage(content: string): boolean {
+  return parseTodoMessage(content) !== null;
+}
+
+export function isNoisyToolStatusMessage(message: Pick<Message, "role" | "content" | "toolName">): boolean {
+  if (message.role !== "tool") return false;
+  const toolName = (message.toolName ?? "").trim();
+  if (toolName === "check_resources") return true;
+  const content = String(message.content ?? "").trim();
+  if (!toolName && /^[✅🔧⚠️❌🗣]?\s*check_resources\b/i.test(content)) return true;
+  if (toolName) return false;
+  return content === "后台任务已完成" || content === "已发送中断请求";
+}
+
+/** Shared extras row under tool cards (inline confirm + workspace reveal). */
+export function renderToolMessageExtras(
+  message: Message,
+  opts: {
+    onRevealPath?: (path: string) => void;
+    onResolveInlineConfirm?: (confirm: NonNullable<Message["inlineConfirm"]>, approved: boolean) => void;
+  }
+): ReactNode {
+  const inlineConfirm = message.inlineConfirm;
+  const inlineConfirmAction =
+    inlineConfirm && opts.onResolveInlineConfirm ? (
+      <div className="mt-1 flex items-center gap-2">
+        <button
+          type="button"
+          className="rounded border border-border bg-surface-hover px-2 py-0.5 text-[11px] text-text-strong hover:opacity-90"
+          onClick={() => opts.onResolveInlineConfirm!(inlineConfirm, true)}
+        >
+          同意
+        </button>
+        <button
+          type="button"
+          className="rounded border border-border bg-surface-hover px-2 py-0.5 text-[11px] text-text-strong hover:opacity-90"
+          onClick={() => opts.onResolveInlineConfirm!(inlineConfirm, false)}
+        >
+          拒绝
+        </button>
+      </div>
+    ) : null;
+  const path = extractPathFromToolResult(message.content);
+  return (
+    <>
+      {inlineConfirmAction}
+      {path && opts.onRevealPath ? (
+        <button
+          type="button"
+          className="rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-cyan-300 hover:bg-surface-hover"
+          onClick={() => opts.onRevealPath!(path)}
+        >
+          查看此文件
+        </button>
+      ) : null}
+    </>
+  );
 }
 
 export function MessageRenderer({
@@ -53,9 +120,15 @@ export function MessageRenderer({
   onToggleSelectMessage,
   onForwardMessage,
   onRetryMessage,
+  onEditMessage,
   selectable,
   selected,
   onResolveInlineConfirm,
+  imAssistantVisual = "default",
+  toolCardOmitLeadingSpacer = false,
+  noBubbleBorder = false,
+  onFollowupClick,
+  omitSuggestedQuestions = false,
 }: Props) {
   const chatStyle = useAppStore((s) => s.chatStyle);
   if (message.role === "user" || message.role === "assistant") {
@@ -75,6 +148,8 @@ export function MessageRenderer({
         badge={assistantBadge}
         assistantName={mergedAssistName}
         assistantAvatarUrl={message.avatarUrl || assistantAvatarUrl}
+        assistantVisual={message.role === "assistant" ? imAssistantVisual : "default"}
+        noBubbleBorder={noBubbleBorder}
         userName={userName}
         userAvatarUrl={userAvatarUrl}
         onCopyMessage={onCopyMessage}
@@ -83,61 +158,40 @@ export function MessageRenderer({
         onToggleSelectMessage={onToggleSelectMessage}
         onForwardMessage={onForwardMessage}
         onRetryMessage={onRetryMessage}
+        onEditMessage={onEditMessage}
         selectable={selectable}
         selected={selected}
+        onFollowupClick={onFollowupClick}
+        omitSuggestedQuestions={omitSuggestedQuestions}
       />
     );
   }
   if (message.role === "tool") {
+    if (isNoisyToolStatusMessage(message)) {
+      return null;
+    }
+    const contextNotice = parseContextNotice(message);
+    if (contextNotice) {
+      return <ContextNoticeLine text={contextNotice.text} />;
+    }
     if (isTodoUpdateToolMessage(message.content)) {
       return (
-        <div className="rounded-lg border border-border bg-surface-card px-3 py-2 text-xs text-text-muted">
+        <div className="rounded-lg border border-border bg-surface-card px-3 py-3 text-[13px] text-text-muted">
           <TodoUpdateCard content={message.content} />
         </div>
       );
     }
-    const inlineConfirm = message.inlineConfirm;
-    const inlineConfirmAction =
-      inlineConfirm && onResolveInlineConfirm ? (
-        <div className="mt-1 flex items-center gap-2">
-          <button
-            type="button"
-            className="rounded border border-border bg-surface-hover px-2 py-0.5 text-[11px] text-text-strong hover:opacity-90"
-            onClick={() => onResolveInlineConfirm(inlineConfirm, true)}
-          >
-            同意
-          </button>
-          <button
-            type="button"
-            className="rounded border border-border bg-surface-hover px-2 py-0.5 text-[11px] text-text-strong hover:opacity-90"
-            onClick={() => onResolveInlineConfirm(inlineConfirm, false)}
-          >
-            拒绝
-          </button>
-        </div>
-      ) : null;
-    const path = extractPathFromToolResult(message.content);
     return (
       <ToolCallCard
         message={message}
         highlightTerms={highlightTerms}
-        forceExpand={!!inlineConfirm}
+        forceExpand={!!message.inlineConfirm}
+        omitLeadingSpacer={toolCardOmitLeadingSpacer}
+        variant={noBubbleBorder ? "flat" : "default"}
         selectable={selectable}
         selected={selected}
         onToggleSelectMessage={onToggleSelectMessage}
-        action={
-          <>
-            {inlineConfirmAction}
-            {path && onRevealPath ? (
-              <button
-                className="rounded bg-surface-hover px-1.5 py-0.5 text-[10px] text-cyan-300 hover:bg-surface-hover"
-                onClick={() => onRevealPath(path)}
-              >
-                查看此文件
-              </button>
-            ) : null}
-          </>
-        }
+        action={renderToolMessageExtras(message, { onRevealPath, onResolveInlineConfirm })}
       />
     );
   }

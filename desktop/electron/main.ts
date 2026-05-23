@@ -7,6 +7,7 @@ import {
   MenuItemConstructorOptions,
   nativeImage,
   powerSaveBlocker,
+  screen,
   session,
   shell,
   Tray
@@ -219,6 +220,7 @@ type AgxConfig = {
     };
   };
   computer_use?: Record<string, unknown>;
+  code_index?: Record<string, unknown>;
   agent_harness_trinity?: {
     skill_protocol?: boolean;
     session_summary?: boolean;
@@ -321,10 +323,17 @@ type LayoutPaneSnapshot = {
   modelName: string;
 };
 
+type LayoutTheme = "dark" | "light" | "dim";
+
+function normalizeLayoutTheme(raw: unknown): LayoutTheme | undefined {
+  return raw === "light" || raw === "dark" || raw === "dim" ? raw : undefined;
+}
+
 type LayoutFile = {
   mainWindow?: LayoutBounds;
   panes?: LayoutPaneSnapshot[];
   activePaneId?: string;
+  theme?: LayoutTheme;
 };
 
 /** Disk read for the pane/window layout. Returns an empty object on any error
@@ -1305,6 +1314,31 @@ function validateTrinityConfigPayload(input: unknown): { ok: true; config: Trini
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+const WIN_TITLE_BAR_OVERLAY_HEIGHT = 44;
+type WinTitleBarTheme = "dark" | "light" | "dim";
+let winTitleBarOverlayTheme: WinTitleBarTheme = "dark";
+
+function winTitleBarOverlayForTheme(theme: WinTitleBarTheme = "dark") {
+  switch (theme) {
+    case "light":
+      return { color: "#ffffff", symbolColor: "#111827", height: WIN_TITLE_BAR_OVERLAY_HEIGHT };
+    case "dim":
+      return { color: "#1e1e1e", symbolColor: "#f6f7f9", height: WIN_TITLE_BAR_OVERLAY_HEIGHT };
+    default:
+      return { color: "#26262a", symbolColor: "#ffffff", height: WIN_TITLE_BAR_OVERLAY_HEIGHT };
+  }
+}
+
+function applyWinTitleBarOverlay(theme: WinTitleBarTheme = winTitleBarOverlayTheme): void {
+  if (process.platform !== "win32" || !mainWindow || mainWindow.isDestroyed() || focusModeActive) return;
+  try {
+    mainWindow.setTitleBarOverlay(winTitleBarOverlayForTheme(theme));
+    winTitleBarOverlayTheme = theme;
+  } catch {
+    // ignore unsupported builds
+  }
+}
+
 /** When true, the scheduled bounds save is skipped so focus-mode's tiny
  *  capsule size is never persisted to layout.json. */
 let focusModeActive = false;
@@ -2230,19 +2264,59 @@ function createWindow(): void {
     boundsOverride.x = Math.floor(savedBounds.x);
     boundsOverride.y = Math.floor(savedBounds.y);
   }
+  if (typeof boundsOverride.x === "number" && typeof boundsOverride.y === "number") {
+    const candidate = {
+      x: boundsOverride.x,
+      y: boundsOverride.y,
+      width: boundsOverride.width,
+      height: boundsOverride.height,
+    };
+    const minVisibleWidth = 120;
+    const minVisibleHeight = 80;
+    const hasVisibleIntersection = screen.getAllDisplays().some((display) => {
+      const area = display.workArea;
+      const overlapWidth = Math.max(
+        0,
+        Math.min(candidate.x + candidate.width, area.x + area.width) - Math.max(candidate.x, area.x),
+      );
+      const overlapHeight = Math.max(
+        0,
+        Math.min(candidate.y + candidate.height, area.y + area.height) - Math.max(candidate.y, area.y),
+      );
+      return overlapWidth >= minVisibleWidth && overlapHeight >= minVisibleHeight;
+    });
+    if (!hasVisibleIntersection) {
+      const primaryArea = screen.getPrimaryDisplay().workArea;
+      boundsOverride.x = Math.round(primaryArea.x + (primaryArea.width - boundsOverride.width) / 2);
+      boundsOverride.y = Math.round(primaryArea.y + Math.max(20, (primaryArea.height - boundsOverride.height) / 6));
+    }
+  }
+  const transparentMainWindow = process.platform !== "win32";
+  const mainWindowBackgroundColor = transparentMainWindow ? "#00000000" : "#14141c";
   mainWindow = new BrowserWindow({
     ...boundsOverride,
+    title: "Machi",
     minWidth: 680,
     minHeight: 480,
     show: false,
     alwaysOnTop: false,
     skipTaskbar: false,
-    transparent: true,
-    titleBarStyle: "hiddenInset",
+    transparent: transparentMainWindow,
+    autoHideMenuBar: true,
+    ...(process.platform === "darwin"
+      ? {
+          titleBarStyle: "hiddenInset" as const,
+          trafficLightPosition: { x: 14, y: 14 },
+        }
+      : process.platform === "win32"
+        ? {
+            titleBarStyle: "hidden" as const,
+            titleBarOverlay: winTitleBarOverlayForTheme("dark"),
+          }
+        : {}),
     ...(vibrancyEnabled ? { vibrancy: "under-window" as const, visualEffectState: "followWindow" as const } : {}),
-    backgroundColor: "#00000000",
+    backgroundColor: mainWindowBackgroundColor,
     roundedCorners: true,
-    trafficLightPosition: { x: 14, y: 14 },
     webPreferences: {
       preload: path.join(__dirname, "preload.js")
     }
@@ -2394,16 +2468,17 @@ function registerEarlyIpc(): void {
   ipcMain.handle("get-api-auth-token", async () => getStudioToken());
   ipcMain.handle("get-platform", async () => process.platform);
   ipcMain.handle("get-connection-mode", async () => remoteConfig ? "remote" : "local");
+  ipcMain.handle("sync-title-bar-overlay", async (_event, theme: unknown) => {
+    if (process.platform !== "win32") return { ok: true, skipped: true };
+    const mode: WinTitleBarTheme =
+      theme === "light" || theme === "dim" || theme === "dark" ? theme : "dark";
+    applyWinTitleBarOverlay(mode);
+    return { ok: true };
+  });
 
   /**
-   * Focus Mode window shrink/restore.
-   * Enter: snapshot current normal bounds, drop window minimums, resize to a
-   *   compact Perplexity-style capsule (560x132), center horizontally on the
-   *   same display the window currently lives on, keep vertical anchor near
-   *   the top third so it feels like a HUD bar. No on-disk persistence.
-   * Exit: restore the snapshot (or re-maximize if it was maximized), put the
-   *   minimum sizes back, re-enable resizing. After this returns the debounced
-   *   scheduleBoundsSave can resume persisting user-driven resizes.
+   * 「灵巧模式」胶囊窗口：右上角圆形语音 HUD（VoiceFocus）。Enter 会快照 bounds、无边框置顶透明背景；
+   * Exit 恢复最小尺寸 / 缩放 / vibrancy / 红黄绿按钮。
    */
   ipcMain.handle("focus-mode-enter", async () => {
     if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
@@ -2424,8 +2499,17 @@ function registerEarlyIpc(): void {
         // unmaximize() emits resize which we skip via focusModeActive guard
         mainWindow.unmaximize();
       }
-      mainWindow.setMinimumSize(240, 80);
+      mainWindow.setResizable(true);
+      mainWindow.setMinimumSize(160, 40);
+      mainWindow.setMaximumSize(2000, 200);
       mainWindow.setResizable(false);
+      if (process.platform === "win32") {
+        try {
+          mainWindow.setTitleBarOverlay({ color: "#14141c", symbolColor: "#ffffff", height: 0 });
+        } catch {
+          // ignore
+        }
+      }
       // macOS 专属：隐藏红绿黄；关闭系统阴影，让 CSS 自己绘制圆角+阴影。
       if (process.platform === "darwin") {
         try {
@@ -2445,16 +2529,15 @@ function registerEarlyIpc(): void {
         }
       }
       try {
-        mainWindow.setBackgroundColor("#00000000");
+        mainWindow.setBackgroundColor(process.platform === "win32" ? "#14141c" : "#00000000");
       } catch {
         // ignore
       }
       mainWindow.setHasShadow(false);
       mainWindow.setMovable(true);
-      // Perplexity 式浮动胶囊：置顶在所有普通窗口之上。
       mainWindow.setAlwaysOnTop(true, "floating");
-      const capsuleWidth = 300;
-      const capsuleHeight = 110;
+      const capsuleWidth = 192;
+      const capsuleHeight = 60;
       const { screen } = await import("electron");
       const display = screen.getDisplayMatching(baseBounds) ?? screen.getPrimaryDisplay();
       const area = display.workArea;
@@ -2467,12 +2550,22 @@ function registerEarlyIpc(): void {
         width: capsuleWidth,
         height: capsuleHeight,
       });
+      // Belt + suspenders: some macOS builds clamp setBounds height to the
+      // previous minimum; explicitly setSize after also seems to win.
+      try {
+        mainWindow.setSize(capsuleWidth, capsuleHeight, false);
+      } catch {
+        /* ignore */
+      }
       return { ok: true };
     } catch (error) {
       // Best-effort rollback to avoid leaving focus-mode state half-applied.
       focusModeActive = false;
       try {
         mainWindow.setMinimumSize(680, 480);
+        // Enter focus-mode sets setMaximumSize(2000, 200) for the capsule; must reset
+        // or the main window stays vertically capped after exit / rollback.
+        mainWindow.setMaximumSize(0, 0);
         mainWindow.setResizable(true);
         mainWindow.setAlwaysOnTop(false);
         mainWindow.setHasShadow(true);
@@ -2499,6 +2592,9 @@ function registerEarlyIpc(): void {
         if (focusModeWasMaximized) {
           mainWindow.maximize();
         }
+        if (process.platform === "win32") {
+          applyWinTitleBarOverlay(winTitleBarOverlayTheme);
+        }
       } catch {
         // ignore rollback failures
       }
@@ -2508,39 +2604,13 @@ function registerEarlyIpc(): void {
     }
   });
 
-  ipcMain.handle("focus-mode-expand", async () => {
-    if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
-    if (!focusModeActive) return { ok: true, alreadyInactive: true };
-    try {
-      const bounds = mainWindow.getBounds();
-      const expandedHeight = 600; // 高度撑开容纳消息流
-      // 如果当前高度已经达到或超过，就不做处理
-      if (bounds.height >= expandedHeight) return { ok: true };
-      
-      try {
-        // Keep transparent background so acrylic/vibrancy can show through.
-        mainWindow.setBackgroundColor("#00000000");
-      } catch {
-        // ignore
-      }
-
-      mainWindow.setBounds({
-        x: bounds.x,
-        y: bounds.y,
-        width: bounds.width,
-        height: expandedHeight,
-      });
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: String(error) };
-    }
-  });
-
   ipcMain.handle("focus-mode-exit", async () => {
     if (!mainWindow || mainWindow.isDestroyed()) return { ok: false };
     if (!focusModeActive) return { ok: true, alreadyInactive: true };
     try {
       mainWindow.setMinimumSize(680, 480);
+      // Clears focus-mode capsule cap (setMaximumSize(2000, 200)); otherwise height stays locked ~200.
+      mainWindow.setMaximumSize(0, 0);
       mainWindow.setResizable(true);
       if (process.platform === "darwin") {
         try {
@@ -2561,7 +2631,7 @@ function registerEarlyIpc(): void {
         }
       }
       try {
-        mainWindow.setBackgroundColor("#00000000");
+        mainWindow.setBackgroundColor(process.platform === "win32" ? "#14141c" : "#00000000");
       } catch {
         // ignore
       }
@@ -2577,6 +2647,9 @@ function registerEarlyIpc(): void {
       focusModeWasMaximized = false;
       // Flip the flag LAST so any resize events above are still suppressed.
       focusModeActive = false;
+      if (process.platform === "win32") {
+        applyWinTitleBarOverlay(winTitleBarOverlayTheme);
+      }
       return { ok: true };
     } catch (error) {
       focusModeActive = false;
@@ -3218,7 +3291,19 @@ function registerIpc(): void {
     }
   });
 
-  ipcMain.handle("create-session", async (_event, payload: { avatar_id?: string; name?: string; inherit_from_session_id?: string }) => {
+  ipcMain.handle(
+    "create-session",
+    async (
+      _event,
+      payload: {
+        avatar_id?: string;
+        name?: string;
+        inherit_from_session_id?: string;
+        session_mode?: "code_dev" | "daily_office";
+        provider?: string;
+        model?: string;
+      }
+    ) => {
     try {
       const resp = await fetch(`${getStudioUrl()}/api/sessions`, {
         method: "POST",
@@ -3328,11 +3413,24 @@ function registerIpc(): void {
 
   ipcMain.handle("layout-get", async () => {
     const data = loadLayoutData();
+    const theme = normalizeLayoutTheme(data.theme);
     return {
       ok: true,
       panes: Array.isArray(data.panes) ? data.panes : [],
       activePaneId: typeof data.activePaneId === "string" ? data.activePaneId : "",
+      theme: theme ?? "",
     };
+  });
+
+  ipcMain.handle("ui-prefs-set", async (_event, payload: { theme?: unknown }) => {
+    try {
+      const theme = normalizeLayoutTheme(payload?.theme);
+      if (!theme) return { ok: false, error: "invalid theme" };
+      saveLayoutData({ theme });
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
   });
 
   ipcMain.handle("layout-set", async (_event, payload: { panes?: LayoutPaneSnapshot[]; activePaneId?: string }) => {
@@ -3743,6 +3841,70 @@ function registerIpc(): void {
     }
   });
 
+  const clampStallDetectSeconds = (raw: unknown) => {
+    const envDetect = process.env.AGX_STALL_DETECT_SILENCE_SECONDS;
+    const n =
+      envDetect !== undefined ? Number(envDetect) : Number(raw ?? 90);
+    if (!Number.isFinite(n)) return 90;
+    return Math.max(30, Math.min(300, Math.round(n)));
+  };
+
+  const readUnattendedRuntime = (raw: Record<string, unknown>) => {
+    const nested =
+      raw.unattended && typeof raw.unattended === "object" && !Array.isArray(raw.unattended)
+        ? (raw.unattended as Record<string, unknown>)
+        : {};
+    const pick = (key: string, flatKey: string, fallback: unknown) =>
+      nested[key] ?? raw[flatKey] ?? fallback;
+    const maxCont = Number(pick("max_continuations_per_session", "unattended_max_continuations_per_session", 20));
+    const maxHours = Number(pick("max_wall_clock_hours", "unattended_max_wall_clock_hours", 6));
+    const stallAfter = Number(pick("stall_continue_after_seconds", "unattended_stall_continue_after_seconds", 120));
+    return {
+      unattended_enabled: Boolean(pick("enabled", "unattended_enabled", false)),
+      unattended_max_continuations_per_session: Number.isFinite(maxCont)
+        ? Math.max(1, Math.min(100, Math.round(maxCont)))
+        : 20,
+      unattended_max_wall_clock_hours: Number.isFinite(maxHours)
+        ? Math.max(0.5, Math.min(48, maxHours))
+        : 6,
+      unattended_stall_continue_after_seconds: Number.isFinite(stallAfter)
+        ? Math.max(30, Math.min(600, Math.round(stallAfter)))
+        : 120,
+      unattended_auto_resume_exhausted: Boolean(
+        pick("auto_resume_exhausted", "unattended_auto_resume_exhausted", true),
+      ),
+      unattended_auto_resume_interrupted: Boolean(
+        pick("auto_resume_interrupted", "unattended_auto_resume_interrupted", true),
+      ),
+    };
+  };
+
+  const readStallNudgeRuntime = (raw: Record<string, unknown>) => {
+    const detectSec = clampStallDetectSeconds(raw.stall_detect_silence_seconds);
+    const envEnabled = process.env.AGX_STALL_AUTO_NUDGE_ENABLED;
+    const envAfter = process.env.AGX_STALL_AUTO_NUDGE_AFTER_SECONDS;
+    const envMax = process.env.AGX_STALL_AUTO_NUDGE_MAX_PER_SESSION;
+    const enabledFromEnv =
+      envEnabled === "1" ? true : envEnabled === "0" ? false : undefined;
+    const afterRaw = envAfter !== undefined ? Number(envAfter) : Number(raw.stall_auto_nudge_after_seconds ?? 120);
+    const maxRaw = envMax !== undefined ? Number(envMax) : Number(raw.stall_auto_nudge_max_per_session ?? 2);
+    let afterSec = Number.isFinite(afterRaw)
+      ? Math.max(60, Math.min(300, Math.round(afterRaw)))
+      : 120;
+    if (afterSec < detectSec) afterSec = detectSec;
+    return {
+      stall_detect_silence_seconds: detectSec,
+      stall_auto_nudge_enabled:
+        enabledFromEnv !== undefined
+          ? enabledFromEnv
+          : Boolean(raw.stall_auto_nudge_enabled ?? false),
+      stall_auto_nudge_after_seconds: afterSec,
+      stall_auto_nudge_max_per_session: Number.isFinite(maxRaw)
+        ? Math.max(1, Math.min(5, Math.round(maxRaw)))
+        : 2,
+    };
+  };
+
   ipcMain.handle("load-runtime-config", async () => {
     try {
       const cfg = loadAgxConfig();
@@ -3756,9 +3918,27 @@ function registerIpc(): void {
         max_tool_rounds: Number.isFinite(val) ? Math.max(10, Math.min(120, val)) : 30,
         auto_resume_on_exhaustion: Boolean(raw.auto_resume_on_exhaustion ?? false),
         max_auto_resumes: Math.max(0, Math.min(10, Number(raw.max_auto_resumes ?? 3))),
+        ...readStallNudgeRuntime(raw),
+        ...readUnattendedRuntime(raw),
       };
     } catch (err) {
-      return { ok: false, error: String(err), max_tool_rounds: 30, auto_resume_on_exhaustion: false, max_auto_resumes: 3 };
+      return {
+        ok: false,
+        error: String(err),
+        max_tool_rounds: 30,
+        auto_resume_on_exhaustion: false,
+        max_auto_resumes: 3,
+        stall_detect_silence_seconds: 90,
+        stall_auto_nudge_enabled: false,
+        stall_auto_nudge_after_seconds: 120,
+        stall_auto_nudge_max_per_session: 2,
+        unattended_enabled: false,
+        unattended_max_continuations_per_session: 20,
+        unattended_max_wall_clock_hours: 6,
+        unattended_stall_continue_after_seconds: 120,
+        unattended_auto_resume_exhausted: true,
+        unattended_auto_resume_interrupted: true,
+      };
     }
   });
 
@@ -3784,9 +3964,148 @@ function registerIpc(): void {
         const v = Number(p.max_auto_resumes);
         if (Number.isFinite(v)) merged.max_auto_resumes = Math.max(0, Math.min(10, Math.round(v)));
       }
+      if (p.stall_detect_silence_seconds !== undefined) {
+        merged.stall_detect_silence_seconds = clampStallDetectSeconds(
+          p.stall_detect_silence_seconds,
+        );
+      }
+      const detectSec = clampStallDetectSeconds(merged.stall_detect_silence_seconds);
+      merged.stall_detect_silence_seconds = detectSec;
+      if (p.stall_auto_nudge_enabled !== undefined) {
+        merged.stall_auto_nudge_enabled = Boolean(p.stall_auto_nudge_enabled);
+      }
+      if (p.stall_auto_nudge_after_seconds !== undefined) {
+        const v = Number(p.stall_auto_nudge_after_seconds);
+        if (Number.isFinite(v)) {
+          let after = Math.max(60, Math.min(300, Math.round(v)));
+          if (after < detectSec) after = detectSec;
+          merged.stall_auto_nudge_after_seconds = after;
+        }
+      } else if (
+        Number(merged.stall_auto_nudge_after_seconds) > 0 &&
+        Number(merged.stall_auto_nudge_after_seconds) < detectSec
+      ) {
+        merged.stall_auto_nudge_after_seconds = detectSec;
+      }
+      if (p.stall_auto_nudge_max_per_session !== undefined) {
+        const v = Number(p.stall_auto_nudge_max_per_session);
+        if (Number.isFinite(v)) {
+          merged.stall_auto_nudge_max_per_session = Math.max(1, Math.min(5, Math.round(v)));
+        }
+      }
+      const unattendedPrev =
+        merged.unattended && typeof merged.unattended === "object" && !Array.isArray(merged.unattended)
+          ? { ...(merged.unattended as Record<string, unknown>) }
+          : {};
+      const unattendedMerged: Record<string, unknown> = { ...unattendedPrev };
+      if (p.unattended_enabled !== undefined) {
+        unattendedMerged.enabled = Boolean(p.unattended_enabled);
+      }
+      if (p.unattended_max_continuations_per_session !== undefined) {
+        const v = Number(p.unattended_max_continuations_per_session);
+        if (Number.isFinite(v)) {
+          unattendedMerged.max_continuations_per_session = Math.max(1, Math.min(100, Math.round(v)));
+        }
+      }
+      if (p.unattended_max_wall_clock_hours !== undefined) {
+        const v = Number(p.unattended_max_wall_clock_hours);
+        if (Number.isFinite(v)) {
+          unattendedMerged.max_wall_clock_hours = Math.max(0.5, Math.min(48, v));
+        }
+      }
+      if (p.unattended_stall_continue_after_seconds !== undefined) {
+        const v = Number(p.unattended_stall_continue_after_seconds);
+        if (Number.isFinite(v)) {
+          unattendedMerged.stall_continue_after_seconds = Math.max(30, Math.min(600, Math.round(v)));
+        }
+      }
+      if (p.unattended_auto_resume_exhausted !== undefined) {
+        unattendedMerged.auto_resume_exhausted = Boolean(p.unattended_auto_resume_exhausted);
+      }
+      if (p.unattended_auto_resume_interrupted !== undefined) {
+        unattendedMerged.auto_resume_interrupted = Boolean(p.unattended_auto_resume_interrupted);
+      }
+      if (Object.keys(unattendedMerged).length > 0) {
+        merged.unattended = unattendedMerged;
+      }
       root.runtime = merged;
       saveAgxConfig(cfg);
       return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("load-code-index-config", async () => {
+    try {
+      const cfg = loadAgxConfig();
+      const raw = cfg.code_index;
+      const ci = raw && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>)
+        : {};
+      const sem =
+        ci.semble && typeof ci.semble === "object" && !Array.isArray(ci.semble)
+          ? (ci.semble as Record<string, unknown>)
+          : {};
+      return {
+        ok: true,
+        config: {
+          enabled: Boolean(ci.enabled ?? false),
+          backend: String(ci.backend ?? "semble"),
+          preload_model: Boolean(ci.preload_model ?? false),
+          max_index_memory_mb: Number(ci.max_index_memory_mb ?? 1024) || 1024,
+          semble: {
+            search_mode: String(sem.search_mode ?? "hybrid"),
+            default_top_k: Number(sem.default_top_k ?? 10) || 10,
+            include_text_files: Boolean(sem.include_text_files ?? false),
+            model: String(sem.model ?? "minishlab/potion-code-16M"),
+          },
+        },
+      };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("save-code-index-config", async (_event, payload: unknown) => {
+    if (!payload || typeof payload !== "object") return { ok: false, error: "invalid payload" };
+    const p = payload as Record<string, unknown>;
+    try {
+      const cfg = loadAgxConfig();
+      const root = cfg as Record<string, unknown>;
+      const prev = root.code_index;
+      const merged =
+        prev && typeof prev === "object" && !Array.isArray(prev)
+          ? { ...(prev as Record<string, unknown>) }
+          : {};
+      if (p.enabled !== undefined) merged.enabled = Boolean(p.enabled);
+      if (p.backend !== undefined) merged.backend = String(p.backend);
+      if (p.preload_model !== undefined) merged.preload_model = Boolean(p.preload_model);
+      if (p.max_index_memory_mb !== undefined) {
+        const v = Number(p.max_index_memory_mb);
+        if (Number.isFinite(v)) merged.max_index_memory_mb = Math.max(128, Math.min(8192, Math.round(v)));
+      }
+      if (p.semble && typeof p.semble === "object" && !Array.isArray(p.semble)) {
+        const semPrev =
+          merged.semble && typeof merged.semble === "object" && !Array.isArray(merged.semble)
+            ? { ...(merged.semble as Record<string, unknown>) }
+            : {};
+        merged.semble = { ...semPrev, ...(p.semble as Record<string, unknown>) };
+      }
+      root.code_index = merged;
+      saveAgxConfig(cfg);
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle("open-code-index-model-cache", async () => {
+    const dir = path.join(os.homedir(), ".cache", "huggingface", "hub");
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      await shell.openPath(dir);
+      return { ok: true, path: dir };
     } catch (err) {
       return { ok: false, error: String(err) };
     }
@@ -4128,7 +4447,8 @@ function registerIpc(): void {
 
   ipcMain.handle("load-mcp-status", async (_event, sessionId: string) => {
     const sid = String(sessionId || "").trim();
-    if (!sid) return { ok: false, error: "missing sessionId", servers: [] };
+    // Empty sid is allowed: backend falls back to process-level configs so the
+    // Settings panel can render before any session is bound (FR-2).
     try {
       const resp = await fetch(
         `${getStudioUrl()}/api/mcp/servers?session_id=${encodeURIComponent(sid)}`,
@@ -4387,6 +4707,17 @@ function registerIpc(): void {
     try {
       const err = await shell.openPath(target);
       if (err) return { ok: false, error: err };
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: String(e) };
+    }
+  });
+
+  ipcMain.handle("shell-show-item-in-folder", async (_event, fullPath: string) => {
+    const fsPath = path.normalize(String(fullPath || "").trim());
+    if (!fsPath) return { ok: false, error: "path is required" };
+    try {
+      shell.showItemInFolder(fsPath);
       return { ok: true };
     } catch (e) {
       return { ok: false, error: String(e) };
@@ -5159,7 +5490,11 @@ if (!gotTheLock) {
 
   app.whenReady().then(async () => {
     try {
-      Menu.setApplicationMenu(Menu.buildFromTemplate(buildMenuTemplate()));
+      if (process.platform === "win32" || process.platform === "linux") {
+        Menu.setApplicationMenu(null);
+      } else {
+        Menu.setApplicationMenu(Menu.buildFromTemplate(buildMenuTemplate()));
+      }
       if (process.platform === "darwin") {
         const iconPath = app.isPackaged
           ? path.join(process.resourcesPath, "assets", "icon.png")

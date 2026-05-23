@@ -32,6 +32,7 @@ import {
   Eye,
   EyeOff,
   Library,
+  Mic,
 } from "lucide-react";
 import { Panel } from "./ds/Panel";
 import { Modal } from "./ds/Modal";
@@ -50,6 +51,14 @@ import {
   RUNTIME_MAX_TOOL_ROUNDS,
   RUNTIME_MIN_TOOL_ROUNDS,
 } from "./automation/RuntimeConfigSection";
+import {
+  StallNudgeConfigSection,
+  type StallNudgeConfig,
+} from "./automation/StallNudgeConfigSection";
+import {
+  UnattendedConfigSection,
+  type UnattendedConfig,
+} from "./automation/UnattendedConfigSection";
 import { AccountTab } from "./AccountTab";
 import { KnowledgeSettings, type KnowledgeSettingsHandle } from "./settings/knowledge/KnowledgeSettings";
 import { getProviderDisplayName, makeCustomOpenAIProviderId } from "../utils/provider-display";
@@ -57,6 +66,17 @@ import type { SettingsTab } from "../settings-tab";
 import type { MCPDiscoveryHit } from "./settings/mcp/MCPDiscoveryPanel";
 import { MCPMarketplacePanel } from "./settings/mcp/MCPMarketplacePanel";
 import { MCPJsonEditorModal } from "./settings/mcp/MCPJsonEditorModal";
+import { WebSearchSettingsPanel, SuggestedQuestionsSettingsPanel } from "./settings/WebSearchSettingsPanel";
+import {
+  VoiceSettingsPanel,
+  type VoiceSettingsPanelHandle,
+} from "./settings/voice/VoiceSettingsPanel";
+import {
+  clampSettingsPanelSize,
+  loadSettingsPanelSize,
+  saveSettingsPanelSize,
+  type SettingsPanelSize,
+} from "../utils/settings-panel-size";
 export type { SettingsTab } from "../settings-tab";
 
 export type FavoriteForwardContext = {
@@ -374,7 +394,7 @@ function SkillRowButton({
           ? "border-[var(--settings-accent-border-strong)] bg-[var(--settings-accent-subtle-bg)]"
           : skill.name === recentMarketSkillName
             ? "border-amber-500/35 bg-amber-500/5"
-            : "border-border bg-surface-card hover:bg-surface-hover"
+            : "border-transparent bg-surface-card hover:bg-surface-hover"
       } ${!globalSkillEnabled ? "opacity-60" : ""}`}
     >
       <div className="flex items-start gap-2">
@@ -543,7 +563,7 @@ function SkillsLocationSection({
         {shouldCollapse ? (
           <button
             type="button"
-            className="w-full rounded-md border border-border bg-surface-panel px-2.5 py-2 text-left text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-primary"
+            className="w-full rounded-md border border-transparent bg-surface-panel px-2.5 py-2 text-left text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-primary"
             onClick={() => setExpanded((v) => !v)}
           >
             {expanded ? "Show less" : `Show all (${remaining} more)`}
@@ -661,6 +681,7 @@ const TABS: { id: SettingsTab; label: string; icon: typeof Settings2 }[] = [
   { id: "knowledge", label: "知识库", icon: Library },
   { id: "hooks", label: "钩子", icon: Anchor },
   { id: "automation", label: "自动化", icon: Clock },
+  { id: "voice", label: "语音", icon: Mic },
   { id: "email", label: "邮件通知", icon: Mail },
   { id: "workspace", label: "工作区", icon: FolderOpen },
   { id: "favorites", label: "收藏", icon: Bookmark },
@@ -757,6 +778,11 @@ const TOOL_LABELS: Record<string, string> = {
   memory_append: "Memory Append",
   memory_search: "Memory Search",
   session_search: "Session Search",
+  code_search: "代码搜索",
+  code_index_create: "代码索引构建",
+  code_index_status: "代码索引状态",
+  code_index_clear: "代码索引清理",
+  code_index_cancel: "代码索引取消",
   liteparse: "LiteParse",
   schedule_task: "Task",
   list_scheduled_tasks: "List Tasks",
@@ -798,6 +824,11 @@ const TOOL_DESCRIPTIONS_ZH: Record<string, string> = {
   memory_append: "向工作区日记或长期 MEMORY.md 追加一条记忆（跨会话保留）。",
   memory_search: "用全文 / 向量 / 混合模式检索已索引的工作区记忆。",
   session_search: "按关键词检索历史会话消息，空查询则返回最近会话。",
+  code_search: "在已索引代码库上做语义/混合检索；探索阶段优先于整文件读取，精确字符串请用 grep。",
+  code_index_create: "后台为指定代码库构建语义索引。",
+  code_index_status: "查询代码索引构建进度与统计。",
+  code_index_clear: "释放内存中的代码索引。",
+  code_index_cancel: "协作式取消进行中的索引任务。",
   liteparse: "通过 LiteParse 解析 PDF、Office、图片等文档并提取文本。",
   lsp_goto_definition: "在指定文件位置跳转到符号定义（LSP）。",
   lsp_find_references: "查找符号在工程内的所有引用（LSP）。",
@@ -1897,6 +1928,20 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
   const [installing, setInstalling] = useState<Record<string, ToolInstallState>>({});
   const [search, setSearch] = useState("");
   const [maxToolRounds, setMaxToolRounds] = useState(60);
+  const [stallNudge, setStallNudge] = useState<StallNudgeConfig>({
+    stall_detect_silence_seconds: 90,
+    stall_auto_nudge_enabled: false,
+    stall_auto_nudge_after_seconds: 120,
+    stall_auto_nudge_max_per_session: 2,
+  });
+  const [unattended, setUnattended] = useState<UnattendedConfig>({
+    unattended_enabled: false,
+    unattended_max_continuations_per_session: 20,
+    unattended_max_wall_clock_hours: 6,
+    unattended_stall_continue_after_seconds: 120,
+    unattended_auto_resume_exhausted: true,
+    unattended_auto_resume_interrupted: true,
+  });
   const [runtimeLoadError, setRuntimeLoadError] = useState("");
 
   const loadAll = useCallback(async () => {
@@ -1930,6 +1975,51 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
         setMaxToolRounds(
           Math.max(RUNTIME_MIN_TOOL_ROUNDS, Math.min(RUNTIME_MAX_TOOL_ROUNDS, n)),
         );
+        const detectSec = Math.max(
+          30,
+          Math.min(300, Number(runtimeResult.stall_detect_silence_seconds ?? 90) || 90),
+        );
+        let afterSec = Math.max(
+          60,
+          Math.min(300, Number(runtimeResult.stall_auto_nudge_after_seconds ?? 120) || 120),
+        );
+        if (afterSec < detectSec) afterSec = detectSec;
+        setStallNudge({
+          stall_detect_silence_seconds: detectSec,
+          stall_auto_nudge_enabled: Boolean(runtimeResult.stall_auto_nudge_enabled),
+          stall_auto_nudge_after_seconds: afterSec,
+          stall_auto_nudge_max_per_session: Math.max(
+            1,
+            Math.min(5, Number(runtimeResult.stall_auto_nudge_max_per_session ?? 2) || 2),
+          ),
+        });
+        setUnattended({
+          unattended_enabled: Boolean(runtimeResult.unattended_enabled),
+          unattended_max_continuations_per_session: Math.max(
+            1,
+            Math.min(
+              100,
+              Number(runtimeResult.unattended_max_continuations_per_session ?? 20) || 20,
+            ),
+          ),
+          unattended_max_wall_clock_hours: Math.max(
+            0.5,
+            Math.min(48, Number(runtimeResult.unattended_max_wall_clock_hours ?? 6) || 6),
+          ),
+          unattended_stall_continue_after_seconds: Math.max(
+            30,
+            Math.min(
+              600,
+              Number(runtimeResult.unattended_stall_continue_after_seconds ?? 120) || 120,
+            ),
+          ),
+          unattended_auto_resume_exhausted: Boolean(
+            runtimeResult.unattended_auto_resume_exhausted ?? true,
+          ),
+          unattended_auto_resume_interrupted: Boolean(
+            runtimeResult.unattended_auto_resume_interrupted ?? true,
+          ),
+        });
       } else {
         setRuntimeLoadError("读取运行时参数失败，仍可按当前滑块值保存。");
       }
@@ -2002,8 +2092,22 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
           return { ok: false, error: "工具列表仍在加载，请稍后再点窗口底部「保存」。" };
         }
         await saveBashDefaultTimeout();
+        let afterSec = stallNudge.stall_auto_nudge_after_seconds;
+        if (stallNudge.stall_auto_nudge_enabled && afterSec < stallNudge.stall_detect_silence_seconds) {
+          afterSec = stallNudge.stall_detect_silence_seconds;
+        }
         const rtRes = await window.agenticxDesktop.saveRuntimeConfig({
           max_tool_rounds: maxToolRounds,
+          stall_detect_silence_seconds: stallNudge.stall_detect_silence_seconds,
+          stall_auto_nudge_enabled: stallNudge.stall_auto_nudge_enabled,
+          stall_auto_nudge_after_seconds: afterSec,
+          stall_auto_nudge_max_per_session: stallNudge.stall_auto_nudge_max_per_session,
+          unattended_enabled: unattended.unattended_enabled,
+          unattended_max_continuations_per_session: unattended.unattended_max_continuations_per_session,
+          unattended_max_wall_clock_hours: unattended.unattended_max_wall_clock_hours,
+          unattended_stall_continue_after_seconds: unattended.unattended_stall_continue_after_seconds,
+          unattended_auto_resume_exhausted: unattended.unattended_auto_resume_exhausted,
+          unattended_auto_resume_interrupted: unattended.unattended_auto_resume_interrupted,
         });
         if (!rtRes?.ok) {
           return {
@@ -2018,7 +2122,7 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
         return bridge.save();
       },
     }),
-    [loading, maxToolRounds, saveBashDefaultTimeout],
+    [loading, maxToolRounds, saveBashDefaultTimeout, stallNudge, unattended],
   );
 
   const startInstall = async (tool: ToolStatusItem) => {
@@ -2085,6 +2189,8 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
         onChange={setMaxToolRounds}
         disabled={loading}
       />
+      <StallNudgeConfigSection value={stallNudge} onChange={setStallNudge} disabled={loading} />
+      <UnattendedConfigSection value={unattended} onChange={setUnattended} disabled={loading} />
       {runtimeLoadError ? (
         <div className="rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-200">
           {runtimeLoadError}
@@ -2981,21 +3087,20 @@ function SkillsTab() {
       </div>
 
       {/* Skill scan roots (presets + custom paths) */}
-      <div className="space-y-3 rounded-md border border-border bg-surface-card p-3">
-        <div className="text-[11px] font-medium uppercase tracking-wide text-text-subtle">扫描路径</div>
-        <p className="text-xs text-text-faint">
+      <Panel title="扫描路径">
+        <p className="mb-3 text-xs leading-relaxed text-text-faint">
           项目内 <code className="text-text-muted">.agents/skills</code>、<code className="text-text-muted">.claude/skills</code>、<code className="text-text-muted">~/.agenticx/skills</code>（含 ClawHub 安装、智能体创建）以及内置包始终参与扫描。以下第三方根目录可按开关启用；也可添加自定义文件夹。
         </p>
-        <div className="space-y-2">
+        <div className="space-y-3">
           {skillScanPresets.map((p) => (
             <div
               key={p.id}
-              className="flex items-center gap-3 rounded-md border border-border/60 bg-surface-panel/50 px-3 py-2"
+              className="flex items-center gap-3 rounded-xl border border-border bg-surface-card px-4 py-3.5"
             >
-              <span className="min-w-0 flex-1">
-                <span className="text-sm text-text-primary">{p.label}</span>
-                <span className="mt-0.5 block font-mono text-[10px] text-text-faint">{p.path}</span>
-              </span>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold text-text-strong">{p.label}</div>
+                <p className="mt-1 font-mono text-[11px] text-text-muted">{p.path}</p>
+              </div>
               <SettingsSwitch
                 checked={p.enabled}
                 disabled={skillScanBusy}
@@ -3010,60 +3115,73 @@ function SkillsTab() {
               />
             </div>
           ))}
-        </div>
-        <div className="text-xs font-medium text-text-subtle">自定义路径</div>
-        <div className="space-y-2">
-          {skillScanCustomPaths.map((row, i) => (
-            <div key={`skill-custom-${i}`} className="flex gap-2">
-              <input
-                className="min-w-0 flex-1 rounded-md border border-border bg-surface-panel px-2 py-1.5 font-mono text-xs text-text-primary placeholder:text-text-faint"
-                placeholder="例如 ~/my-skills 或绝对路径"
-                value={row}
-                disabled={skillScanBusy}
-                onChange={(e) => {
-                  const next = [...skillScanCustomPaths];
-                  next[i] = e.target.value;
-                  setSkillScanCustomPaths(next);
-                }}
-                onBlur={(e) => {
-                  const next = [...skillScanCustomPaths];
-                  next[i] = e.target.value;
-                  void persistSkillScanSettings(skillScanPresets, next, preferredSkillSources, disabledSkillNames);
-                }}
-              />
+
+          {/* Custom paths */}
+          <div className="mt-4 border-t border-border pt-4">
+            <div className="mb-3 flex items-center justify-between">
+              <div className="text-sm font-semibold text-text-strong">自定义路径</div>
               <button
                 type="button"
-                className="shrink-0 rounded-md border border-border p-2 text-text-faint transition hover:bg-surface-hover hover:text-rose-400 disabled:opacity-40"
+                className="inline-flex items-center gap-1 rounded-md border border-border bg-surface-panel px-2.5 py-1.5 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-primary disabled:opacity-40"
                 disabled={skillScanBusy}
-                title="移除"
-                onClick={() => {
-                  const next = skillScanCustomPaths.filter((_, j) => j !== i);
-                  setSkillScanCustomPaths(next);
-                  void persistSkillScanSettings(skillScanPresets, next, preferredSkillSources, disabledSkillNames);
-                }}
+                onClick={() => setSkillScanCustomPaths((prev) => [...prev, ""])}
               >
-                <Trash2 className="h-4 w-4" />
+                <Plus className="h-3.5 w-3.5" />
+                添加路径
               </button>
             </div>
-          ))}
-          <button
-            type="button"
-            className="inline-flex items-center gap-1 rounded-md border border-border px-2.5 py-1.5 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-primary disabled:opacity-40"
-            disabled={skillScanBusy}
-            onClick={() => setSkillScanCustomPaths((prev) => [...prev, ""])}
-          >
-            <Plus className="h-3.5 w-3.5" />
-            添加路径
-          </button>
-        </div>
-        {skillScanMsg ? (
-          <div
-            className={`text-xs ${skillScanMsg.includes("失败") ? "text-amber-400" : "text-emerald-400"}`}
-          >
-            {skillScanMsg}
+            
+            {skillScanCustomPaths.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-border p-4 text-center text-xs text-text-faint">
+                暂无自定义路径
+              </div>
+            ) : (
+              <div className="space-y-2">
+                {skillScanCustomPaths.map((row, i) => (
+                  <div key={`skill-custom-${i}`} className="flex items-center gap-2">
+                    <input
+                      className="min-w-0 flex-1 rounded-md border border-border bg-surface-panel px-3 py-2 font-mono text-xs text-text-primary placeholder:text-text-faint"
+                      placeholder="例如 ~/my-skills 或绝对路径"
+                      value={row}
+                      disabled={skillScanBusy}
+                      onChange={(e) => {
+                        const next = [...skillScanCustomPaths];
+                        next[i] = e.target.value;
+                        setSkillScanCustomPaths(next);
+                      }}
+                      onBlur={(e) => {
+                        const next = [...skillScanCustomPaths];
+                        next[i] = e.target.value;
+                        void persistSkillScanSettings(skillScanPresets, next, preferredSkillSources, disabledSkillNames);
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="shrink-0 rounded-md border border-border p-2 text-text-faint transition hover:bg-surface-hover hover:text-rose-400 disabled:opacity-40"
+                      disabled={skillScanBusy}
+                      title="移除"
+                      onClick={() => {
+                        const next = skillScanCustomPaths.filter((_, j) => j !== i);
+                        setSkillScanCustomPaths(next);
+                        void persistSkillScanSettings(skillScanPresets, next, preferredSkillSources, disabledSkillNames);
+                      }}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        ) : null}
-      </div>
+          {skillScanMsg ? (
+            <div
+              className={`text-xs ${skillScanMsg.includes("失败") ? "text-amber-400" : "text-emerald-400"}`}
+            >
+              {skillScanMsg}
+            </div>
+          ) : null}
+        </div>
+      </Panel>
 
       {/* Search + Refresh */}
       <div className="flex gap-2">
@@ -3180,7 +3298,7 @@ function SkillsTab() {
         )}
 
         {builtinFiltered.length > 0 && (
-          <div className="rounded-md border border-border bg-surface-card">
+          <div className="rounded-md border border-transparent bg-surface-card">
             <button
               type="button"
               className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm text-text-subtle transition hover:bg-surface-hover"
@@ -3231,7 +3349,7 @@ function SkillsTab() {
           {RECOMMENDED_SKILLS.map((skill) => (
             <div
               key={skill.id}
-              className="flex flex-col rounded-md border border-border bg-surface-card px-3 py-2.5 transition hover:bg-surface-hover/40"
+              className="flex flex-col rounded-md border border-transparent bg-surface-card px-3 py-2.5 transition hover:bg-surface-hover/40"
             >
               <div className="flex items-start gap-2">
                 {recommendedIconBroken[skill.id] || !(recommendedIconData[skill.id] || skill.icon_src) ? (
@@ -3354,7 +3472,7 @@ function SkillsTab() {
             {marketResults.map((item) => (
               <div
                 key={`${item.source}:${item.name}`}
-                className="flex items-start gap-2 rounded-md border border-border bg-surface-card px-3 py-2"
+                className="flex items-start gap-2 rounded-md border border-transparent bg-surface-card px-3 py-2"
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
@@ -3444,7 +3562,7 @@ function SkillsTab() {
             {skillhubResults.map((item) => (
               <div
                 key={item.slug}
-                className="flex items-start gap-2 rounded-md border border-border bg-surface-card px-3 py-2"
+                className="flex items-start gap-2 rounded-md border border-transparent bg-surface-card px-3 py-2"
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-1.5">
@@ -3575,7 +3693,7 @@ function SkillsTab() {
             {bundles.map((bundle) => (
               <div
                 key={bundle.name}
-                className="rounded-md border border-border bg-surface-card px-3 py-2"
+                className="rounded-md border border-transparent bg-surface-card px-3 py-2"
               >
                 <div className="flex items-center gap-2">
                   <span className="flex-1 truncate text-sm font-medium text-text-primary">
@@ -4197,9 +4315,9 @@ function SettingsSwitch({
   size?: "sm" | "md";
   "aria-label"?: string;
 }) {
-  const trackClass = size === "sm" ? "h-5 w-9" : "h-7 w-12";
-  const knobClass = size === "sm" ? "left-0.5 top-0.5 h-4 w-4" : "left-0.5 top-0.5 h-6 w-6";
-  const knobTranslate = size === "sm" ? "translate-x-4" : "translate-x-5";
+  const trackClass = size === "sm" ? "h-4 w-7" : "h-5 w-9";
+  const knobClass = size === "sm" ? "left-0.5 top-0.5 h-3 w-3" : "left-0.5 top-0.5 h-4 w-4";
+  const knobTranslate = size === "sm" ? "translate-x-3" : "translate-x-4";
   return (
     <button
       type="button"
@@ -4210,8 +4328,8 @@ function SettingsSwitch({
       onClick={() => {
         if (!disabled) onChange(!checked);
       }}
-      className={`relative ${trackClass} shrink-0 rounded-full transition focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500/55 disabled:opacity-40 ${
-        checked ? "bg-emerald-500" : "bg-surface-hover"
+      className={`relative ${trackClass} shrink-0 rounded-full transition focus:outline-none focus-visible:ring-2 focus-visible:ring-[rgba(var(--theme-color-rgb,16,185,129),0.55)] disabled:opacity-40 ${
+        checked ? "bg-[rgb(var(--theme-color-rgb,16,185,129))]" : "bg-surface-hover"
       }`}
     >
       <span
@@ -4770,6 +4888,8 @@ export function SettingsPanel({
   const setUserAvatarUrl = useAppStore((s) => s.setUserAvatarUrl);
   const userPreference = useAppStore((s) => s.userPreference);
   const setUserPreference = useAppStore((s) => s.setUserPreference);
+  const themeColor = useAppStore((s) => s.themeColor);
+  const setThemeColor = useAppStore((s) => s.setThemeColor);
   const metaAvatarUrl = useAppStore((s) => s.metaAvatarUrl);
   const effectiveMetaAvatarUrl = metaAvatarUrl.trim() || DEFAULT_META_AVATAR_URL;
   const setMetaAvatarUrl = useAppStore((s) => s.setMetaAvatarUrl);
@@ -4778,13 +4898,55 @@ export function SettingsPanel({
   const initializedForOpenRef = useRef(false);
   const toolsTabRef = useRef<ToolsTabHandle>(null);
   const knowledgeRef = useRef<KnowledgeSettingsHandle>(null);
+  const voiceSettingsRef = useRef<VoiceSettingsPanelHandle>(null);
   const permissionsPanelRef = useRef<PermissionsAdvancedPanelHandle>(null);
   const [tab, setTab] = useState<SettingsTab>("general");
+  const [panelSize, setPanelSize] = useState<SettingsPanelSize>(() => loadSettingsPanelSize());
   useEffect(() => {
     if (!open || !settingsOpenToTab) return;
     setTab(settingsOpenToTab);
     updateSettingsSlice({ openToTab: undefined });
   }, [open, settingsOpenToTab, updateSettingsSlice]);
+  useEffect(() => {
+    if (!open) return;
+    setPanelSize(loadSettingsPanelSize());
+  }, [open]);
+  useEffect(() => {
+    if (!open) return;
+    const onWindowResize = () => {
+      setPanelSize((prev) => clampSettingsPanelSize(prev));
+    };
+    window.addEventListener("resize", onWindowResize);
+    return () => window.removeEventListener("resize", onWindowResize);
+  }, [open]);
+  const onPanelResizeMouseDown = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    const startWidth = panelSize.width;
+    const startHeight = panelSize.height;
+    document.body.classList.add("agx-settings-panel-resizing");
+    const onMove = (moveEvent: MouseEvent) => {
+      setPanelSize(
+        clampSettingsPanelSize({
+          width: startWidth + (moveEvent.clientX - startX),
+          height: startHeight + (moveEvent.clientY - startY),
+        }),
+      );
+    };
+    const onUp = () => {
+      document.body.classList.remove("agx-settings-panel-resizing");
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      setPanelSize((prev) => {
+        saveSettingsPanelSize(prev);
+        return prev;
+      });
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }, [panelSize.height, panelSize.width]);
   const [active, setActive] = useState(defaultProvider || ALL_PROVIDERS[0]);
   const [draft, setDraft] = useState<Record<string, ProviderEntry>>({});
   const [defProv, setDefProv] = useState(defaultProvider);
@@ -5439,6 +5601,11 @@ export function SettingsPanel({
       );
       if (!cont) return;
     }
+    const voiceRes = await voiceSettingsRef.current?.persist();
+    if (voiceRes && !voiceRes.ok) {
+      window.alert(voiceRes.error || "语音设置保存失败");
+      return;
+    }
     const normalized: Record<string, ProviderEntry> = {};
     for (const [name, entry] of Object.entries(draft)) {
       normalized[name] = { ...entry, baseUrl: normalizeBaseUrl(entry.baseUrl) };
@@ -6008,7 +6175,9 @@ export function SettingsPanel({
   }, [open, tab, mcpDiscoverHits.length, mcpMarketplaceItems.length, refreshMcpDiscover, refreshMcpMarketplace]);
 
   useEffect(() => {
-    if (!open || tab !== "mcp" || !sessionId) return;
+    if (!open || tab !== "mcp") return;
+    // sessionId may be empty (no session yet); backend falls back to
+    // process-level configs in that case, so we still poll.
     void onRefreshMcp(sessionId);
     const timer = window.setInterval(() => {
       void onRefreshMcp(sessionId);
@@ -6023,10 +6192,14 @@ export function SettingsPanel({
   return (
     <>
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/70 p-4 backdrop-blur-none">
-      {/* 固定为视口比例，避免切换 tab 时随内容伸缩；长内容在右侧滚动区内滚动 */}
+      {/* 默认更宽；右下角可拖拽调整尺寸并持久化，切换 tab 时尺寸不变 */}
       <div
-        className="agx-settings-panel flex h-[min(85vh,calc(100dvh-2rem))] w-[min(90vw,51.25rem)] max-w-[calc(100vw-2rem)] shrink-0 overflow-hidden rounded-2xl border border-border shadow-2xl"
-        style={{ backgroundColor: "var(--surface-base-fallback, var(--surface-panel))" }}
+        className="agx-settings-panel relative flex shrink-0 overflow-hidden rounded-2xl border border-border shadow-2xl"
+        style={{
+          width: panelSize.width,
+          height: panelSize.height,
+          backgroundColor: "var(--surface-base-fallback, var(--surface-panel))",
+        }}
       >
         {/* Left: tab navigation */}
         <div className="flex h-full min-h-0 w-[200px] shrink-0 flex-col bg-surface-sidebar p-4">
@@ -6040,7 +6213,7 @@ export function SettingsPanel({
                   key={t.id}
                   className={`flex w-full items-center gap-2.5 rounded-[10px] border px-2.5 py-2 text-left text-[13px] font-semibold transition-all ${
                     isActive
-                      ? "border-border-strong bg-surface-card text-text-strong"
+                      ? "border-transparent bg-btnPrimary text-btnPrimary-text"
                       : "border-transparent text-text-subtle hover:border-border-strong hover:bg-surface-card hover:text-text-strong"
                   }`}
                   onClick={() => setTab(t.id)}
@@ -6071,7 +6244,11 @@ export function SettingsPanel({
             </button>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+          <div
+            className={`min-h-0 flex-1 px-4 py-3 ${
+              tab === "knowledge" ? "flex flex-col overflow-hidden" : "overflow-y-auto"
+            }`}
+          >
             {tab === "account" && <AccountTab />}
 
             {/* === GENERAL TAB ===（保持挂载以便底部「保存」能刷入权限 API，避免仅失焦写入） */}
@@ -6085,7 +6262,6 @@ export function SettingsPanel({
                       onChange={(e) => onThemeChange(e.target.value as "dark" | "light" | "dim")}
                     >
                       <option value="dark">深色</option>
-                      <option value="dim">暗灰</option>
                       <option value="light">浅色</option>
                     </select>
                   </label>
@@ -6101,6 +6277,28 @@ export function SettingsPanel({
                       <option value="clean">Clean 风格（极简分隔块）</option>
                     </select>
                   </label>
+                  <div className="mt-3 block text-sm text-text-muted">
+                    主题色系
+                    <div className="mt-2 flex items-center gap-3">
+                      {[
+                        { id: "blue", color: "bg-blue-500", label: "蓝色" },
+                        { id: "green", color: "bg-emerald-500", label: "绿色" },
+                        { id: "pink", color: "bg-pink-500", label: "粉红色" },
+                        { id: "yellow", color: "bg-amber-500", label: "黄色" },
+                        { id: "white", color: "bg-slate-900 dark:bg-white", label: "白色/单色" },
+                      ].map((tc) => (
+                        <button
+                          key={tc.id}
+                          type="button"
+                          className={`group relative flex h-6 w-6 items-center justify-center rounded-full transition-all hover:scale-110 ${themeColor === tc.id ? "ring-2 ring-text-primary ring-offset-2 ring-offset-surface-base" : ""}`}
+                          onClick={() => setThemeColor(tc.id as any)}
+                          title={tc.label}
+                        >
+                          <span className={`h-full w-full rounded-full ${tc.color}`} />
+                        </button>
+                      ))}
+                    </div>
+                  </div>
                 </Panel>
                 <Panel title="用户档案">
                   <p className="mb-3 text-[11px] leading-relaxed text-text-subtle">
@@ -6130,7 +6328,7 @@ export function SettingsPanel({
                           className="h-12 w-12 rounded-full border border-border object-cover"
                         />
                       ) : (
-                        <div className="flex h-12 w-12 items-center justify-center rounded-full border border-border bg-surface-card text-sm font-semibold text-text-primary">
+                        <div className="flex h-12 w-12 items-center justify-center rounded-full bg-[rgba(var(--theme-color-rgb),0.9)] text-sm font-semibold text-black">
                           {(userNickname.trim().slice(0, 1) || "我").toUpperCase()}
                         </div>
                       )}
@@ -6284,6 +6482,8 @@ export function SettingsPanel({
                   </p>
                 </Panel>
                 <PermissionsAdvancedPanel ref={permissionsPanelRef} />
+                <WebSearchSettingsPanel />
+                <SuggestedQuestionsSettingsPanel />
                 <ComputerUseGeneralPanel />
                 <SessionMemoryPanel />
                 <div className="rounded-md border border-border bg-surface-card px-3 py-2.5 text-xs text-text-subtle">
@@ -6876,8 +7076,13 @@ export function SettingsPanel({
             {tab === "mcp" && (() => {
               return (
               <div className="space-y-5">
-                <div className="text-sm text-text-subtle">
-                  MCP（模型上下文协议）服务为 Agent 扩展外部工具 — 文件系统、数据库、网页搜索等。
+                <div className="space-y-1">
+                  <div className="text-sm text-text-subtle">
+                    MCP（模型上下文协议）服务为 Agent 扩展外部工具 — 文件系统、数据库、网页搜索等。
+                  </div>
+                  <div className="text-[11px] text-text-faint">
+                    已连接的 MCP 服务是 Machi <strong>进程级</strong>资源，所有对话共享；Machi 启动时自动恢复上次的连接记录，新建对话不会触发额外连接或断开。
+                  </div>
                 </div>
 
                 {mcpMessage && <div className="text-xs text-text-subtle">{mcpMessage}</div>}
@@ -6994,7 +7199,7 @@ export function SettingsPanel({
                   <div className="space-y-1.5">
                     {mcpServers.length === 0 ? (
                       <div className="py-6 text-center text-sm text-text-faint">
-                        尚未发现 MCP 服务。点右上角「扫描发现」或下方「New MCP Server」添加。
+                        尚未发现 MCP 服务。点上方主配置右侧的编辑图标，在 <code>~/.agenticx/mcp.json</code> 中添加。
                       </div>
                     ) : null}
                     {mcpServers.map((server) => {
@@ -7218,6 +7423,8 @@ export function SettingsPanel({
             {tab === "hooks" && <HooksTab />}
 
             {tab === "automation" && <AutomationTab />}
+
+            {tab === "voice" && <VoiceSettingsPanel ref={voiceSettingsRef} />}
 
             {/* === EMAIL TAB === */}
             {tab === "email" && <EmailSettingsTab />}
@@ -7767,6 +7974,14 @@ export function SettingsPanel({
             </button>
           </div>
         </div>
+        <div
+          className="agx-settings-panel-resize-handle"
+          role="separator"
+          aria-orientation="horizontal"
+          aria-label="拖拽调整设置窗口大小"
+          title="拖拽调整大小"
+          onMouseDown={onPanelResizeMouseDown}
+        />
       </div>
     </div>
     {mcpErrorInspect ? (

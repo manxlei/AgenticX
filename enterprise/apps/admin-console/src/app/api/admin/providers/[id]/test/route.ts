@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireAdminSession } from "../../../../../../lib/admin-auth";
+import { requireAdminScope } from "../../../../../../lib/admin-auth";
 import { getProviderInternal } from "../../../../../../lib/model-providers-store";
 
 const TIMEOUT_MS = 8000;
@@ -12,11 +12,11 @@ const TIMEOUT_MS = 8000;
  * 任一步成功即视为连通；结果原样回 UI（HTTP 状态 + 上游错误片段）。
  */
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
-  const auth = await requireAdminSession();
+  const auth = await requireAdminScope(["provider:read"]);
   if (!auth.ok) return auth.response;
 
   const { id } = await context.params;
-  const provider = getProviderInternal(id);
+  const provider = await getProviderInternal(id);
   if (!provider) {
     return NextResponse.json({ code: "40400", message: "provider not found" }, { status: 404 });
   }

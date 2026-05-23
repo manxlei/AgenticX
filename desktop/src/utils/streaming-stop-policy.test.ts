@@ -1,89 +1,147 @@
-import assert from "node:assert/strict";
-import test from "node:test";
-
+import { describe, expect, it } from "vitest";
 import {
   canStopCurrentRun,
+  isDoubleEnterWithinWindow,
+  shouldEnqueueOnResend,
   shouldInterruptOnResend,
-} from "./streaming-stop-policy.ts";
+  shouldShowSessionWorkInProgress,
+  shouldShowStopButton,
+  shouldShowStopForExecutionState,
+} from "./streaming-stop-policy";
+import type { Message } from "../store";
 
-test("停止按钮：单聊 streaming 中且会话匹配 → 可见", () => {
-  assert.equal(
-    canStopCurrentRun({
-      streaming: true,
-      streamingSessionId: "s-1",
-      currentSessionId: "s-1",
-    }),
-    true,
-  );
+describe("shouldShowStopForExecutionState", () => {
+  it("shows stop only when running", () => {
+    expect(shouldShowStopForExecutionState("running")).toBe(true);
+    expect(shouldShowStopForExecutionState("idle")).toBe(false);
+    expect(shouldShowStopForExecutionState("interrupted")).toBe(false);
+    expect(shouldShowStopForExecutionState(undefined)).toBe(false);
+  });
 });
 
-test("停止按钮：群聊 streaming 中且会话匹配 → 可见（不再排除群聊）", () => {
-  // 历史 bug：ChatPane 用 `!isGroupPane && streaming` 导致群聊永远拿不到停止按钮。
-  // 这里以与窗格类型无关的方式锁住"群聊也应可见"。
-  assert.equal(
-    canStopCurrentRun({
-      streaming: true,
-      streamingSessionId: "g-sse-1",
-      currentSessionId: "g-sse-1",
-    }),
-    true,
-  );
+describe("shouldShowStopButton", () => {
+  it("prefers active SSE on current session", () => {
+    expect(
+      shouldShowStopButton({
+        streaming: true,
+        streamingSessionId: "s1",
+        currentSessionId: "s1",
+        executionState: "idle",
+      })
+    ).toBe(true);
+  });
+
+  it("shows stop when backend still running after SSE ended", () => {
+    expect(
+      shouldShowStopButton({
+        streaming: false,
+        streamingSessionId: "",
+        currentSessionId: "s1",
+        executionState: "running",
+      })
+    ).toBe(true);
+  });
+
+  it("keeps delegation fallback for avatar panes", () => {
+    expect(
+      shouldShowStopButton({
+        streaming: false,
+        streamingSessionId: "",
+        currentSessionId: "s1",
+        executionState: "idle",
+        hasDelegation: true,
+        isGroupPane: false,
+      })
+    ).toBe(true);
+  });
 });
 
-test("停止按钮：streaming=false → 不可见", () => {
-  assert.equal(
-    canStopCurrentRun({
-      streaming: false,
-      streamingSessionId: "s-1",
-      currentSessionId: "s-1",
-    }),
-    false,
-  );
+describe("message queue resend policy", () => {
+  it("enqueues by default while streaming", () => {
+    expect(shouldEnqueueOnResend({ isStreamRunActive: true })).toBe(true);
+    expect(shouldInterruptOnResend({ isStreamRunActive: true })).toBe(false);
+  });
+
+  it("force send interrupts instead of enqueueing", () => {
+    expect(shouldEnqueueOnResend({ isStreamRunActive: true, forceSend: true })).toBe(false);
+    expect(shouldInterruptOnResend({ isStreamRunActive: true, forceSend: true })).toBe(true);
+  });
+
+  it("detects double-enter within window", () => {
+    const now = 10_000;
+    expect(isDoubleEnterWithinWindow(now - 200, now)).toBe(true);
+    expect(isDoubleEnterWithinWindow(now - 500, now)).toBe(false);
+  });
 });
 
-test("停止按钮：streaming 中但会话不匹配（多窗格） → 不可见", () => {
-  assert.equal(
-    canStopCurrentRun({
-      streaming: true,
-      streamingSessionId: "s-1",
-      currentSessionId: "s-2",
-    }),
-    false,
-  );
+describe("canStopCurrentRun", () => {
+  it("requires matching session ids", () => {
+    expect(
+      canStopCurrentRun({
+        streaming: true,
+        streamingSessionId: "a",
+        currentSessionId: "b",
+      })
+    ).toBe(false);
+  });
 });
 
-test("停止按钮：streamingSessionId 空字符串 → 不可见（防御）", () => {
-  assert.equal(
-    canStopCurrentRun({
-      streaming: true,
-      streamingSessionId: "",
-      currentSessionId: "s-1",
-    }),
-    false,
-  );
-});
+describe("shouldShowSessionWorkInProgress", () => {
+  const userMsg: Message = { id: "u1", role: "user", content: "do task" };
+  const toolMsg: Message = { id: "t1", role: "tool", toolName: "file_read", content: "ok" };
 
-test("停止按钮：会话 id 包含前后空格 → trim 后比较一致 → 可见", () => {
-  assert.equal(
-    canStopCurrentRun({
-      streaming: true,
-      streamingSessionId: "s-1",
-      currentSessionId: "  s-1  ",
-    }),
-    true,
-  );
-});
+  it("shows for unattended session after tool without final assistant reply", () => {
+    expect(
+      shouldShowSessionWorkInProgress({
+        isStreamingCurrentSession: false,
+        executionState: "interrupted",
+        sessionUnattended: true,
+        unattendedGlobalEnabled: true,
+        messages: [userMsg, toolMsg],
+      })
+    ).toBe(true);
+  });
 
-test("追问策略：当前 session 有进行中的流 → 应打断当前并发新一轮", () => {
-  assert.equal(
-    shouldInterruptOnResend({ isStreamRunActive: true }),
-    true,
-  );
-});
+  it("hides when user stopped the session", () => {
+    expect(
+      shouldShowSessionWorkInProgress({
+        isStreamingCurrentSession: false,
+        executionState: "interrupted",
+        sessionUnattended: true,
+        unattendedGlobalEnabled: true,
+        userStopped: true,
+        messages: [userMsg, toolMsg],
+      })
+    ).toBe(false);
+  });
 
-test("追问策略：当前 session 没有进行中的流 → 直接发送（不打断不入队）", () => {
-  assert.equal(
-    shouldInterruptOnResend({ isStreamRunActive: false }),
-    false,
-  );
+  it("hides when todos are all completed", () => {
+    const todoDone: Message = {
+      id: "todo1",
+      role: "tool",
+      toolName: "todo_write",
+      content: "🗂 任务清单更新\n[x] a\n[x] b\n(2/2 completed)",
+    };
+    expect(
+      shouldShowSessionWorkInProgress({
+        isStreamingCurrentSession: false,
+        executionState: "idle",
+        sessionUnattended: true,
+        unattendedGlobalEnabled: true,
+        messages: [userMsg, todoDone],
+      })
+    ).toBe(false);
+  });
+
+  it("shows stop when session work is in progress without local SSE", () => {
+    expect(
+      shouldShowStopButton({
+        streaming: false,
+        streamingSessionId: "",
+        currentSessionId: "s1",
+        executionState: "idle",
+        sessionWorkInProgress: true,
+      })
+    ).toBe(true);
+  });
 });

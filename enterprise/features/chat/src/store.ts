@@ -1,6 +1,14 @@
 import { create } from "zustand";
-import { toComplianceMessage, type ChatMessage, type ChatSession } from "@agenticx/core-api";
+import { ulid as newUlid } from "ulid";
+import {
+  buildAutoTitleFromFirstUserMessage,
+  sessionTitleNeedsAutoFill,
+  toComplianceMessage,
+  type ChatMessage,
+  type ChatSession,
+} from "@agenticx/core-api";
 import type { ChatClient, ChatRequest as SdkChatRequest } from "@agenticx/sdk-ts";
+import { ChatHistoryHttpError, createPortalChatHistoryClient } from "./history-client";
 
 export type ChatStatus = "idle" | "sending" | "streaming" | "error";
 
@@ -54,6 +62,11 @@ export type ChatStoreState = {
   /** 按会话累计 token，切换会话时与 sessionTokens 同步 */
   sessionTokensBySessionId: Record<string, SessionTokenUsage>;
   responseVersionsByUserMessageId: Record<string, UserResponseVersionState>;
+  /** 服务端历史已加载（Enterprise portal） */
+  hydrated: boolean;
+  historyLoading: boolean;
+  historyError: string | null;
+  sessionMessagesLoading: boolean;
 };
 
 const EMPTY_USAGE: SessionTokenUsage = {
@@ -66,11 +79,12 @@ const EMPTY_USAGE: SessionTokenUsage = {
 };
 
 export type ChatStoreActions = {
+  hydrateSessions(): Promise<void>;
   bootstrap(params?: { tenantId?: string; userId?: string; defaultModel?: string; title?: string }): void;
-  createSession(params?: { tenantId?: string; userId?: string; defaultModel?: string; title?: string }): void;
-  switchSession(sessionId: string): void;
-  renameSession(sessionId: string, title: string): void;
-  deleteSession(sessionId: string): void;
+  createSession(params?: { tenantId?: string; userId?: string; defaultModel?: string; title?: string }): Promise<void>;
+  switchSession(sessionId: string): Promise<void>;
+  renameSession(sessionId: string, title: string): Promise<void>;
+  deleteSession(sessionId: string): Promise<void>;
   switchModel(model: string): void;
   sendMessage(client: ChatClient, input: SendMessageInput): Promise<void>;
   editUserMessageAndResend(client: ChatClient, input: EditUserMessageInput): Promise<void>;
@@ -89,48 +103,12 @@ const DEFAULT_MODEL = "mock-model-v1";
 const DEFAULT_TENANT = "tenant-local";
 const DEFAULT_USER = "user-local";
 
-function makeId(prefix: string): string {
-  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+function makeId(): string {
+  return newUlid();
 }
 
 function now(): string {
   return new Date().toISOString();
-}
-
-/** 与 agenticx/studio/session_manager.py _PLACEHOLDER_SESSION_TITLE_CF + 前缀规则对齐 */
-const PLACEHOLDER_SESSION_TITLES_CF = new Set(
-  [
-    "微信会话",
-    "微信对话",
-    "微信聊天",
-    "飞书会话",
-    "飞书对话",
-    "新对话",
-    "新会话",
-    "new chat",
-    "new conversation",
-    "欢迎使用 agenticx",
-  ].map((s) => s.toLowerCase()),
-);
-
-export function sessionTitleNeedsAutoFill(name: string | null | undefined): boolean {
-  const raw = String(name ?? "").trim();
-  if (!raw) return true;
-  const key = raw.toLowerCase();
-  if (PLACEHOLDER_SESSION_TITLES_CF.has(key)) return true;
-  if (key.startsWith("新会话") || key.startsWith("新对话")) return true;
-  if (key.startsWith("new session") || key.startsWith("new chat")) return true;
-  return false;
-}
-
-/** 与 session_manager._build_auto_title 一致：空白压平后取前 48 字 */
-export function buildAutoTitleFromFirstUserMessage(message: string): string {
-  const compact = String(message ?? "")
-    .trim()
-    .split(/\s+/)
-    .join(" ");
-  if (!compact) return "";
-  return compact.length > 48 ? compact.slice(0, 48).trimEnd() : compact;
 }
 
 function addChunkToSessionTokens(
@@ -233,6 +211,79 @@ function mergeSessionMessages(messages: ChatMessage[], sessionId: string, sessio
   return [...rest, ...sessionMessages];
 }
 
+let chatHydrateInFlight: Promise<void> | null = null;
+let sessionMessageLoadSeq = 0;
+let historyAuthRedirectScheduled = false;
+const portalHistory = createPortalChatHistoryClient();
+
+function resolveHistoryErrorMessage(error: unknown, fallback: string): string {
+  const unauthorized =
+    (error instanceof ChatHistoryHttpError && error.status === 401) ||
+    (error instanceof Error && /unauthorized/i.test(error.message));
+
+  if (unauthorized) {
+    if (typeof window !== "undefined" && !historyAuthRedirectScheduled) {
+      historyAuthRedirectScheduled = true;
+      const returnTo = encodeURIComponent(`${window.location.pathname}${window.location.search}`);
+      window.setTimeout(() => {
+        window.location.assign(`/auth?returnTo=${returnTo}`);
+      }, 0);
+    }
+    return "登录已过期，请重新登录";
+  }
+
+  return error instanceof Error ? error.message : fallback;
+}
+
+function stripVersionsForSession(
+  state: ChatStoreState,
+  sessionId: string
+): Record<string, UserResponseVersionState> {
+  const userIds = new Set(
+    state.messages.filter((m) => m.session_id === sessionId && m.role === "user").map((m) => m.id)
+  );
+  const next = { ...state.responseVersionsByUserMessageId };
+  for (const id of userIds) {
+    delete next[id];
+  }
+  return next;
+}
+
+function buildHydratedResponseVersions(messages: ChatMessage[]): Record<string, UserResponseVersionState> {
+  const result: Record<string, UserResponseVersionState> = {};
+  let i = 0;
+  while (i < messages.length) {
+    const m = messages[i];
+    if (m?.role === "user") {
+      const userMsg = m;
+      const assistants: ChatMessage[] = [];
+      i += 1;
+      while (i < messages.length && messages[i]?.role === "assistant") {
+        const a = messages[i];
+        if (a) assistants.push(a);
+        i += 1;
+      }
+      if (assistants.length > 0) {
+        const versions = assistants.map((a, idx) =>
+          toAssistantVersion(a, {
+            queryVersionIndex: 0,
+            retryAttempt: idx,
+            queryText: userMsg.content,
+          })
+        );
+        result[userMsg.id] = {
+          versions,
+          activeIndex: versions.length - 1,
+          activeAssistantIndexByQueryVersion: { 0: versions.length - 1 },
+        };
+      }
+    } else {
+      i += 1;
+    }
+  }
+  return result;
+}
+
 export const useChatStore = create<ChatStore>((set, get) => ({
   sessions: [],
   activeSessionId: null,
@@ -244,9 +295,70 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   sessionTokens: { ...EMPTY_USAGE },
   sessionTokensBySessionId: {},
   responseVersionsByUserMessageId: {},
+  hydrated: false,
+  historyLoading: false,
+  historyError: null,
+  sessionMessagesLoading: false,
+
+  async hydrateSessions() {
+    if (chatHydrateInFlight) {
+      await chatHydrateInFlight;
+      return;
+    }
+    if (get().hydrated) return;
+
+    chatHydrateInFlight = (async () => {
+      set({ historyLoading: true, historyError: null });
+      try {
+        let sessions = await portalHistory.listSessions();
+        if (sessions.length === 0) {
+          const state = get();
+          const welcome = await portalHistory.createSession({
+            title: "欢迎使用 AgenticX",
+            activeModel: state.activeModel !== DEFAULT_MODEL ? state.activeModel : undefined,
+          });
+          sessions = [welcome];
+        }
+        const activeSession = sessions[0]!;
+        const activeSessionId = activeSession.id;
+        const remoteMessages = await portalHistory.getMessages(activeSessionId);
+        const responseVersions = buildHydratedResponseVersions(remoteMessages);
+
+        set({
+          sessions,
+          activeSessionId,
+          messages: remoteMessages,
+          hydrated: true,
+          historyLoading: false,
+          historyError: null,
+          activeModel: activeSession.active_model ?? get().activeModel ?? DEFAULT_MODEL,
+          status: "idle",
+          activeRequestId: null,
+          errorMessage: null,
+          sessionTokens: { ...EMPTY_USAGE },
+          sessionTokensBySessionId: { [activeSessionId]: { ...EMPTY_USAGE } },
+          responseVersionsByUserMessageId: responseVersions,
+        });
+        historyAuthRedirectScheduled = false;
+      } catch (error) {
+        const message = resolveHistoryErrorMessage(error, "加载历史失败");
+        const unauthorized = message === "登录已过期，请重新登录";
+        set({
+          historyLoading: false,
+          historyError: message,
+          hydrated: unauthorized ? false : get().hydrated,
+        });
+      } finally {
+        chatHydrateInFlight = null;
+      }
+    })();
+
+    await chatHydrateInFlight;
+  },
 
   bootstrap(params) {
-    const sessionId = makeId("session");
+    if (get().hydrated) return;
+    const sessionId = makeId();
     const session: ChatSession = {
       id: sessionId,
       tenant_id: params?.tenantId ?? DEFAULT_TENANT,
@@ -272,56 +384,140 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     });
   },
 
-  createSession(params) {
-    const sessionId = makeId("session");
-    const session: ChatSession = {
-      id: sessionId,
-      tenant_id: params?.tenantId ?? DEFAULT_TENANT,
-      user_id: params?.userId ?? DEFAULT_USER,
-      title: params?.title?.trim() || "New chat",
-      active_model: params?.defaultModel ?? get().activeModel ?? DEFAULT_MODEL,
-      message_count: 0,
-      created_at: now(),
-      updated_at: now(),
-    };
+  async createSession(params) {
+    if (!get().hydrated) {
+      const sessionId = makeId();
+      const session: ChatSession = {
+        id: sessionId,
+        tenant_id: params?.tenantId ?? DEFAULT_TENANT,
+        user_id: params?.userId ?? DEFAULT_USER,
+        title: params?.title?.trim() || "New chat",
+        active_model: params?.defaultModel ?? get().activeModel ?? DEFAULT_MODEL,
+        message_count: 0,
+        created_at: now(),
+        updated_at: now(),
+      };
 
-    set((prev) => ({
-      sessions: [...prev.sessions, session],
-      activeSessionId: sessionId,
-      activeModel: session.active_model ?? DEFAULT_MODEL,
-      status: "idle",
-      errorMessage: null,
-      activeRequestId: null,
-      sessionTokens: { ...EMPTY_USAGE },
-      sessionTokensBySessionId: {
-        ...prev.sessionTokensBySessionId,
-        [sessionId]: { ...EMPTY_USAGE },
-      },
-    }));
+      set((prev) => ({
+        sessions: [...prev.sessions, session],
+        activeSessionId: sessionId,
+        activeModel: session.active_model ?? DEFAULT_MODEL,
+        status: "idle",
+        errorMessage: null,
+        activeRequestId: null,
+        historyError: null,
+        sessionTokens: { ...EMPTY_USAGE },
+        sessionTokensBySessionId: {
+          ...prev.sessionTokensBySessionId,
+          [sessionId]: { ...EMPTY_USAGE },
+        },
+      }));
+      return;
+    }
+
+    try {
+      const created = await portalHistory.createSession({
+        title: params?.title?.trim() || "New chat",
+        activeModel: params?.defaultModel ?? get().activeModel,
+      });
+      set((prev) => ({
+        sessions: [...prev.sessions, created],
+        activeSessionId: created.id,
+        activeModel: created.active_model ?? prev.activeModel ?? DEFAULT_MODEL,
+        status: "idle",
+        errorMessage: null,
+        activeRequestId: null,
+        sessionTokens: { ...EMPTY_USAGE },
+        sessionTokensBySessionId: {
+          ...prev.sessionTokensBySessionId,
+          [created.id]: { ...EMPTY_USAGE },
+        },
+        messages: mergeSessionMessages(prev.messages, created.id, []),
+        responseVersionsByUserMessageId: {},
+      }));
+    } catch (error) {
+      const message = resolveHistoryErrorMessage(error, "创建会话失败");
+      set({
+        historyError: message,
+        hydrated: message === "登录已过期，请重新登录" ? false : get().hydrated,
+      });
+    }
   },
 
-  switchSession(sessionId) {
+  async switchSession(sessionId) {
     const target = get().sessions.find((session) => session.id === sessionId);
     if (!target) return;
     const tokens = get().sessionTokensBySessionId[sessionId] ?? { ...EMPTY_USAGE };
+    if (!get().hydrated) {
+      set({
+        activeSessionId: sessionId,
+        activeModel: target.active_model ?? DEFAULT_MODEL,
+        errorMessage: null,
+        sessionTokens: { ...tokens },
+      });
+      return;
+    }
+
+    const loadSeq = ++sessionMessageLoadSeq;
     set({
       activeSessionId: sessionId,
       activeModel: target.active_model ?? DEFAULT_MODEL,
       errorMessage: null,
       sessionTokens: { ...tokens },
+      sessionMessagesLoading: true,
     });
+
+    try {
+      const remoteMessages = await portalHistory.getMessages(sessionId);
+      const responseVersions = buildHydratedResponseVersions(remoteMessages);
+      if (loadSeq !== sessionMessageLoadSeq || get().activeSessionId !== sessionId) return;
+      set((state) => ({
+        messages: mergeSessionMessages(state.messages, sessionId, remoteMessages),
+        responseVersionsByUserMessageId: {
+          ...stripVersionsForSession(state, sessionId),
+          ...responseVersions,
+        },
+        sessionMessagesLoading: false,
+      }));
+    } catch (error) {
+      if (loadSeq !== sessionMessageLoadSeq || get().activeSessionId !== sessionId) return;
+      set({
+        sessionMessagesLoading: false,
+        historyError: error instanceof Error ? error.message : "加载消息失败",
+      });
+    }
   },
 
-  renameSession(sessionId, title) {
+  async renameSession(sessionId, title) {
     const nextTitle = title.trim() || "New chat";
     set((state) => ({
       sessions: state.sessions.map((session) =>
         session.id === sessionId ? { ...session, title: nextTitle, updated_at: now() } : session,
       ),
     }));
+    if (!get().hydrated) return;
+    try {
+      const updated = await portalHistory.renameSession(sessionId, nextTitle);
+      set((state) => ({
+        sessions: state.sessions.map((s) => (s.id === sessionId ? updated : s)),
+      }));
+    } catch (error) {
+      set({ historyError: error instanceof Error ? error.message : "重命名失败" });
+    }
   },
 
-  deleteSession(sessionId) {
+  async deleteSession(sessionId) {
+    if (get().hydrated) {
+      try {
+        await portalHistory.deleteSession(sessionId);
+      } catch (error) {
+        set({ historyError: error instanceof Error ? error.message : "删除失败" });
+        return;
+      }
+    }
+
+    const willBeEmpty = get().sessions.filter((s) => s.id !== sessionId).length === 0;
+
     set((state) => {
       const removedUserIds = new Set(
         state.messages
@@ -356,9 +552,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         errorMessage: null,
       };
     });
+
+    if (willBeEmpty && get().hydrated) {
+      await get().createSession({
+        title: "欢迎使用 AgenticX",
+        defaultModel: get().activeModel,
+      });
+    }
   },
 
   switchModel(model) {
+    const sessionId = get().activeSessionId;
     set((state) => ({
       activeModel: model,
       sessions: state.sessions.map((session) =>
@@ -371,6 +575,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           : session
       ),
     }));
+    if (get().hydrated && sessionId) {
+      void portalHistory.patchSession(sessionId, { activeModel: model }).catch((error) => {
+        set({ historyError: error instanceof Error ? error.message : "更新模型失败" });
+      });
+    }
   },
 
   async sendMessage(client, input) {
@@ -385,7 +594,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const tenantId = input.tenantId ?? state.sessions.find((session) => session.id === sessionId)?.tenant_id ?? DEFAULT_TENANT;
     const userId = input.userId ?? state.sessions.find((session) => session.id === sessionId)?.user_id ?? DEFAULT_USER;
     const userMessage: ChatMessage = {
-      id: makeId("msg_user"),
+      id: makeId(),
       session_id: sessionId,
       tenant_id: tenantId,
       user_id: userId,
@@ -394,7 +603,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       created_at: now(),
     };
     const assistantMessage: ChatMessage = {
-      id: makeId("msg_assistant"),
+      id: makeId(),
       session_id: sessionId,
       tenant_id: tenantId,
       user_id: userId,
@@ -444,11 +653,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       for await (const chunk of client.stream(requestId)) {
         if (chunk.error) {
+          const complianceMessage = toComplianceMessage(chunk.error.code, chunk.error.message);
           set({
-            status: "error",
-            errorMessage: toComplianceMessage(chunk.error.code, chunk.error.message),
+            status: "idle",
+            errorMessage: complianceMessage,
             activeRequestId: null,
           });
+          set((prev) => ({
+            messages: prev.messages.map((message) =>
+              message.id === assistantMessage.id ? { ...message, content: complianceMessage } : message
+            ),
+          }));
           return;
         }
 
@@ -497,6 +712,21 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           set({ status: "idle", activeRequestId: null });
         }
       }
+
+      const after = get();
+      if (after.status !== "error" && after.hydrated) {
+        const u = after.messages.find((m) => m.id === userMessage.id);
+        const a = after.messages.find((m) => m.id === assistantMessage.id);
+        if (u && a && u.role === "user" && a.role === "assistant") {
+          try {
+            await portalHistory.appendMessages(sessionId, [u, a]);
+          } catch (persistErr) {
+            set({
+              historyError: persistErr instanceof Error ? persistErr.message : "保存消息失败",
+            });
+          }
+        }
+      }
     } catch (error) {
       set({
         status: "error",
@@ -527,7 +757,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     if (!sourceUserMessage || sourceUserMessage.role !== "user") return;
 
     const replacementAssistant: ChatMessage = {
-      id: makeId("msg_assistant"),
+      id: makeId(),
       session_id: sessionId,
       tenant_id: tenantId,
       user_id: userId,
@@ -614,11 +844,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       for await (const chunk of client.stream(requestId)) {
         if (chunk.error) {
+          const complianceMessage = toComplianceMessage(chunk.error.code, chunk.error.message);
           set({
-            status: "error",
-            errorMessage: toComplianceMessage(chunk.error.code, chunk.error.message),
+            status: "idle",
+            errorMessage: complianceMessage,
             activeRequestId: null,
           });
+          set((prev) => ({
+            messages: prev.messages.map((message) =>
+              message.id === replacementAssistant.id ? { ...message, content: complianceMessage } : message
+            ),
+          }));
           return;
         }
 
@@ -666,6 +902,18 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           set({ status: "idle", activeRequestId: null });
         }
       }
+
+      const afterEdit = get();
+      if (afterEdit.status !== "error" && afterEdit.hydrated) {
+        const snapshot = getSessionMessages(afterEdit.messages, sessionId);
+        try {
+          await portalHistory.replaceMessages(sessionId, snapshot);
+        } catch (persistErr) {
+          set({
+            historyError: persistErr instanceof Error ? persistErr.message : "保存消息失败",
+          });
+        }
+      }
     } catch (error) {
       set({
         status: "error",
@@ -695,7 +943,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
     const targetUserMessageId = sourceUserMessage.id;
 
     const replacementAssistant: ChatMessage = {
-      id: makeId("msg_assistant"),
+      id: makeId(),
       session_id: sessionId,
       tenant_id: tenantId,
       user_id: userId,
@@ -768,11 +1016,17 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       for await (const chunk of client.stream(requestId)) {
         if (chunk.error) {
+          const complianceMessage = toComplianceMessage(chunk.error.code, chunk.error.message);
           set({
-            status: "error",
-            errorMessage: toComplianceMessage(chunk.error.code, chunk.error.message),
+            status: "idle",
+            errorMessage: complianceMessage,
             activeRequestId: null,
           });
+          set((prev) => ({
+            messages: prev.messages.map((message) =>
+              message.id === replacementAssistant.id ? { ...message, content: complianceMessage } : message
+            ),
+          }));
           return;
         }
 
@@ -818,6 +1072,18 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
         if (chunk.done) {
           set({ status: "idle", activeRequestId: null });
+        }
+      }
+
+      const afterRegen = get();
+      if (afterRegen.status !== "error" && afterRegen.hydrated) {
+        const snapshot = getSessionMessages(afterRegen.messages, sessionId);
+        try {
+          await portalHistory.replaceMessages(sessionId, snapshot);
+        } catch (persistErr) {
+          set({
+            historyError: persistErr instanceof Error ? persistErr.message : "保存消息失败",
+          });
         }
       }
     } catch (error) {

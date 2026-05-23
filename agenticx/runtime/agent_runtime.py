@@ -20,7 +20,13 @@ import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Sequence
 
-from agenticx.cli.agent_tools import STUDIO_TOOLS, dispatch_tool_async, tool_denied_by_session_permissions
+from agenticx.cli.agent_tools import (
+    STUDIO_TOOLS,
+    studio_tools_for_session,
+    _TOOL_REQUIRED_PARAMS,
+    dispatch_tool_async,
+    tool_denied_by_session_permissions,
+)
 from agenticx.cli.studio_mcp import build_mcp_tools_context
 from agenticx.cli.studio_skill import get_all_skill_summaries
 from agenticx.runtime.compactor import ContextCompactor
@@ -32,6 +38,11 @@ from agenticx.runtime.loop_detector import LoopDetector
 from agenticx.runtime.llm_retry import LLMRetryPolicy, _classify_error
 from agenticx.runtime.token_budget import BudgetLevel, TokenBudgetGuard
 from agenticx.runtime.usage_metadata import usage_metadata_from_llm_response
+from agenticx.runtime.followup_stream import (
+    FollowupStreamEmitter,
+    split_final_answer_and_followups,
+    suggested_questions_enabled_from_config,
+)
 from agenticx.llms.provider_fault import classify_provider_fault, record_session_provider_hard_failure
 
 if TYPE_CHECKING:
@@ -60,6 +71,90 @@ def _env_int_runtime(key: str, default: int) -> int:
         except ValueError:
             pass
     return default
+
+
+def _build_user_goal_anchor(
+    session: "StudioSession",
+    round_idx: int,
+    max_rounds: int,
+    tools_used_so_far: int,
+    messages_total_chars: int,
+) -> Optional[Dict[str, Any]]:
+    """Build user goal anchor message for long-horizon task context management (FR-2/FR-3).
+
+    Returns ephemeral system message that reinforces user's original query
+    without being persisted to session history (NFR-3).
+    """
+    # NFR-6: Escape hatch to disable anchor injection
+    if os.environ.get("AGX_GOAL_ANCHOR_DISABLE", "").strip() == "1":
+        return None
+
+    user_intent_raw = getattr(session, "current_user_intent", None)
+    # NFR-4: Skip if None or whitespace-only (including empty string)
+    if not user_intent_raw or not str(user_intent_raw).strip():
+        return None
+
+    # FR-3: Read threshold environment variables
+    full_trigger_tools = _env_int_runtime("AGX_GOAL_ANCHOR_FULL_TRIGGER_TOOLS", 3)
+    full_trigger_chars = _env_int_runtime("AGX_GOAL_ANCHOR_FULL_TRIGGER_CHARS", 20000)
+    agent_msg_count = len(getattr(session, "agent_messages", []))
+
+    # Defensive intent length cap for compact/full modes (parity with compactor's 4000-char cap).
+    # full/compact modes embed the intent verbatim; cap to 2000 chars to prevent abnormally long
+    # inputs from blowing up the per-round anchor cost. Minimal mode caps independently below.
+    user_intent_full = str(user_intent_raw)[:2000]
+
+    is_first_round = round_idx == 1 and tools_used_so_far == 0
+    is_complex = (
+        tools_used_so_far >= full_trigger_tools
+        or messages_total_chars >= full_trigger_chars
+        or agent_msg_count >= 8
+    )
+
+    if is_first_round:
+        # First round: minimal anchor (≤80 chars as per FR-3)
+        # Prefix "[user-goal-anchor] " is 19 chars, so intent truncated to 60 chars
+        anchor_text = f"[user-goal-anchor] {str(user_intent_raw)[:60]}"
+        mode = "minimal"
+    elif is_complex:
+        # Complex scenario: full anchor with 4 execution disciplines (FR-2).
+        # Discipline #3 threshold is derived from full_trigger_tools so the anchor body stays
+        # consistent with the actual env-configurable trigger (no hard-coded "5").
+        stop_threshold = max(full_trigger_tools + 2, 5)
+        anchor_text = (
+            f"[user-goal-anchor] (round {round_idx}/{max_rounds}, tools_used_so_far={tools_used_so_far})\n"
+            f"==== 用户当前原始问题（一字不差，禁止改写）====\n"
+            f"{user_intent_full}\n"
+            f"==================================\n"
+            f"执行纪律：\n"
+            f"1. 本轮所有工具调用与最终答复必须直接服务于上述问题；\n"
+            f"2. 若发现自己正在重复上一轮已做过的对比/分析，立即停止并直接基于已有信息产出最终方案；\n"
+            f"3. 工具调用累计 >= {stop_threshold} 次仍未直接回答原始问题时，停止信息收集并产出方案；\n"
+            f"4. 最终回复必须明确对照原始问题的每个子问题逐点作答（若有 a/b/c 子问题，回复中需对应 a/b/c）。"
+        )
+        mode = "full"
+    else:
+        # Middle ground: compact anchor without discipline details (FR-3)
+        anchor_text = (
+            f"[user-goal-anchor] (round {round_idx}/{max_rounds})\n"
+            f"==== 用户当前原始问题 ====\n"
+            f"{user_intent_full}\n"
+            f"=================================="
+        )
+        mode = "compact"
+
+    # NFR-7: Structured logging for observability
+    logging.getLogger(__name__).info(
+        "goal_anchor_injected=true session=%s round=%d/%d tools_used=%d anchor_chars=%d mode=%s",
+        getattr(session, "session_id", "unknown") or getattr(session, "_session_id", "unknown"),
+        round_idx,
+        max_rounds,
+        tools_used_so_far,
+        len(anchor_text),
+        mode,
+    )
+
+    return {"role": "system", "content": anchor_text}
 
 
 def _maybe_persist_large_tool_result(
@@ -282,6 +377,43 @@ def _resolve_llm_hard_timeout_seconds(session: StudioSession) -> float:
     return DEFAULT_LLM_HARD_TIMEOUT_SECONDS
 
 
+def _streamed_tool_call_truncated(name: str, args_obj: Dict[str, Any]) -> bool:
+    """FR-C: judge whether a streamed tool call has been truncated.
+
+    A tool call is considered truncated (and should NOT be dispatched) when:
+    - the tool has at least one `required` parameter declared on its schema, AND
+    - the parsed arguments dict is empty.
+
+    Splitting this out as a module-level pure function keeps the streaming
+    aggregator readable and unit-testable.
+    """
+    if not name:
+        return False
+    required = _TOOL_REQUIRED_PARAMS.get(name)
+    if not required:
+        return False
+    if isinstance(args_obj, dict) and len(args_obj) == 0:
+        return True
+    return False
+
+
+def _build_streamed_tool_truncation_hint(names: Sequence[str]) -> str:
+    """FR-C: human-readable retry hint appended to assistant text when streamed
+    tool calls were dropped due to truncation.
+
+    The text is intentionally directive ("立即重新调用") to fight the failure
+    mode where weak models read "ERROR" and then give up the whole task.
+    """
+    unique_names = ", ".join(sorted({n for n in names if n}))
+    if not unique_names:
+        unique_names = "<unknown>"
+    return (
+        f"[系统通知] 上一次工具调用（{unique_names}）因流式输出被截断导致参数为空，已被丢弃。"
+        f"请立即重新调用同一工具，并把所有 required 参数完整填写一次"
+        f"（file_write/file_edit 必须包含完整的 path 与 content/old_string/new_string）。"
+    )
+
+
 def _repair_streamed_tool_arguments(raw: str) -> Dict[str, Any]:
     def _sanitize_parsed_args(parsed: Dict[str, Any]) -> Dict[str, Any]:
         # Drop leaked streamed metadata keys/values such as call_xxx / sa-xxxx
@@ -374,6 +506,18 @@ def _build_agent_system_prompt(session: StudioSession) -> str:
     if not mcp_context:
         mcp_context = "(no MCP tools connected)"
 
+    try:
+        from agenticx.runtime.prompts.code_mode import build_code_dev_prompt_blocks
+
+        code_dev_block = build_code_dev_prompt_blocks(session)
+    except Exception:
+        code_dev_block = ""
+    try:
+        from agenticx.project_state.prompts import build_project_state_blocks
+
+        project_state_block = build_project_state_blocks(session)
+    except Exception:
+        project_state_block = ""
     return (
         "你是 AgenticX Studio 的执行型 Agent（implement 角色）。\n"
         "核心目标：根据用户请求完成代码/命令操作，并在不确定或高风险动作前主动确认。\n\n"
@@ -390,6 +534,8 @@ def _build_agent_system_prompt(session: StudioSession) -> str:
         f"{_serialize_scratchpad(session)}\n\n"
         "## 当前 context_files\n"
         f"{_serialize_context_files(session)}\n\n"
+        f"{code_dev_block}"
+        f"{project_state_block}"
         "## 当前 MCP 工具上下文\n"
         f"{_truncate(mcp_context, 6000)}\n\n"
         "## 浏览器自动化（browser-use 等 MCP）\n"
@@ -546,7 +692,9 @@ def _merge_consecutive_simple_roles_for_minimax(
 
     MiniMax returns error 2013 (invalid chat setting) when the same role
     appears on consecutive messages (e.g. main system prompt + [compacted]
-    system block from ContextCompactor). Tool-call turns are left unchanged.
+    system block from ContextCompactor). It also rejects system messages outside
+    the first position, so runtime-injected system notes are downgraded to user
+    context before the request is sent. Tool-call turns are left unchanged.
     """
     merge_roles = frozenset({"system", "user"})
     out: List[Dict[str, Any]] = []
@@ -556,6 +704,10 @@ def _merge_consecutive_simple_roles_for_minimax(
         if m.get("tool_calls"):
             out.append(m)
             continue
+        if role == "system" and out:
+            m["role"] = "user"
+            m["content"] = f"[system-context]\n{str(m.get('content', '')).strip()}"
+            role = "user"
         if role not in merge_roles:
             out.append(m)
             continue
@@ -732,6 +884,7 @@ class AgentRuntime:
             warning_threshold=loop_warning_threshold,
             critical_threshold=loop_critical_threshold,
         )
+        self._pending_loop_nudge: Optional[str] = None
         self._recent_exploratory_fps: deque[str] = deque(maxlen=10)
         # Exploratory tools get a bounded "schema discovery" budget:
         # the first N consecutive unique errors count as progress, after
@@ -806,6 +959,8 @@ class AgentRuntime:
         user_message_content: Optional[Any] = None,
         history_user_attachments: Optional[list[dict[str, Any]]] = None,
         persist_user_message: bool = True,
+        usage_session_id: Optional[str] = None,
+        usage_avatar_id: Optional[str] = None,
     ) -> AsyncGenerator[RuntimeEvent, None]:
         async def _check_should_stop() -> bool:
             if should_stop is None:
@@ -819,6 +974,7 @@ class AgentRuntime:
                 return False
 
         self.token_budget.reset_turn()
+        self._pending_loop_nudge = None
         self._last_persist_time = time.time()
         self._tools_since_persist = 0
         # Reset per-turn exploratory tracking so each turn starts with a
@@ -827,20 +983,55 @@ class AgentRuntime:
         self._exploratory_error_streak = 0
 
         current_system_prompt = system_prompt or _build_agent_system_prompt(session)
-        active_tools: Sequence[Dict[str, Any]] = STUDIO_TOOLS if tools is None else tools
+        active_tools: Sequence[Dict[str, Any]] = (
+            studio_tools_for_session(session) if tools is None else tools
+        )
         allowed_tool_names = {
             str(tool.get("function", {}).get("name", "")).strip()
             for tool in active_tools
             if isinstance(tool, dict)
         }
         history = _sanitize_context_messages(session.agent_messages)
+        if getattr(session, "_code_dev_phase_compact_pending", False):
+            setattr(session, "_code_dev_phase_compact_pending", False)
+            compact_model = str(getattr(session, "model_name", "") or "")
+            history, _phase_did, _phase_sum, _phase_cnt, _ = await self.compactor.maybe_compact(
+                history,
+                force=True,
+                model=compact_model,
+            )
+            if _phase_did:
+                session.agent_messages = list(history)
         compact_model = str(getattr(session, "model_name", "") or "")
-        compacted_history, did_compact, compact_summary, compacted_count = await self.compactor.maybe_compact(
+        compacted_history, did_compact, compact_summary, compacted_count, _pending_q = await self.compactor.maybe_compact(
             history,
             model=compact_model,
         )
         messages: List[Dict[str, Any]] = [{"role": "system", "content": current_system_prompt}]
         messages.extend(compacted_history)
+        try:
+            from agenticx.runtime.session_mode import (
+                EXPLORE_WHOLE_FILE_READ_WARN_KEY,
+                PHASE_EXPLORE,
+                get_session_phase,
+                is_code_dev,
+            )
+
+            if is_code_dev(session) and get_session_phase(session) == PHASE_EXPLORE:
+                scratch = getattr(session, "scratchpad", None) or {}
+                if isinstance(scratch, dict):
+                    warn_n = int(scratch.get(EXPLORE_WHOLE_FILE_READ_WARN_KEY, 0) or 0)
+                    if warn_n >= 2:
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "[code_dev] 当前处于探索阶段，已连续整文件 file_read。"
+                                "请先使用 code_outline / grep 定位，再用 start_line/end_line 片段读取。"
+                            ),
+                        })
+                        scratch[EXPLORE_WHOLE_FILE_READ_WARN_KEY] = "0"
+        except Exception:
+            pass
         if did_compact:
             yield RuntimeEvent(
                 type=EventType.COMPACTION.value,
@@ -863,6 +1054,8 @@ class AgentRuntime:
             if history_user_attachments:
                 hist_user["attachments"] = list(history_user_attachments)
             session.chat_history.append(hist_user)
+            # Set current user intent for goal anchor injection (FR-1)
+            session.current_user_intent = user_input
         status_query_total = 0
         status_query_attempts_total = 0
         max_status_queries_per_turn = _resolve_status_query_budget_per_turn()
@@ -892,11 +1085,27 @@ class AgentRuntime:
             if await _check_should_stop():
                 yield RuntimeEvent(type=EventType.ERROR.value, data={"text": STOP_MESSAGE}, agent_id=agent_id)
                 return
+            if self._pending_loop_nudge:
+                nudge_text = self._pending_loop_nudge
+                self._pending_loop_nudge = None
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": f"[runtime-loop-hint]\n{nudge_text}",
+                    }
+                )
+                logger.info(
+                    "loop_nudge_injected=true session=%s round=%s",
+                    getattr(session, "session_id", ""),
+                    round_idx,
+                )
             yield RuntimeEvent(
                 type=EventType.ROUND_START.value,
                 data={"round": round_idx, "max_rounds": self.max_tool_rounds},
                 agent_id=agent_id,
             )
+            _followups_enabled = suggested_questions_enabled_from_config()
+            followup_emitter = FollowupStreamEmitter(_followups_enabled)
             if agent_id != "meta" and round_idx > 1 and (round_idx - 1) % 8 == 0:
                 checkpoint = {
                     "agent_id": agent_id,
@@ -947,6 +1156,9 @@ class AgentRuntime:
                         "content": "<reminder>10+ rounds without todo_write. Please update todo list.</reminder>",
                     }
                 )
+            # FR-C: 标记本轮是否需要因流式工具调用截断而强制进入下一轮，
+            # 而不是把空 tool_calls 当作模型最终回答处理。每轮起始重置。
+            force_retry_next_round = False
             try:
                 # Increment per-turn counter for SessionReviewHook nudge threshold
                 session._turns_since_skill_manage = getattr(session, "_turns_since_skill_manage", 0) + 1
@@ -954,6 +1166,25 @@ class AgentRuntime:
                 messages = _sanitize_context_messages(messages)
                 if provider_name.strip().lower() == "minimax":
                     messages = _merge_consecutive_simple_roles_for_minimax(messages)
+                # P1-T4 (v2): Inject ephemeral user goal anchor as a temporary view for THIS LLM call only.
+                # Critical: do NOT mutate `messages` itself—anchor must not survive into the next round
+                # (NFR-3 ephemeral semantics). All downstream LLM calls in this round use messages_for_llm.
+                messages_total_chars = sum(
+                    len(str(m.get("content", ""))) for m in messages if isinstance(m, dict)
+                )
+                anchor_message = _build_user_goal_anchor(
+                    session=session,
+                    round_idx=round_idx,
+                    max_rounds=self.max_tool_rounds,
+                    tools_used_so_far=len(executed_tool_names),
+                    messages_total_chars=messages_total_chars,
+                )
+                if anchor_message:
+                    messages_for_llm = list(messages) + [anchor_message]
+                else:
+                    messages_for_llm = messages
+                if provider_name.strip().lower() == "minimax":
+                    messages_for_llm = _merge_consecutive_simple_roles_for_minimax(messages_for_llm)
                 response_text = ""
                 tool_calls: List[Dict[str, Any]] = []
                 response: Any
@@ -984,7 +1215,7 @@ class AgentRuntime:
                                     stream_kwargs.pop("temperature", None)
                                     stream_kwargs["max_tokens"] = 4096
                                 for chunk in stream_with_tools(
-                                    messages,
+                                    messages_for_llm,
                                     **stream_kwargs,
                                 ):
                                     if stop_stream.is_set():
@@ -1078,11 +1309,13 @@ class AgentRuntime:
                                 tok = str(stream_chunk.get("text", ""))
                                 if tok:
                                     response_text += tok
-                                    yield RuntimeEvent(
-                                        type=EventType.TOKEN.value,
-                                        data={"text": tok},
-                                        agent_id=agent_id,
-                                    )
+                                    _vis = followup_emitter.feed_append(tok)
+                                    if _vis:
+                                        yield RuntimeEvent(
+                                            type=EventType.TOKEN.value,
+                                            data={"text": _vis},
+                                            agent_id=agent_id,
+                                        )
                             elif chunk_type == "usage":
                                 usage_raw = stream_chunk.get("usage", {})
                                 if isinstance(usage_raw, dict):
@@ -1123,6 +1356,11 @@ class AgentRuntime:
                                 if args_delta:
                                     acc["arguments"] += args_delta
                         await stream_task
+                        # FR-C：流式工具调用偶尔因 token 紧张被截断 → arguments 字段为空。
+                        # 如果该工具有 required 参数（如 file_write），则不要把空参数派发出去，
+                        # 改成丢弃并往本轮 response_text 追加一条 retry hint，让下一轮 LLM
+                        # 看到提示后重新生成完整调用，避免「ERROR → 模型放弃」死循环。
+                        truncated_tool_names: List[str] = []
                         for idx in sorted(tool_calls_acc.keys()):
                             item = tool_calls_acc[idx]
                             accumulated_name = (item.get("name") or "").strip()
@@ -1133,6 +1371,15 @@ class AgentRuntime:
                                 )
                                 continue
                             args_obj = _repair_streamed_tool_arguments(item.get("arguments", ""))
+                            if _streamed_tool_call_truncated(accumulated_name, args_obj):
+                                logger.warning(
+                                    "Dropping streamed tool_call '%s' (idx=%d) due to truncated/empty arguments; "
+                                    "will surface retry hint to model",
+                                    accumulated_name,
+                                    idx,
+                                )
+                                truncated_tool_names.append(accumulated_name)
+                                continue
                             tool_calls.append(
                                 {
                                     "id": item.get("id") or f"stream-{uuid.uuid4().hex[:8]}",
@@ -1142,6 +1389,30 @@ class AgentRuntime:
                                         "arguments": json.dumps(args_obj, ensure_ascii=False),
                                     },
                                 }
+                            )
+                        # FR-C: 流式工具调用被截断后，drop 掉的空参 tool_call
+                        # 不能让 turn 走 finalText 分支结束。这里把 hint 注入
+                        # messages 里作为 system 消息，并设置 force_retry 标志，
+                        # 让外层 for round_idx 循环立即进入下一轮 LLM 调用。
+                        if truncated_tool_names:
+                            force_retry_next_round = True
+                            hint = _build_streamed_tool_truncation_hint(truncated_tool_names)
+                            # 把 hint 同时写进会话历史（让前端/后续 LLM 上下文都能感知），
+                            # 但不附加到 assistant_message——避免污染 tool_calls 链路。
+                            messages.append({"role": "system", "content": hint})
+                            session.agent_messages.append({"role": "system", "content": hint})
+                            # 给前端透出一条事件，提示当前轮被流式截断、即将自动重试，
+                            # 而不是让 UI 看到"模型沉默"再触发 stall 提示。
+                            yield RuntimeEvent(
+                                type=EventType.ROUND_END.value,
+                                data={
+                                    "round": round_idx,
+                                    "max_rounds": self.max_tool_rounds,
+                                    "auto_retry": True,
+                                    "reason": "streamed_tool_call_truncated",
+                                    "tools": sorted(set(truncated_tool_names)),
+                                },
+                                agent_id=agent_id,
                             )
                         response = type(
                             "StreamResponse",
@@ -1171,7 +1442,7 @@ class AgentRuntime:
                     def _invoke_once_with_fallback() -> Any:
                         try:
                             return self.llm.invoke(
-                                messages,
+                                messages_for_llm,
                                 tools=active_tools,
                                 tool_choice="auto",
                                 temperature=0.2,
@@ -1201,7 +1472,7 @@ class AgentRuntime:
                                 last_exc: Exception = invoke_exc
                                 for retry_kwargs in minimax_retries:
                                     try:
-                                        return self.llm.invoke(messages, **retry_kwargs)
+                                        return self.llm.invoke(messages_for_llm, **retry_kwargs)
                                     except Exception as retry_exc:
                                         last_exc = retry_exc
                                         if not _is_minimax_chat_setting_error(retry_exc):
@@ -1256,6 +1527,32 @@ class AgentRuntime:
 
                 _round_usage = usage_metadata_from_llm_response(response)
                 self.token_budget.record(_round_usage)
+                if _round_usage:
+                    usage_snapshot = dict(_round_usage)
+
+                    async def _persist_usage_row() -> None:
+                        try:
+                            from agenticx.runtime.usage_store import get_usage_store
+
+                            sid_eff = (usage_session_id or "").strip() or str(
+                                getattr(session, "_usage_owner_session_id", "") or ""
+                            ).strip()
+                            aid_eff = (usage_avatar_id or "").strip()
+                            await get_usage_store().record_async(
+                                session_id=sid_eff,
+                                avatar_id=aid_eff,
+                                provider=provider_name,
+                                model=model_name,
+                                input_tokens=int(usage_snapshot.get("input_tokens", 0) or 0),
+                                output_tokens=int(usage_snapshot.get("output_tokens", 0) or 0),
+                                cached_tokens=int(usage_snapshot.get("cached_tokens", 0) or 0),
+                                reasoning_tokens=int(usage_snapshot.get("reasoning_tokens", 0) or 0),
+                                total_tokens=int(usage_snapshot.get("total_tokens", 0) or 0),
+                            )
+                        except Exception as exc:
+                            logger.debug("usage persist skipped: %s", exc)
+
+                    asyncio.create_task(_persist_usage_row())
                 budget_level, budget_source, budget_current, budget_max = self.token_budget.check_with_source()
                 if budget_level == BudgetLevel.EXCEEDED:
                     yield RuntimeEvent(
@@ -1273,7 +1570,7 @@ class AgentRuntime:
                     return
                 if budget_level == BudgetLevel.COMPRESS:
                     hist_compact = _sanitize_context_messages(session.agent_messages)
-                    react_hist, did_react, react_summary, react_count = await self.compactor.maybe_compact(
+                    react_hist, did_react, react_summary, react_count, _pending_q_react = await self.compactor.maybe_compact(
                         hist_compact,
                         force=True,
                         model=model_name,
@@ -1281,15 +1578,6 @@ class AgentRuntime:
                     if did_react:
                         session.agent_messages = react_hist
                         messages[:] = [{"role": "system", "content": current_system_prompt}, *list(react_hist)]
-                        yield RuntimeEvent(
-                            type=EventType.COMPACTION.value,
-                            data={
-                                "compacted_count": react_count,
-                                "summary": react_summary,
-                                "reactive": True,
-                            },
-                            agent_id=agent_id,
-                        )
                         try:
                             await self.hooks.run_on_compaction(react_count, react_summary, session)
                         except Exception:
@@ -1305,6 +1593,57 @@ class AgentRuntime:
                                 ),
                             },
                         )
+                        # FR-4: one concise notice — skip separate reactive compaction event when
+                        # budget is still over limit (Desktop would otherwise show two long lines).
+                        if did_react:
+                            compress_notice = (
+                                f"上下文接近上限，已压缩 {react_count} 条历史但仍超限，"
+                                "建议收口或新建会话。"
+                            )
+                        else:
+                            compress_notice = "上下文接近上限，建议收口或新建会话。"
+                        yield RuntimeEvent(
+                            type=EventType.ERROR.value,
+                            data={
+                                "text": compress_notice,
+                                "severity": "warning",
+                                "detector": "token_budget_compress",
+                                "current": budget_current,
+                                "max": budget_max,
+                            },
+                            agent_id=agent_id,
+                        )
+                    elif did_react:
+                        yield RuntimeEvent(
+                            type=EventType.COMPACTION.value,
+                            data={
+                                "compacted_count": react_count,
+                                "summary": react_summary,
+                                "reactive": True,
+                            },
+                            agent_id=agent_id,
+                        )
+                    # FR-5: surface compactor circuit-breaker tripping so the user
+                    # knows long-session stability may degrade.
+                    cf_state = getattr(self, "_compactor_failure_warned", False)
+                    cf_count = int(getattr(self.compactor, "_consecutive_failures", 0) or 0)
+                    if cf_count >= 3 and not cf_state:
+                        self._compactor_failure_warned = True
+                        yield RuntimeEvent(
+                            type=EventType.ERROR.value,
+                            data={
+                                "text": (
+                                    "自动上下文压缩已暂停（连续 3 次失败）。长会话稳定性可能下降，"
+                                    "建议新建会话或检查模型连通性。"
+                                ),
+                                "severity": "warning",
+                                "detector": "compactor_circuit_breaker",
+                            },
+                            agent_id=agent_id,
+                        )
+                    elif cf_count == 0 and cf_state:
+                        # Reset latch when compactor recovers.
+                        self._compactor_failure_warned = False
                 if budget_level == BudgetLevel.WARNING:
                     messages.append({"role": "user", "content": self.token_budget.convergence_hint()})
             except asyncio.TimeoutError:
@@ -1323,14 +1662,38 @@ class AgentRuntime:
                 )
                 return
             except Exception as exc:
+                fault = classify_provider_fault(exc)
                 record_session_provider_hard_failure(
                     session,
                     provider_name,
-                    fault=classify_provider_fault(exc),
+                    fault=fault,
                 )
+                if fault == "rate_limit" and agent_id != "meta":
+                    pause_text = (
+                        f"模型供应商触发限流（provider={provider_name or '(unknown)'}, "
+                        f"model={model_name or '(unknown)'}）。任务已暂停，可等待限流窗口恢复后继续。"
+                    )
+                    yield RuntimeEvent(
+                        type=EventType.SUBAGENT_PAUSED.value,
+                        data={
+                            "agent_id": agent_id,
+                            "round": round_idx,
+                            "max_rounds": self.max_tool_rounds,
+                            "text": pause_text,
+                            "detector": "rate_limit",
+                            "retryable": True,
+                        },
+                        agent_id=agent_id,
+                    )
+                    return
                 yield RuntimeEvent(
                     type=EventType.ERROR.value,
-                    data={"text": f"模型调用失败: {exc}"},
+                    data={
+                        "text": f"模型调用失败: {exc}",
+                        "detector": fault,
+                        "retryable": fault in {"rate_limit", "transient"},
+                        "severity": "warning" if fault == "rate_limit" else "error",
+                    },
                     agent_id=agent_id,
                 )
                 return
@@ -1342,6 +1705,15 @@ class AgentRuntime:
                 and (tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}).get("name")
                 and str((tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}).get("name", "")).strip().lower() != "none"
             ]
+            # FR-C: 如果本轮所有 tool_calls 都因流式截断被丢弃，禁止把空 tool_calls
+            # 当作"模型最终回答"处理，强制进入下一轮 LLM 调用让模型重新生成完整工具调用。
+            if force_retry_next_round and not tool_calls:
+                logger.info(
+                    "force_retry_next_round=true session=%s round=%s reason=streamed_tool_call_truncated",
+                    getattr(session, "session_id", ""),
+                    round_idx,
+                )
+                continue
             if not tool_calls:
                 inline_tool = _extract_inline_tool_call(response_text, allowed_tool_names)
                 if inline_tool is not None:
@@ -1355,7 +1727,12 @@ class AgentRuntime:
                             },
                         }
                     ]
-            assistant_message: Dict[str, Any] = {"role": "assistant", "content": response_text}
+            ac_clean, _ac_suggestions = (
+                split_final_answer_and_followups(response_text)
+                if _followups_enabled
+                else (response_text, [])
+            )
+            assistant_message: Dict[str, Any] = {"role": "assistant", "content": ac_clean}
             if tool_calls:
                 assistant_message["tool_calls"] = tool_calls
             session.agent_messages.append(assistant_message)
@@ -1365,9 +1742,14 @@ class AgentRuntime:
                 if response_text.strip():
                     # Tokens were already streamed to the client during the
                     # invoke/stream phase above; do NOT re-send them here.
-                    final_text = response_text.strip()
+                    final_text, sug_list = (
+                        split_final_answer_and_followups(response_text)
+                        if _followups_enabled
+                        else (response_text.strip(), [])
+                    )
                 else:
                     streamed_text = ""
+                    sug_list = []
                     try:
                         token_queue: asyncio.Queue[str | None] = asyncio.Queue()
                         stream_loop = asyncio.get_running_loop()
@@ -1400,12 +1782,23 @@ class AgentRuntime:
                             if tok is None:
                                 break
                             streamed_text += tok
-                            yield RuntimeEvent(type=EventType.TOKEN.value, data={"text": tok}, agent_id=agent_id)
+                            _vis2 = followup_emitter.feed_append(tok)
+                            if _vis2:
+                                yield RuntimeEvent(
+                                    type=EventType.TOKEN.value,
+                                    data={"text": _vis2},
+                                    agent_id=agent_id,
+                                )
 
                         await stream_task
                     except Exception:
                         streamed_text = response_text
-                    final_text = streamed_text.strip() if streamed_text.strip() else response_text
+                    raw_tail = streamed_text.strip() if streamed_text.strip() else response_text
+                    final_text, sug_list = (
+                        split_final_answer_and_followups(raw_tail)
+                        if _followups_enabled
+                        else (str(raw_tail).strip(), [])
+                    )
                 if not str(final_text).strip() and executed_tool_names:
                     unique_tools = ", ".join(dict.fromkeys(executed_tool_names))
                     final_text = (
@@ -1413,26 +1806,34 @@ class AgentRuntime:
                         f"{unique_tools}）。\n"
                         "当前模型未返回进一步正文，请继续给我下一步指令。"
                     )
+                    sug_list = []
                 if not _is_system_trigger:
-                    session.chat_history.append({"role": "assistant", "content": final_text})
+                    _hist_assistant: Dict[str, Any] = {"role": "assistant", "content": final_text}
+                    if sug_list:
+                        _hist_assistant["suggested_questions"] = list(sug_list)
+                    session.chat_history.append(_hist_assistant)
                 await self.hooks.run_on_agent_end(final_text, session)
                 _um = usage_metadata_from_llm_response(response)
                 _final_data: dict[str, Any] = {"text": final_text}
+                if sug_list:
+                    _final_data["suggested_questions"] = list(sug_list)
                 if _um:
-                    _final_data["usage_metadata"] = _um
+                    _final_data["usage_metadata"] = {
+                        **_um,
+                        "model": model_name,
+                        "provider": provider_name,
+                    }
                 yield RuntimeEvent(type=EventType.FINAL.value, data=_final_data, agent_id=agent_id)
                 return
 
             assistant_tool_message = {
                 "role": "assistant",
-                "content": response_text,
+                "content": ac_clean,
                 "tool_calls": tool_calls,
             }
             messages.append(assistant_tool_message)
-            tool_calls_summary = _summarize_tool_calls_for_history(tool_calls)
-            tool_call_text = f"工具调用:\n{json.dumps(tool_calls_summary, ensure_ascii=False)}"
-            if not _is_system_trigger:
-                session.chat_history.append({"role": "tool", "content": tool_call_text})
+            if not _is_system_trigger and str(ac_clean or "").strip():
+                session.chat_history.append({"role": "assistant", "content": ac_clean})
 
             _parallel_mode = _parallel_tools_enabled() and len(tool_calls) > 1
             if _parallel_mode:
@@ -1477,7 +1878,14 @@ class AgentRuntime:
                     synced_session_message_count = len(session.agent_messages)
                     if not _is_system_trigger:
                         session.chat_history.append(
-                            {"role": "tool", "content": f"工具结果({tool_name}):\n{invalid_message}"}
+                        {
+                            "role": "tool",
+                            "content": invalid_message,
+                            "tool_call_id": tool_call_id,
+                            "tool_name": tool_name,
+                            "tool_args": arguments,
+                            "tool_status": "error",
+                        }
                         )
                     yield RuntimeEvent(
                         type=EventType.ERROR.value,
@@ -1513,7 +1921,14 @@ class AgentRuntime:
                     synced_session_message_count = len(session.agent_messages)
                     if not _is_system_trigger:
                         session.chat_history.append(
-                            {"role": "assistant", "content": f"工具结果({tool_name}):\n{denied_message}"}
+                        {
+                            "role": "tool",
+                            "content": denied_message,
+                            "tool_call_id": tool_call_id,
+                            "tool_name": tool_name,
+                            "tool_args": arguments,
+                            "tool_status": "error",
+                        }
                         )
                     yield RuntimeEvent(
                         type=EventType.ERROR.value,
@@ -1547,7 +1962,14 @@ class AgentRuntime:
                     synced_session_message_count = len(session.agent_messages)
                     if not _is_system_trigger:
                         session.chat_history.append(
-                            {"role": "assistant", "content": f"工具结果({tool_name}):\n{denied_message}"}
+                            {
+                                "role": "tool",
+                                "content": denied_message,
+                                "tool_call_id": tool_call_id,
+                                "tool_name": tool_name,
+                                "tool_args": arguments,
+                                "tool_status": "error",
+                            }
                         )
                     yield RuntimeEvent(
                         type=EventType.ERROR.value,
@@ -1956,6 +2378,9 @@ class AgentRuntime:
                             <= self._exploratory_error_budget
                         ):
                             logical_progress = True
+                result_fp: Optional[str] = None
+                if isinstance(result, str) and not is_error_result:
+                    result_fp = LoopDetector.fingerprint_from_result(result) or None
                 self.loop_detector.record_call(
                     tool_name,
                     LoopDetector.args_signature(arguments),
@@ -1965,8 +2390,11 @@ class AgentRuntime:
                         or disk_write_progress
                         or logical_progress
                     ),
+                    result_fingerprint=result_fp,
                 )
                 loop_issue = self.loop_detector.check()
+                if loop_issue is not None and loop_issue.nudge:
+                    self._pending_loop_nudge = loop_issue.nudge
                 loop_halt = loop_issue is not None and loop_issue.level == "critical"
                 if loop_issue is not None:
                     _original_task_snippet = (user_input or "").strip().replace("\n", " ")[:300]
@@ -1996,7 +2424,14 @@ class AgentRuntime:
                 synced_session_message_count = len(session.agent_messages)
                 if not _is_system_trigger:
                     session.chat_history.append(
-                        {"role": "tool", "content": f"工具结果({tool_name}):\n{result}"}
+                        {
+                            "role": "tool",
+                            "content": result,
+                            "tool_call_id": tool_call_id,
+                            "tool_name": tool_name,
+                            "tool_args": arguments,
+                            "tool_status": "error" if str(result).startswith("ERROR:") else "done",
+                        }
                     )
 
                 self._tools_since_persist += 1

@@ -7,8 +7,11 @@ import {
   chatMarkdownComponents,
   chatRehypePlugins,
   chatRemarkPlugins,
+  chatUrlTransform,
   normalizeChatMarkdownContent,
+  MarkdownContext,
 } from "./markdown-components";
+import { renderUserMessageInlineBody } from "./user-message-inline";
 
 type Props = {
   message: Message;
@@ -45,13 +48,25 @@ export function CleanBlock({ message, badge }: Props) {
           <ReasoningBlock text={parsed.reasoning} />
         ) : null}
         {hasBody ? (
-          <ReactMarkdown
-            remarkPlugins={chatRemarkPlugins}
-            rehypePlugins={chatRehypePlugins}
-            components={chatMarkdownComponents}
-          >
-            {normalizeChatMarkdownContent(bodyText)}
-          </ReactMarkdown>
+          isUser ? (
+            renderUserMessageInlineBody(
+              bodyText,
+              (message.attachments ?? []).filter((a) => !!a.referenceToken)
+            )
+          ) : (
+            <div className={!isUser && parsed?.reasoning ? "mt-2" : undefined}>
+              <MarkdownContext.Provider value={{ isStreaming }}>
+                <ReactMarkdown
+                  remarkPlugins={chatRemarkPlugins}
+                  rehypePlugins={chatRehypePlugins}
+                  components={chatMarkdownComponents}
+                  urlTransform={chatUrlTransform}
+                >
+                  {normalizeChatMarkdownContent(bodyText, { isStreaming })}
+                </ReactMarkdown>
+              </MarkdownContext.Provider>
+            </div>
+          )
         ) : null}
       </div>
     </div>

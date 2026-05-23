@@ -5,4 +5,15 @@ export * from "./users";
 export * from "./roles";
 export * from "./user-roles";
 export * from "./usage-records";
+export * from "./audit-events";
+export * from "./gateway-audit-events";
+export * from "./policy";
+export * from "./sso-providers";
+export * from "./chat-sessions";
+export * from "./chat-messages";
+export * from "./runtime-config";
+export * from "./gateway-channels";
+export * from "./api-tokens";
+export * from "./mcp-servers";
+export * from "./mcp-tools";
 

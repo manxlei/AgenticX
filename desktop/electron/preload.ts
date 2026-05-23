@@ -26,6 +26,8 @@ contextBridge.exposeInMainWorld("agenticxDesktop", {
   getApiBase: async (): Promise<string> => ipcRenderer.invoke("get-api-base"),
   getApiAuthToken: async (): Promise<string> => ipcRenderer.invoke("get-api-auth-token"),
   platform: async (): Promise<string> => ipcRenderer.invoke("get-platform"),
+  syncTitleBarOverlay: async (theme: "dark" | "light" | "dim") =>
+    ipcRenderer.invoke("sync-title-bar-overlay", theme) as Promise<{ ok: boolean; skipped?: boolean; error?: string }>,
   getConnectionMode: async (): Promise<"local" | "remote"> => ipcRenderer.invoke("get-connection-mode"),
   focusModeEnter: async (): Promise<{ ok: boolean; alreadyActive?: boolean; error?: string }> =>
     ipcRenderer.invoke("focus-mode-enter"),
@@ -145,6 +147,8 @@ contextBridge.exposeInMainWorld("agenticxDesktop", {
     pinned?: boolean;
     system_prompt?: string;
     tools_enabled?: Record<string, boolean>;
+    skills_enabled?: Record<string, boolean> | null;
+    brains_enabled?: "*" | string[] | null;
     default_provider?: string;
     default_model?: string;
   }) =>
@@ -196,7 +200,14 @@ contextBridge.exposeInMainWorld("agenticxDesktop", {
       `/api/sessions/search?${params.toString()}`
     );
   },
-  createSession: async (payload: { avatar_id?: string; name?: string; inherit_from_session_id?: string }) =>
+  createSession: async (payload: {
+    avatar_id?: string;
+    name?: string;
+    inherit_from_session_id?: string;
+    session_mode?: "code_dev" | "daily_office";
+    provider?: string;
+    model?: string;
+  }) =>
     ipcRenderer.invoke("create-session", payload),
   renameSession: async (payload: { sessionId: string; name: string }) =>
     ipcRenderer.invoke("rename-session", payload),
@@ -209,6 +220,8 @@ contextBridge.exposeInMainWorld("agenticxDesktop", {
   setSessionModel: async (payload: { sessionId: string; provider: string; model: string }) =>
     ipcRenderer.invoke("set-session-model", payload),
   loadLayout: async () => ipcRenderer.invoke("layout-get"),
+  saveUiPrefs: async (payload: { theme: "dark" | "light" | "dim" }) =>
+    ipcRenderer.invoke("ui-prefs-set", payload) as Promise<{ ok: boolean; error?: string }>,
   saveLayout: async (payload: {
     panes?: Array<{
       id: string;
@@ -276,6 +289,10 @@ contextBridge.exposeInMainWorld("agenticxDesktop", {
   loadComputerUseConfig: async () => ipcRenderer.invoke("load-computer-use-config"),
   saveComputerUseConfig: async (payload: { enabled: boolean }) =>
     ipcRenderer.invoke("save-computer-use-config", payload),
+  loadCodeIndexConfig: async () => ipcRenderer.invoke("load-code-index-config"),
+  saveCodeIndexConfig: async (payload: Record<string, unknown>) =>
+    ipcRenderer.invoke("save-code-index-config", payload),
+  openCodeIndexModelCache: async () => ipcRenderer.invoke("open-code-index-model-cache"),
   loadTrinityConfig: async () => ipcRenderer.invoke("load-trinity-config"),
   saveTrinityConfig: async (payload: {
     skill_protocol: boolean;
@@ -365,6 +382,7 @@ contextBridge.exposeInMainWorld("agenticxDesktop", {
   mcpMarketplaceInstall: async (payload: { serverId: string; env?: Record<string, string> }) =>
     ipcRenderer.invoke("mcp-marketplace-install", payload),
   shellOpenPath: async (path: string) => ipcRenderer.invoke("shell-open-path", path),
+  shellShowItemInFolder: async (path: string) => ipcRenderer.invoke("shell-show-item-in-folder", path),
   connectMcp: async (payload: { sessionId: string; name: string }) =>
     ipcRenderer.invoke("connect-mcp", payload),
   disconnectMcp: async (payload: { sessionId: string; name: string }) =>

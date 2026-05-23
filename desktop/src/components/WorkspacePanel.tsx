@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { PanelRightClose, Folder, RefreshCw, FolderPlus, Terminal } from "lucide-react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import Prism from "prismjs";
 import "prismjs/components/prism-bash";
@@ -14,6 +15,7 @@ import { ContextMenu } from "./ContextMenu";
 import { TerminalEmbed } from "./TerminalEmbed";
 import { getRememberedSessionForAvatar } from "../utils/avatar-last-session";
 import { isPaneAwaitingFreshSession } from "../utils/pane-fresh-session";
+import { shouldKeepWorkspaceVisibleWhenSessionMissing } from "../utils/workspace-session-visibility";
 
 type TaskspaceFile = {
   name: string;
@@ -41,7 +43,9 @@ type Props = {
   tintColor?: string;
 };
 
-type CtxTarget = { x: number; y: number; taskspace: Taskspace };
+type CtxMenuState =
+  | { kind: "taskspace"; x: number; y: number; taskspace: Taskspace }
+  | { kind: "entry"; x: number; y: number; taskspace: Taskspace; entry: TaskspaceFile };
 type SessionListItem = {
   session_id: string;
   avatar_id: string | null;
@@ -95,6 +99,30 @@ function nodeKey(taskspaceId: string, relPath: string): string {
   return `${taskspaceId}:${relPath || "."}`;
 }
 
+/** Join taskspace root (absolute) with a relative path from the Studio API (POSIX segments). */
+function absoluteTaskspacePath(root: string, relPath: string): string {
+  const r = String(root || "").trim().replace(/[/\\]+$/, "");
+  if (!r) return "";
+  const norm = String(relPath || ".").replace(/\\/g, "/");
+  const parts = norm.split("/").filter((p) => p && p !== ".");
+  if (parts.length === 0) return r;
+  const isWin = /^[a-zA-Z]:/.test(r) || r.startsWith("\\\\");
+  const sep = isWin ? "\\" : "/";
+  return `${r}${sep}${parts.join(sep)}`;
+}
+
+function terminalCwdForEntry(taskspace: Taskspace, entry: TaskspaceFile): string {
+  const root = (taskspace.path || "").trim();
+  if (!root) return "";
+  if (entry.type === "dir") {
+    return absoluteTaskspacePath(root, entry.path);
+  }
+  const rel = entry.path.replace(/\\/g, "/");
+  const idx = rel.lastIndexOf("/");
+  const parent = idx === -1 ? "." : rel.slice(0, idx);
+  return absoluteTaskspacePath(root, parent);
+}
+
 export function WorkspacePanel({
   paneId,
   sessionId,
@@ -125,8 +153,21 @@ export function WorkspacePanel({
   const [newPath, setNewPath] = useState("");
   const [newLabel, setNewLabel] = useState("");
   const [adding, setAdding] = useState(false);
-  const [ctxMenu, setCtxMenu] = useState<CtxTarget | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<CtxMenuState | null>(null);
+  const [hostPlatform, setHostPlatform] = useState<string | null>(null);
+  const [fileSearchQuery, setFileSearchQuery] = useState("");
+  const fallbackBrowseSessionIdRef = useRef<string>("");
   const panelRef = useRef<HTMLDivElement | null>(null);
+  const awaitingFreshSession = isPaneAwaitingFreshSession(paneId);
+  const getBrowseSessionId = () => {
+    const direct = String(sessionId ?? "").trim();
+    if (direct) return direct;
+    if (awaitingFreshSession) {
+      return String(fallbackBrowseSessionIdRef.current ?? "").trim();
+    }
+    return "";
+  };
+
   const [panelHeight, setPanelHeight] = useState(0);
   const [terminalAreaHeight, setTerminalAreaHeight] = useState(0);
   const terminalUserResized = useRef(false);
@@ -135,6 +176,27 @@ export function WorkspacePanel({
     () => taskspaces.find((item) => item.id === activeTaskspaceId) ?? taskspaces[0] ?? null,
     [taskspaces, activeTaskspaceId]
   );
+
+  const revealInFileManagerLabel = useMemo(() => {
+    if (hostPlatform === "darwin") return "在访达中显示";
+    if (hostPlatform === "win32") return "在文件资源管理器中显示";
+    return "打开所在文件夹";
+  }, [hostPlatform]);
+
+  const filteredFiles = useMemo(() => {
+    const q = fileSearchQuery.trim().toLowerCase();
+    if (!q) return null;
+    const results: { taskspaceId: string; file: TaskspaceFile }[] = [];
+    for (const [key, entries] of Object.entries(entriesByDir)) {
+      const taskspaceId = key.split(":")[0];
+      for (const entry of entries) {
+        if (entry.type === "file" && entry.name.toLowerCase().includes(q)) {
+          results.push({ taskspaceId, file: entry });
+        }
+      }
+    }
+    return results;
+  }, [fileSearchQuery, entriesByDir]);
 
   const maxTerminalHeight = panelHeight > 0 ? Math.floor(panelHeight * 0.7) : 520;
   const minTerminalHeight = 140;
@@ -157,28 +219,34 @@ export function WorkspacePanel({
     return Prism.highlight(filePreview.content, grammar, language);
   }, [filePreview]);
 
-  const loadTaskspaces = async () => {
-    if (!sessionId) return;
+  const loadTaskspaces = async (): Promise<Taskspace[] | undefined> => {
+    const browseSessionId = getBrowseSessionId();
+    if (!browseSessionId) return undefined;
     setLoading(true);
-    const result = await window.agenticxDesktop.listTaskspaces(sessionId);
+    const result = await window.agenticxDesktop.listTaskspaces(browseSessionId);
     if (!result.ok) {
       setErrorText(result.error ?? "加载工作区失败");
       setLoading(false);
-      return;
+      return undefined;
     }
     const workspaces = Array.isArray(result.workspaces) ? result.workspaces : [];
     setTaskspaces(workspaces);
-    if (workspaces.length > 0 && !workspaces.some((item) => item.id === activeTaskspaceId)) {
-      onActiveTaskspaceChange(workspaces[0].id);
+    if (workspaces.length > 0) {
+      const active = workspaces.find((item) => item.id === activeTaskspaceId) ?? workspaces[0];
+      if (!workspaces.some((item) => item.id === activeTaskspaceId)) {
+        onActiveTaskspaceChange(active.id);
+      }
     }
     setLoading(false);
+    return workspaces;
   };
 
   const loadDir = async (taskspaceId: string, relPath = ".", force = false) => {
-    if (!sessionId) return;
+    const browseSessionId = getBrowseSessionId();
+    if (!browseSessionId) return;
     const key = nodeKey(taskspaceId, relPath);
     if (!force && entriesByDir[key]) return;
-    const result = await window.agenticxDesktop.listTaskspaceFiles({ sessionId, taskspaceId, path: relPath });
+    const result = await window.agenticxDesktop.listTaskspaceFiles({ sessionId: browseSessionId, taskspaceId, path: relPath });
     if (!result.ok) {
       if ((result.error ?? "").includes("session not found")) return;
       setErrorText(result.error ?? "读取目录失败");
@@ -197,19 +265,71 @@ export function WorkspacePanel({
   };
 
   const refreshListAndActiveTaskspace = async () => {
-    await loadTaskspaces();
-    const latest = await window.agenticxDesktop.listTaskspaces(sessionId);
-    if (!latest.ok || !Array.isArray(latest.workspaces)) return;
-    const refreshedActive =
-      latest.workspaces.find((item) => item.id === activeTaskspaceId) ?? latest.workspaces[0] ?? null;
-    if (refreshedActive) {
-      onActiveTaskspaceChange(refreshedActive.id);
-      await refreshTaskspace(refreshedActive.id);
-    }
+    const workspaces = await loadTaskspaces();
+    if (!workspaces?.length) return;
+    await Promise.all(
+      workspaces.map((ts) => {
+        const key = nodeKey(ts.id, ".");
+        if (expandedDirs.has(key)) {
+          return refreshTaskspace(ts.id);
+        }
+        return Promise.resolve();
+      })
+    );
   };
 
   useEffect(() => {
+    void window.agenticxDesktop
+      .platform()
+      .then((p) => setHostPlatform(p))
+      .catch(() => setHostPlatform(null));
+  }, []);
+
+  useEffect(() => {
+    const sid = String(sessionId ?? "").trim();
+    if (sid) {
+      fallbackBrowseSessionIdRef.current = sid;
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (sessionId) return;
+    if (!awaitingFreshSession) return;
+    if (fallbackBrowseSessionIdRef.current) {
+      void loadTaskspaces();
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const listed = await window.agenticxDesktop
+        .listSessions(paneAvatarId ?? undefined)
+        .catch(() => ({ ok: false, sessions: [] as SessionListItem[] }));
+      if (!listed.ok || !Array.isArray(listed.sessions) || cancelled) return;
+      const rememberedSid = getRememberedSessionForAvatar(paneAvatarId);
+      const rememberedValid =
+        !!rememberedSid &&
+        listed.sessions.some(
+          (item) =>
+            String(item.session_id ?? "").trim() === rememberedSid &&
+            isSessionAvatarMatch(item, paneAvatarId)
+        );
+      const recentSid = pickMostRecentSessionId(listed.sessions, paneAvatarId);
+      const preferredSid = rememberedValid ? rememberedSid ?? undefined : recentSid;
+      if (!preferredSid || cancelled) return;
+      fallbackBrowseSessionIdRef.current = preferredSid;
+      await loadTaskspaces();
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, awaitingFreshSession, paneAvatarId]);
+
+  useEffect(() => {
     if (!sessionId) {
+      if (shouldKeepWorkspaceVisibleWhenSessionMissing(sessionId, isPaneAwaitingFreshSession(paneId))) {
+        return;
+      }
       setTaskspaces([]);
       setExpandedDirs(new Set());
       setEntriesByDir({});
@@ -258,27 +378,29 @@ export function WorkspacePanel({
     };
   }, [sessionId, paneAvatarId, paneId, setPaneSessionId]);
 
-  useEffect(() => {
-    if (!activeTaskspace) return;
-    void loadDir(activeTaskspace.id, ".");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeTaskspace?.id]);
 
   useEffect(() => {
-    if (!sessionId || !activeTaskspace) return;
+    const browseSessionId = getBrowseSessionId();
+    if (!browseSessionId) return;
     const timer = window.setInterval(() => {
-      void refreshTaskspace(activeTaskspace.id);
+      taskspaces.forEach((ts) => {
+        const key = nodeKey(ts.id, ".");
+        if (expandedDirs.has(key)) {
+          void refreshTaskspace(ts.id);
+        }
+      });
     }, 3000);
     return () => window.clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionId, activeTaskspace?.id, expandedDirs]);
+  }, [sessionId, awaitingFreshSession, taskspaces, expandedDirs]);
 
   useEffect(() => {
-    if (!sessionId) return;
+    const browseSessionId = getBrowseSessionId();
+    if (!browseSessionId) return;
     if (typeof autoRefreshKey !== "number" || autoRefreshKey <= 0) return;
     void refreshListAndActiveTaskspace();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoRefreshKey, sessionId]);
+  }, [autoRefreshKey, sessionId, awaitingFreshSession]);
 
   useLayoutEffect(() => {
     const element = panelRef.current;
@@ -303,6 +425,11 @@ export function WorkspacePanel({
       if (isGroupOrAutomationPane) {
         setAdding(false);
         setErrorText("会话正在初始化，请稍候再试");
+        return;
+      }
+      if (isPaneAwaitingFreshSession(paneId)) {
+        setAdding(false);
+        setErrorText("请先发送一条消息，再添加工作区目录");
         return;
       }
       try {
@@ -373,6 +500,24 @@ export function WorkspacePanel({
     addPaneTerminalTab(paneId, p, labelHint);
   };
 
+  const revealInFileManager = async (absPath: string) => {
+    const p = (absPath || "").trim();
+    if (!p) {
+      setErrorText("无法在文件管理器中显示：路径无效");
+      return;
+    }
+    setErrorText("");
+    const api = window.agenticxDesktop;
+    if (typeof api.shellShowItemInFolder !== "function") {
+      setErrorText("当前客户端不支持在文件管理器中显示");
+      return;
+    }
+    const res = await api.shellShowItemInFolder(p);
+    if (!res.ok) {
+      setErrorText(res.error ?? "无法在文件管理器中显示");
+    }
+  };
+
   const chooseDirectoryForTaskspace = async () => {
     try {
       const picker = window.agenticxDesktop.chooseDirectory;
@@ -403,8 +548,12 @@ export function WorkspacePanel({
   };
 
   const openFile = async (taskspaceId: string, relPath: string) => {
-    if (!sessionId) return;
-    const result = await window.agenticxDesktop.readTaskspaceFile({ sessionId, taskspaceId, path: relPath });
+    const browseSessionId = getBrowseSessionId();
+    if (!browseSessionId) return;
+    if (activeTaskspaceId !== taskspaceId) {
+      onActiveTaskspaceChange(taskspaceId);
+    }
+    const result = await window.agenticxDesktop.readTaskspaceFile({ sessionId: browseSessionId, taskspaceId, path: relPath });
     if (!result.ok) {
       if ((result.error ?? "").includes("session not found")) return;
       setErrorText(result.error ?? "读取文件失败");
@@ -420,6 +569,9 @@ export function WorkspacePanel({
   };
 
   const toggleDir = async (taskspaceId: string, relPath: string) => {
+    if (activeTaskspaceId !== taskspaceId) {
+      onActiveTaskspaceChange(taskspaceId);
+    }
     const key = nodeKey(taskspaceId, relPath);
     if (expandedDirs.has(key)) {
       const next = new Set(expandedDirs);
@@ -464,10 +616,16 @@ export function WorkspacePanel({
         return (
           <div key={item.path}>
             <button
-              className="flex w-full min-w-0 items-center gap-1 rounded px-1 py-0.5 text-left text-xs text-text-muted hover:bg-surface-hover"
+              className="flex w-full min-w-0 items-center gap-1 rounded px-1 py-1 text-left text-[13px] text-text-muted hover:bg-surface-hover"
               style={{ paddingLeft }}
               onClick={() => void toggleDir(taskspaceId, item.path)}
               title={item.path}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                const ts = taskspaces.find((t) => t.id === taskspaceId);
+                if (!ts) return;
+                setCtxMenu({ kind: "entry", x: e.clientX, y: e.clientY, taskspace: ts, entry: item });
+              }}
             >
               <span className="inline-block w-3 shrink-0 text-center">{isExpanded ? "▾" : "▸"}</span>
               <span className="min-w-0 truncate">{item.name}/</span>
@@ -477,19 +635,28 @@ export function WorkspacePanel({
         );
       }
       return (
-        <div key={item.path} className="flex min-w-0 items-center gap-1">
+        <div
+          key={item.path}
+          className="flex min-w-0 items-center gap-1"
+          onContextMenu={(e) => {
+            e.preventDefault();
+            const ts = taskspaces.find((t) => t.id === taskspaceId);
+            if (!ts) return;
+            setCtxMenu({ kind: "entry", x: e.clientX, y: e.clientY, taskspace: ts, entry: item });
+          }}
+        >
           <button
-            className={`min-w-0 flex-1 truncate rounded px-1 py-0.5 text-left text-xs transition hover:bg-surface-hover ${
+            className={`min-w-0 flex-1 truncate rounded px-1 py-1 text-left text-[13px] transition hover:bg-surface-hover ${
               selectedFilePath === item.path ? "text-text-strong" : "text-text-subtle"
             }`}
-            style={{ paddingLeft }}
+            style={{ paddingLeft: paddingLeft + 16 }}
             title={item.path}
             onClick={() => void openFile(taskspaceId, item.path)}
           >
             {item.name}
           </button>
           <button
-            className="rounded px-1 py-0.5 text-[10px] text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
+            className="rounded px-1.5 py-0.5 text-xs text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
             onClick={() => onPickFileForReference?.(item.path)}
             title="引用到输入框"
           >
@@ -514,97 +681,86 @@ export function WorkspacePanel({
   return (
     <div ref={panelRef} className="relative flex h-full min-h-0 w-full flex-col bg-surface-card" style={tintColor ? { backgroundColor: tintColor } : undefined}>
       <div className="flex min-h-0 flex-1 flex-col">
-        <div className="flex flex-col border-b border-border">
-          <div className="flex items-center gap-1 px-2 py-2">
-            <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
-              {taskspaces.map((item) => (
-                <button
-                  key={item.id}
-                  className={`shrink-0 rounded px-2 py-1 text-xs transition ${
-                    item.id === activeTaskspace?.id
-                      ? "text-text-strong"
-                      : "text-text-subtle hover:bg-surface-hover hover:text-text-primary"
-                  }`}
-                  style={
-                    item.id === activeTaskspace?.id
-                      ? {
-                          background: "var(--ui-accent-surface)",
-                          color: "var(--ui-accent-text)",
-                        }
-                      : {}
-                  }
-                  onClick={() => onActiveTaskspaceChange(item.id)}
-                  onContextMenu={(e) => {
-                    e.preventDefault();
-                    setCtxMenu({ x: e.clientX, y: e.clientY, taskspace: item });
-                  }}
-                  title={item.id === "default" ? (item.path || item.label) : undefined}
-                >
-                  <span className="flex items-center gap-1">
-                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg" className="shrink-0 opacity-70">
-                      <path d="M2 4.5C2 3.67 2.67 3 3.5 3H6.38L7.88 4.5H12.5C13.33 4.5 14 5.17 14 6V11.5C14 12.33 13.33 13 12.5 13H3.5C2.67 13 2 12.33 2 11.5V4.5Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round"/>
-                    </svg>
-                    {item.id !== "default" && item.label}
-                  </span>
-                </button>
-              ))}
+        <div className="flex flex-col">
+          <div className="flex items-center justify-between px-3 py-2">
+            <div className="flex items-center gap-1.5 text-[13px] font-medium text-text-strong">
+              工作区
             </div>
-            <button
-              className="flex h-[26px] w-[26px] items-center justify-center rounded bg-surface-hover text-text-muted hover:bg-surface-hover"
-              onClick={() => {
-                setErrorText("");
-                void refreshListAndActiveTaskspace();
-              }}
-              title="刷新工作区列表与目录"
-            >
-              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M13.5 8A5.5 5.5 0 1 1 8 2.5c1.6 0 3.04.68 4.06 1.76L14 2.5V6h-3.5l1.44-1.44A4 4 0 1 0 12 8" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round"/>
-              </svg>
-            </button>
-            <button
-              className={`flex h-[26px] w-[26px] items-center justify-center rounded text-sm text-text-muted transition ${showAddForm ? "bg-surface-active" : "bg-surface-hover hover:bg-surface-hover"}`}
-              onClick={() => {
-                setShowAddForm((prev) => !prev);
-                setErrorText("");
-              }}
-              title="新增工作区"
-            >
-              +
-            </button>
-            {onClose ? (
+            <div className="flex items-center gap-0.5">
               <button
-                className="flex h-[26px] w-[26px] items-center justify-center rounded text-text-faint hover:bg-surface-hover hover:text-text-muted"
-                onClick={onClose}
-                title="关闭工作区面板"
+                className="agx-topbar-btn !px-[5px]"
+                onClick={() => {
+                  setErrorText("");
+                  void refreshListAndActiveTaskspace();
+                }}
+                title="刷新工作区列表与目录"
               >
-                <svg width="10" height="10" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M3 8H13" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
-                </svg>
+                <RefreshCw className="h-4 w-4" strokeWidth={1.8} />
               </button>
-            ) : null}
+              <button
+                className={`agx-topbar-btn !px-[5px] ${showAddForm ? "agx-topbar-btn--active" : ""}`}
+                onClick={() => {
+                  setShowAddForm((prev) => !prev);
+                  setErrorText("");
+                }}
+                title="新增工作区"
+              >
+                <FolderPlus className="h-4 w-4" strokeWidth={1.8} />
+              </button>
+              <button
+                type="button"
+                className="agx-topbar-btn !px-[5px]"
+                onClick={() => {
+                  setErrorText("");
+                  addSameCwdTerminal();
+                }}
+                title="打开内嵌终端（当前选中的工作区目录）；也可右键工作区节点选「在此目录下打开终端」"
+              >
+                <Terminal className="h-4 w-4" strokeWidth={1.8} />
+              </button>
+              {onClose ? (
+                <button
+                  className="agx-topbar-btn !px-[5px]"
+                  onClick={onClose}
+                  title="关闭工作区面板"
+                >
+                  <PanelRightClose className="h-4 w-4" strokeWidth={1.8} />
+                </button>
+              ) : null}
+            </div>
+          </div>
+          <div className="px-2 pb-1.5">
+            <input
+              type="search"
+              value={fileSearchQuery}
+              onChange={(e) => setFileSearchQuery(e.target.value)}
+              placeholder="搜索文件…"
+              autoComplete="off"
+              spellCheck={false}
+              aria-label="搜索工作区文件"
+              className="w-full rounded-md border border-border bg-surface-hover px-2 py-2 text-[13px] text-text-primary placeholder:text-text-faint focus:border-[var(--ui-btn-primary-border,#3b82f6)] focus:outline-none focus:ring-1 focus:ring-[var(--ui-btn-primary-border,#3b82f6)]"
+            />
           </div>
           {showAddForm ? (
             <div
-              className="border-t border-border px-3 py-2"
+              className="border-b border-border px-3 py-2"
               style={tintColor ? { backgroundColor: tintColor } : undefined}
             >
-              <div className="mb-2 text-[11px] font-medium text-text-subtle">新增工作区</div>
+              <div className="mb-2 text-[13px] font-medium text-text-subtle">新增工作区</div>
               <input
                 value={newPath}
                 onChange={(e) => setNewPath(e.target.value)}
                 placeholder="目录绝对路径（可留空用默认）"
-                className="mb-1.5 w-full rounded border border-border bg-surface-hover px-2 py-1.5 text-[11px] text-text-primary outline-none focus:border-border-strong"
+                className="mb-1.5 w-full rounded border border-border bg-surface-hover px-2 py-1.5 text-[13px] text-text-primary outline-none focus:border-border-strong"
               />
               <div className="mb-1.5 flex justify-end">
                 <button
                   type="button"
-                  className="flex items-center gap-1 rounded border border-border px-2 py-1 text-[11px] text-text-muted hover:bg-surface-hover"
+                  className="flex items-center gap-1 rounded border border-border px-2 py-1 text-[13px] text-text-muted hover:bg-surface-hover"
                   onClick={() => void chooseDirectoryForTaskspace()}
                   title="从系统目录中选择"
                 >
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M2 4.5C2 3.67 2.67 3 3.5 3H6.38L7.88 4.5H12.5C13.33 4.5 14 5.17 14 6V11.5C14 12.33 13.33 13 12.5 13H3.5C2.67 13 2 12.33 2 11.5V4.5Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round"/>
-                  </svg>
+                  <Folder className="h-3.5 w-3.5" strokeWidth={1.8} />
                   选择目录
                 </button>
               </div>
@@ -612,11 +768,11 @@ export function WorkspacePanel({
                 value={newLabel}
                 onChange={(e) => setNewLabel(e.target.value)}
                 placeholder="显示名称（可选）"
-                className="mb-2 w-full rounded border border-border bg-surface-hover px-2 py-1.5 text-[11px] text-text-primary outline-none focus:border-border-strong"
+                className="mb-2 w-full rounded border border-border bg-surface-hover px-2 py-1.5 text-[13px] text-text-primary outline-none focus:border-border-strong"
               />
               <div className="flex items-center justify-end gap-1.5">
                 <button
-                  className="rounded px-2 py-1 text-[11px] text-text-subtle hover:bg-surface-hover"
+                  className="rounded px-2 py-1 text-[13px] text-text-subtle hover:bg-surface-hover"
                   onClick={() => {
                     setShowAddForm(false);
                     setNewPath("");
@@ -626,7 +782,7 @@ export function WorkspacePanel({
                   取消
                 </button>
                 <button
-                  className="rounded px-2 py-1 text-[11px] transition disabled:opacity-50"
+                  className="rounded px-2 py-1 text-[13px] transition disabled:opacity-50"
                   style={{ background: "var(--ui-btn-primary-bg)", color: "var(--ui-btn-primary-text)" }}
                   disabled={adding}
                   onClick={() => void addTaskspace(newPath, newLabel)}
@@ -637,89 +793,153 @@ export function WorkspacePanel({
             </div>
           ) : null}
         </div>
-        <div className="min-h-0 flex-1 overflow-y-auto border-b border-border px-2 py-2">
-          {loading ? <div className="text-xs text-text-faint">加载中...</div> : null}
-          {!loading && !activeTaskspace ? <div className="text-xs text-text-faint">暂无工作区</div> : null}
-          {!loading && activeTaskspace ? renderDir(activeTaskspace.id, ".", 0) : null}
-        </div>
-      </div>
-
-      <div
-        className="group relative min-h-[14px] shrink-0 cursor-row-resize px-2 py-2 touch-none"
-        onMouseDown={startResizeTerminal}
-        title="拖拽调整终端区域高度"
-      >
-        <div
-          className="pointer-events-none absolute left-2 right-2 top-1/2 h-px -translate-y-1/2 transition"
-          style={{ background: "var(--ui-accent-divider)" }}
-        />
-        <div
-          className="pointer-events-none absolute left-1/2 top-1/2 h-2 w-8 -translate-x-1/2 -translate-y-1/2 rounded-full border bg-surface-panel opacity-60 transition group-hover:opacity-90"
-          style={{ borderColor: "var(--ui-accent-divider-hover)" }}
-        />
-      </div>
-
-      <div className="flex min-h-0 shrink-0 flex-col border-t border-border" style={{ height: safeTerminalHeight }}>
-        <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1">
-          <span className="text-[10px] text-text-faint">终端</span>
-          <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
-            {terminalTabs.map((tab) => (
-              <div key={tab.id} className="flex shrink-0 items-center gap-0.5">
-                <button
-                  type="button"
-                  className={`max-w-[120px] truncate rounded px-2 py-0.5 text-[11px] transition ${
-                    tab.id === activeTerminalTabId
-                      ? "bg-surface-hover text-text-strong"
-                      : "text-text-subtle hover:bg-surface-hover"
-                  }`}
-                  onClick={() => setActivePaneTerminalTab(paneId, tab.id)}
-                  title={tab.cwd}
-                >
-                  {tab.label}
-                </button>
-                <button
-                  type="button"
-                  className="rounded px-1 py-0.5 text-[10px] text-text-faint hover:bg-surface-hover hover:text-rose-300"
-                  onClick={() => removePaneTerminalTab(paneId, tab.id)}
-                  title="关闭终端"
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-          </div>
-          <button
-            type="button"
-            className="shrink-0 rounded bg-surface-hover px-2 py-0.5 text-[11px] text-text-muted hover:bg-surface-hover"
-            onClick={addSameCwdTerminal}
-            title="在当前工作区目录下新开终端"
-          >
-            +
-          </button>
-        </div>
-        <div className="relative min-h-0 flex-1 bg-surface-card">
-          {terminalTabs.length === 0 ? (
-            <div className="flex h-full items-center justify-center overflow-hidden px-3 text-center text-[11px] leading-relaxed text-text-faint">
-              <span className="break-words">右键工作区标签选择「在此目录下打开终端」，或点击 + 使用当前工作区目录</span>
-            </div>
-          ) : (
-            terminalTabs.map((tab) => {
-              const isVisible = activeTab && tab.id === activeTab.id;
-              return (
+        <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
+          {loading ? <div className="text-[13px] text-text-faint">加载中...</div> : null}
+          {!loading && taskspaces.length === 0 ? <div className="text-[13px] text-text-faint">暂无工作区</div> : null}
+          {!loading && filteredFiles !== null ? (
+            filteredFiles.length === 0 ? (
+              <div className="text-[13px] text-text-faint">无匹配文件</div>
+            ) : (
+              filteredFiles.map(({ taskspaceId, file }) => {
+                const ts = taskspaces.find((t) => t.id === taskspaceId);
+                return (
                 <div
-                  key={tab.id}
-                  className={`absolute inset-0 flex min-h-0 flex-col ${
-                    isVisible ? "z-10" : "invisible pointer-events-none z-0"
-                  }`}
-                  aria-hidden={!isVisible}
+                  key={`${taskspaceId}:${file.path}`}
+                  className="flex min-w-0 items-center gap-1"
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    if (!ts) return;
+                    setCtxMenu({ kind: "entry", x: e.clientX, y: e.clientY, taskspace: ts, entry: file });
+                  }}
                 >
-                  <TerminalEmbed tabId={tab.id} cwd={tab.cwd} ccBridgePty={tab.ccBridgePty} />
+                  <button
+                    className={`min-w-0 flex-1 truncate rounded px-1 py-1 text-left text-[13px] transition hover:bg-surface-hover ${
+                      selectedFilePath === file.path ? "text-text-strong" : "text-text-subtle"
+                    }`}
+                    title={file.path}
+                    onClick={() => void openFile(taskspaceId, file.path)}
+                  >
+                    {file.name}
+                    <span className="ml-1 text-[11px] text-text-faint">{file.path}</span>
+                  </button>
+                  <button
+                    className="rounded px-1.5 py-0.5 text-xs text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
+                    onClick={() => onPickFileForReference?.(file.path)}
+                    title="引用到输入框"
+                  >
+                    @
+                  </button>
                 </div>
               );
-            })
-          )}
+              })
+            )
+          ) : null}
+          {!loading && filteredFiles === null && taskspaces.map((ts) => {
+            const key = nodeKey(ts.id, ".");
+            const isExpanded = expandedDirs.has(key);
+            const isActive = activeTaskspaceId === ts.id;
+            
+            return (
+              <div key={ts.id} className="mb-0.5">
+                <button
+                  className={`flex w-full min-w-0 items-center gap-1.5 rounded px-1 py-1.5 text-left text-[13px] font-medium transition ${
+                    isActive ? "bg-surface-hover text-text-strong" : "text-text-subtle hover:bg-surface-hover hover:text-text-primary"
+                  }`}
+                  onClick={() => {
+                    onActiveTaskspaceChange(ts.id);
+                    const next = new Set(expandedDirs);
+                    if (next.has(key)) {
+                      next.delete(key);
+                    } else {
+                      next.add(key);
+                      void loadDir(ts.id, ".");
+                    }
+                    setExpandedDirs(next);
+                  }}
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    setCtxMenu({ kind: "taskspace", x: e.clientX, y: e.clientY, taskspace: ts });
+                  }}
+                  title={ts.id === "default" ? (ts.path || ts.label) : ts.path}
+                >
+                  <span className="inline-block w-3 shrink-0 text-center text-text-faint">{isExpanded ? "▾" : "▸"}</span>
+                  <Folder className="h-3.5 w-3.5 shrink-0 opacity-70" strokeWidth={1.8} />
+                  <span className="min-w-0 flex-1 truncate">{ts.id !== "default" ? ts.label : (ts.path || ts.label || "默认工作区")}</span>
+                </button>
+                {isExpanded ? renderDir(ts.id, ".", 1) : null}
+              </div>
+            );
+          })}
         </div>
       </div>
+
+      {terminalTabs.length > 0 ? (
+        <>
+          <div
+            className="group relative min-h-[14px] shrink-0 cursor-row-resize px-2 py-2 touch-none"
+            onMouseDown={startResizeTerminal}
+            title="拖拽调整终端区域高度"
+          >
+            <div className="pointer-events-none absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-[var(--border-strong)] transition-all duration-200 group-hover:h-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
+          </div>
+
+          <div className="flex min-h-0 shrink-0 flex-col border-t border-border" style={{ height: safeTerminalHeight }}>
+            <div className="flex shrink-0 items-center gap-1 border-b border-border px-2 py-1">
+              <span className="text-xs text-text-faint">终端</span>
+              <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto">
+                {terminalTabs.map((tab) => (
+                  <div key={tab.id} className="flex shrink-0 items-center gap-0.5">
+                    <button
+                      type="button"
+                      className={`max-w-[120px] truncate rounded px-2 py-1 text-[13px] transition ${
+                        tab.id === activeTerminalTabId
+                          ? "bg-surface-hover text-text-strong"
+                          : "text-text-subtle hover:bg-surface-hover"
+                      }`}
+                      onClick={() => setActivePaneTerminalTab(paneId, tab.id)}
+                      title={tab.cwd}
+                    >
+                      {tab.label}
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded px-1.5 py-0.5 text-xs text-text-faint hover:bg-surface-hover hover:text-rose-300"
+                      onClick={() => removePaneTerminalTab(paneId, tab.id)}
+                      title="关闭终端"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button
+                type="button"
+                className="shrink-0 rounded bg-surface-hover px-2 py-1 text-[13px] text-text-muted hover:bg-surface-hover"
+                onClick={addSameCwdTerminal}
+                title="在当前工作区目录下新开终端"
+              >
+                +
+              </button>
+            </div>
+            <div className="relative min-h-0 flex-1 bg-surface-card">
+              {terminalTabs.map((tab) => {
+                const isVisible = activeTab && tab.id === activeTab.id;
+                return (
+                  <div
+                    key={tab.id}
+                    className={`absolute inset-0 flex min-h-0 flex-col ${
+                      isVisible ? "z-10" : "invisible pointer-events-none z-0"
+                    }`}
+                    aria-hidden={!isVisible}
+                  >
+                    <TerminalEmbed tabId={tab.id} cwd={tab.cwd} ccBridgePty={tab.ccBridgePty} />
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      ) : null}
 
       <ContextMenu
         open={!!ctxMenu}
@@ -728,17 +948,45 @@ export function WorkspacePanel({
         onClose={() => setCtxMenu(null)}
         items={
           ctxMenu
-            ? [
-                {
-                  label: "在此目录下打开终端",
-                  onSelect: () => openTerminalForPath(ctxMenu.taskspace.path, ctxMenu.taskspace.label),
-                },
-                {
-                  label: "移除工作区",
-                  danger: true,
-                  onSelect: () => void removeTaskspace(ctxMenu.taskspace.id),
-                },
-              ]
+            ? ctxMenu.kind === "taskspace"
+              ? [
+                  {
+                    label: revealInFileManagerLabel,
+                    onSelect: () => {
+                      const rootPath = (ctxMenu.taskspace.path || "").trim();
+                      if (!rootPath) {
+                        setErrorText("该工作区没有可打开的磁盘路径");
+                        return;
+                      }
+                      void revealInFileManager(rootPath);
+                    },
+                  },
+                  {
+                    label: "在此目录下打开终端",
+                    onSelect: () => openTerminalForPath(ctxMenu.taskspace.path, ctxMenu.taskspace.label),
+                  },
+                  {
+                    label: "移除工作区",
+                    danger: true,
+                    onSelect: () => void removeTaskspace(ctxMenu.taskspace.id),
+                  },
+                ]
+              : [
+                  {
+                    label: revealInFileManagerLabel,
+                    onSelect: () => {
+                      const abs = absoluteTaskspacePath(ctxMenu.taskspace.path, ctxMenu.entry.path);
+                      void revealInFileManager(abs);
+                    },
+                  },
+                  {
+                    label: "在此目录下打开终端",
+                    onSelect: () => {
+                      const cwd = terminalCwdForEntry(ctxMenu.taskspace, ctxMenu.entry);
+                      openTerminalForPath(cwd, ctxMenu.entry.name);
+                    },
+                  },
+                ]
             : []
         }
       />
@@ -746,22 +994,22 @@ export function WorkspacePanel({
       {filePreview ? (
         <div className="absolute inset-2 z-30 flex min-h-0 flex-col rounded-lg border border-border-strong bg-surface-panel shadow-2xl backdrop-blur-xl">
           <div className="flex items-center justify-between border-b border-border px-3 py-2">
-            <div className="truncate text-xs text-text-subtle">{filePreview.path}</div>
+            <div className="truncate text-[13px] text-text-subtle">{filePreview.path}</div>
             <button
-              className="rounded border border-border px-2 py-0.5 text-[11px] text-text-muted hover:bg-surface-hover hover:text-text-strong"
+              className="rounded border border-border px-2 py-1 text-[13px] text-text-muted hover:bg-surface-hover hover:text-text-strong"
               onClick={() => setFilePreview(null)}
             >
               关闭
             </button>
           </div>
-          <pre className="min-h-0 flex-1 overflow-auto px-3 py-2 text-[11px] leading-5">
+          <pre className="min-h-0 flex-1 overflow-auto px-3 py-2 text-[13px] leading-relaxed">
             <code
               className={`language-${detectLanguage(filePreview.path)}`}
               dangerouslySetInnerHTML={{ __html: highlightedCode }}
             />
           </pre>
           {filePreview.truncated ? (
-            <div className="border-t border-border px-3 py-1 text-[10px] text-amber-300">
+            <div className="border-t border-border px-3 py-1.5 text-xs text-amber-300">
               文件过大，已截断显示（{filePreview.size} bytes）。
             </div>
           ) : null}
@@ -769,7 +1017,7 @@ export function WorkspacePanel({
       ) : null}
 
       {errorText ? (
-        <div className="border-t border-border px-2 py-1 text-[10px] text-rose-300">{errorText}</div>
+        <div className="border-t border-border px-3 py-1.5 text-xs text-rose-300">{errorText}</div>
       ) : null}
     </div>
   );

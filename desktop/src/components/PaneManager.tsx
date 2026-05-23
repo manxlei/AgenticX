@@ -33,14 +33,12 @@ function clamp(value: number, min: number, max: number) {
 }
 
 function PaneDragOverlayPreview({ pane }: { pane: ChatPaneState }) {
-  const sessionSnippet = pane.sessionId ? `${pane.sessionId.slice(0, 8)}…` : "-";
   return (
     <div
       className="flex min-h-[40px] min-w-[200px] max-w-md cursor-grabbing flex-col justify-center rounded-lg border border-border bg-surface-card/95 px-4 py-2 shadow-lg shadow-black/40 backdrop-blur-sm"
       style={{ width: "min(100%, 360px)" }}
     >
       <div className="truncate text-sm font-medium text-text-strong">{pane.avatarName}</div>
-      <div className="truncate text-[10px] text-text-faint">session: {sessionSnippet}</div>
     </div>
   );
 }
@@ -48,7 +46,6 @@ function PaneDragOverlayPreview({ pane }: { pane: ChatPaneState }) {
 export function PaneManager({ onOpenConfirm }: Props) {
   const panes = useAppStore((s) => s.panes);
   const activePaneId = useAppStore((s) => s.activePaneId);
-  const focusMode = useAppStore((s) => s.focusMode);
   const setActivePaneId = useAppStore((s) => s.setActivePaneId);
   const reorderPanes = useAppStore((s) => s.reorderPanes);
 
@@ -158,7 +155,7 @@ export function PaneManager({ onOpenConfirm }: Props) {
           <>
             <div
               className={`flex h-full min-w-0 flex-1 overflow-hidden ${
-                isFocused && isMulti && !focusMode ? "bg-[rgba(255,255,255,0.015)]" : ""
+                isFocused && isMulti ? "bg-[rgba(255,255,255,0.015)]" : ""
               }`}
             >
               <ChatPane
@@ -234,7 +231,7 @@ export function PaneManager({ onOpenConfirm }: Props) {
                   >
                     <div
                       className={`flex h-full min-w-0 flex-1 overflow-hidden ${
-                        isFocused && !focusMode ? "bg-[rgba(255,255,255,0.015)]" : ""
+                        isFocused ? "bg-[rgba(255,255,255,0.015)]" : ""
                       }`}
                     >
                       <ChatPane

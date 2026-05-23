@@ -75,6 +75,7 @@ def _resolve_subagent_min_run_timeout_seconds() -> int:
 class SubAgentStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -135,6 +136,8 @@ class SubAgentContext:
     avatar_id: str = ""
     failure_count: int = 0
     escalation_level: int = 0
+    pause_detector: str = ""
+    pause_retryable: bool = False
 
 
 class AgentTeamManager:
@@ -725,6 +728,55 @@ class AgentTeamManager:
             new_context.artifacts.update(previous.artifacts)
         return result
 
+    async def submit_for_longrun(self, entry: Any) -> Dict[str, Any]:
+        """Run one long-running task entry via :meth:`spawn_subagent` and await completion."""
+        payload = getattr(entry, "payload", None)
+        if not isinstance(payload, dict):
+            payload = {}
+        workspace_obj = getattr(entry, "workspace", None)
+        ws_path = ""
+        if workspace_obj is not None:
+            p = getattr(workspace_obj, "path", None)
+            if p is not None:
+                ws_path = str(p)
+        task_text = str(payload.get("task") or payload.get("prompt") or "").strip()
+        if not task_text:
+            raise ValueError("longrun payload requires non-empty task or prompt")
+        name = str(payload.get("name") or "longrun").strip() or "longrun"
+        role = str(payload.get("role") or "worker").strip() or "worker"
+        spawn_res = await self.spawn_subagent(
+            name=name,
+            role=role,
+            task=task_text,
+            workspace_dir=ws_path or None,
+            provider=str(payload.get("provider") or "").strip() or None,
+            model=str(payload.get("model") or "").strip() or None,
+        )
+        if not spawn_res.get("ok"):
+            raise RuntimeError(str(spawn_res.get("error") or spawn_res))
+        agent_id = str(spawn_res.get("agent_id", "") or "").strip()
+        sub_task = self._tasks.get(agent_id)
+        if sub_task is not None:
+            await sub_task
+        ctx = self._agents.get(agent_id) or self._archived_agents.get(agent_id)
+        if ctx is None:
+            raise RuntimeError("subagent context missing after run")
+        if ctx.status == SubAgentStatus.FAILED:
+            raise RuntimeError(ctx.error_text or "subagent_failed")
+        if ctx.status == SubAgentStatus.CANCELLED:
+            raise asyncio.CancelledError()
+        text = (ctx.final_text or "").strip()
+        wants = bool(payload.get("wants_continuation"))
+        if not wants and "[longrun:continue]" in text.lower():
+            wants = True
+        return {
+            "ok": True,
+            "wants_continuation": wants,
+            "agent_id": agent_id,
+            "final_text": ctx.final_text,
+            "status": ctx.status.value,
+        }
+
     def _find_by_name_or_avatar(self, query: str) -> Optional[SubAgentContext]:
         """Fallback lookup by name (case-insensitive) or avatar_id."""
         q = query.strip().lower()
@@ -1025,6 +1077,8 @@ class AgentTeamManager:
                 agent_id=context.agent_id,
                 tools=allowed_tools,
                 system_prompt=system_prompt,
+                usage_session_id=str(self.owner_session_id or ""),
+                usage_avatar_id=str(context.avatar_id or ""),
             ):
                 context.updated_at = time.time()
                 if event.type == EventType.TOKEN.value:
@@ -1042,6 +1096,8 @@ class AgentTeamManager:
                     context.error_text = str(event.data.get("text", ""))
                 if event.type == EventType.SUBAGENT_PAUSED.value:
                     paused_at_limit = True
+                    context.pause_detector = str(event.data.get("detector", "") or "").strip()
+                    context.pause_retryable = bool(event.data.get("retryable", False))
                     context.final_text = context.final_text or str(event.data.get("text", ""))
                 if event.type == EventType.ROUND_START.value:
                     round_no = int(event.data.get("round", 0) or 0)
@@ -1087,7 +1143,7 @@ class AgentTeamManager:
                     context.status = SubAgentStatus.CANCELLED
                     context.error_text = "任务已中断"
                 elif paused_at_limit:
-                    context.status = SubAgentStatus.COMPLETED
+                    context.status = SubAgentStatus.PAUSED
                     context.error_text = ""
                 else:
                     context.status = (
@@ -1126,6 +1182,7 @@ class AgentTeamManager:
             context.output_files = self._extract_output_files_from_messages(context.agent_messages)
             context.result_summary = self._build_result_summary(context)
             produced_files = self._merge_output_files(context)
+            missing_files = self._missing_output_files(produced_files)
             if (
                 context.status == SubAgentStatus.COMPLETED
                 and self._task_expects_file_output(context.task)
@@ -1135,6 +1192,17 @@ class AgentTeamManager:
                 context.error_text = (
                     "Task completed without file artifact. Expected an output file "
                     "but none was detected from tool results."
+                )
+                context.result_summary = self._build_result_summary(context)
+            elif (
+                context.status == SubAgentStatus.COMPLETED
+                and self._task_expects_file_output(context.task)
+                and missing_files
+            ):
+                context.status = SubAgentStatus.FAILED
+                context.error_text = (
+                    "Task completed with missing file artifact(s): "
+                    + ", ".join(missing_files[:10])
                 )
                 context.result_summary = self._build_result_summary(context)
             self.base_session.scratchpad[f"subagent_result::{context.agent_id}"] = (
@@ -1156,11 +1224,12 @@ class AgentTeamManager:
 
             if self.summary_sink is not None:
                 await self.summary_sink(context.result_summary, context)
-            event_type = (
-                EventType.SUBAGENT_COMPLETED.value
-                if context.status == SubAgentStatus.COMPLETED
-                else EventType.SUBAGENT_ERROR.value
-            )
+            if context.status == SubAgentStatus.COMPLETED:
+                event_type = EventType.SUBAGENT_COMPLETED.value
+            elif context.status == SubAgentStatus.PAUSED:
+                event_type = EventType.SUBAGENT_PAUSED.value
+            else:
+                event_type = EventType.SUBAGENT_ERROR.value
             await self._emit(
                 RuntimeEvent(
                     type=event_type,
@@ -1169,6 +1238,9 @@ class AgentTeamManager:
                         "name": context.name,
                         "status": context.status.value,
                         "summary": context.result_summary,
+                        "text": context.final_text or context.error_text or context.result_summary,
+                        "detector": context.pause_detector,
+                        "retryable": context.pause_retryable,
                     },
                     agent_id=context.agent_id,
                 )
@@ -1309,6 +1381,16 @@ class AgentTeamManager:
                 f"结果摘要: {text}\n"
                 f"产出文件: {', '.join(file_list) if file_list else '(无)'}"
             )
+        elif context.status == SubAgentStatus.PAUSED:
+            text = context.final_text or "任务已暂停，可基于当前进展继续。"
+            reason = f"暂停原因: {context.pause_detector or 'runtime_pause'}"
+            retry = "可稍后继续。" if context.pause_retryable else "请根据提示继续指示。"
+            summary = (
+                f"[{context.name}] 已暂停。\n"
+                f"{reason}；{retry}\n"
+                f"阶段性摘要: {text}\n"
+                f"产出文件: {', '.join(file_list) if file_list else '(无)'}"
+            )
         elif context.status == SubAgentStatus.CANCELLED:
             summary = f"[{context.name}] 已取消。"
         else:
@@ -1356,3 +1438,18 @@ class AgentTeamManager:
                 seen.add(p)
                 merged.append(p)
         return merged
+
+    @staticmethod
+    def _missing_output_files(paths: Sequence[str]) -> List[str]:
+        """Return output file paths that were reported but do not exist on disk."""
+        missing: List[str] = []
+        for raw in paths:
+            p = str(raw or "").strip()
+            if not p:
+                continue
+            try:
+                if not Path(p).expanduser().exists():
+                    missing.append(p)
+            except Exception:
+                missing.append(p)
+        return missing

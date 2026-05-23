@@ -6,14 +6,40 @@ export function attachmentsFromSessionRow(raw: unknown): MessageAttachment[] | u
   const out: MessageAttachment[] = [];
   for (const a of raw) {
     if (!a || typeof a !== "object") continue;
-    const o = a as { name?: unknown; mime_type?: unknown; size?: unknown; data_url?: unknown };
+    const o = a as {
+      name?: unknown;
+      mime_type?: unknown;
+      size?: unknown;
+      data_url?: unknown;
+      source_path?: unknown;
+      reference_token?: unknown;
+      composer_ref_label?: unknown;
+      kind?: unknown;
+    };
     const dataUrl = String(o.data_url ?? "").trim();
-    if (!dataUrl.startsWith("data:image/")) continue;
-    const name = String(o.name ?? "").trim() || "image";
-    const mimeType = String(o.mime_type ?? "").trim() || "image/png";
+    const name = String(o.name ?? "").trim() || "file";
     const sizeRaw = o.size;
     const size = typeof sizeRaw === "number" && Number.isFinite(sizeRaw) ? sizeRaw : Number(sizeRaw) || 0;
-    out.push({ name, mimeType, size, dataUrl });
+    if (dataUrl.startsWith("data:image/")) {
+      const mimeType = String(o.mime_type ?? "").trim() || "image/png";
+      out.push({ name, mimeType, size, dataUrl });
+      continue;
+    }
+    const kind = String(o.kind ?? "").trim();
+    const sourcePath = String(o.source_path ?? "").trim();
+    const referenceToken = Boolean(o.reference_token);
+    const composerRefLabel = String(o.composer_ref_label ?? "").trim();
+    if (kind === "context_file" || (!dataUrl && name)) {
+      const mimeType = String(o.mime_type ?? "").trim() || "application/octet-stream";
+      out.push({
+        name,
+        mimeType,
+        size,
+        ...(sourcePath ? { sourcePath } : {}),
+        ...(referenceToken ? { referenceToken: true } : {}),
+        ...(composerRefLabel ? { composerRefLabel } : {}),
+      });
+    }
   }
   return out.length ? out : undefined;
 }
@@ -44,6 +70,16 @@ export type LoadedSessionMessage = {
   };
   /** From messages.json / GET /api/session/messages */
   attachments?: unknown;
+  tool_call_id?: string;
+  tool_name?: string;
+  tool_args?: Record<string, unknown>;
+  tool_status?: Message["toolStatus"];
+  tool_elapsed_sec?: number;
+  tool_result_preview?: string;
+  tool_group_id?: string;
+  tool_stream_lines?: string[];
+  /** From `<followups>` / FINAL payload */
+  suggested_questions?: string[];
 };
 
 export function mapLoadedSessionMessage(item: LoadedSessionMessage, idPrefix: string, index: number): Message {
@@ -61,7 +97,7 @@ export function mapLoadedSessionMessage(item: LoadedSessionMessage, idPrefix: st
     : [];
   const storedId = item.id != null ? String(item.id).trim() : "";
   const id = `${idPrefix}-i${index}${storedId ? `-${storedId}` : ""}`;
-  return {
+  const mapped: Message = {
     id,
     role: item.role,
     content: item.content,
@@ -84,4 +120,25 @@ export function mapLoadedSessionMessage(item: LoadedSessionMessage, idPrefix: st
         : undefined,
     attachments: attachmentsFromSessionRow(item.attachments),
   };
+  if (item.role === "assistant") {
+    const sq = item.suggested_questions;
+    if (Array.isArray(sq) && sq.length > 0) {
+      mapped.suggestedQuestions = sq.map((x) => String(x).trim()).filter(Boolean).slice(0, 3);
+    }
+  }
+  if (item.role === "tool") {
+    const toolCallId = String(item.tool_call_id ?? "").trim();
+    const toolName = String(item.tool_name ?? "").trim();
+    const toolGroupId = String(item.tool_group_id ?? "").trim();
+    const toolResultPreview = String(item.tool_result_preview ?? "").trim();
+    if (toolCallId) mapped.toolCallId = toolCallId;
+    if (toolName) mapped.toolName = toolName;
+    if (item.tool_args && typeof item.tool_args === "object") mapped.toolArgs = item.tool_args;
+    if (item.tool_status) mapped.toolStatus = item.tool_status;
+    if (typeof item.tool_elapsed_sec === "number") mapped.toolElapsedSec = item.tool_elapsed_sec;
+    if (toolResultPreview) mapped.toolResultPreview = toolResultPreview;
+    if (toolGroupId) mapped.toolGroupId = toolGroupId;
+    if (Array.isArray(item.tool_stream_lines)) mapped.toolStreamLines = item.tool_stream_lines;
+  }
+  return mapped;
 }

@@ -27,6 +27,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Crown,
+  LayoutDashboard,
   LogOut,
   Menu,
   MessageSquare,
@@ -48,6 +49,7 @@ import { usePortalCopy } from "../lib/portal-copy";
 
 type WorkspaceShellProps = {
   userEmail: string;
+  userScopes: string[];
 };
 
 type PanelMode = "chat" | "settings";
@@ -85,14 +87,16 @@ function groupHistory(history: HistorySession[]): Array<{ key: string; label: st
   ].filter((group) => group.items.length > 0);
 }
 
-export function WorkspaceShell({ userEmail }: WorkspaceShellProps) {
+export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
   const router = useRouter();
   const t = usePortalCopy();
+  const showAdminEntry = userScopes.includes("admin:enter");
   const { locale, setLocale } = useLocale();
   const { resolved: resolvedTheme, theme, setTheme, toggle: toggleTheme } = useUiTheme();
   const sessions = useChatStore((s) => s.sessions);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const activeModel = useChatStore((s) => s.activeModel);
+  const historyLoading = useChatStore((s) => s.historyLoading);
   const createSession = useChatStore((s) => s.createSession);
   const switchSession = useChatStore((s) => s.switchSession);
   const renameSessionInStore = useChatStore((s) => s.renameSession);
@@ -139,13 +143,13 @@ export function WorkspaceShell({ userEmail }: WorkspaceShellProps) {
   }, []);
 
   const onNewChat = React.useCallback(() => {
-    createSession({ defaultModel: activeModel || "deepseek-chat", title: t.newChat });
+    void createSession({ defaultModel: activeModel || "deepseek-chat", title: t.newChat });
     setPanelMode("chat");
     setMobileOpen(false);
   }, [createSession, activeModel, t.newChat]);
 
   const onSelectSession = React.useCallback((id: string) => {
-    switchSession(id);
+    void switchSession(id);
     setPanelMode("chat");
     setMobileOpen(false);
   }, [switchSession]);
@@ -154,13 +158,13 @@ export function WorkspaceShell({ userEmail }: WorkspaceShellProps) {
     const current = history.find((item) => item.id === id);
     const next = window.prompt("重命名会话", current?.title ?? "");
     if (!next) return;
-    renameSessionInStore(id, next);
+    void renameSessionInStore(id, next);
   }, [history, renameSessionInStore]);
 
   const onDeleteSession = React.useCallback(
     (id: string) => {
       if (!window.confirm("删除这条会话？")) return;
-      deleteSessionInStore(id);
+      void deleteSessionInStore(id);
     },
     [deleteSessionInStore]
   );
@@ -248,7 +252,9 @@ export function WorkspaceShell({ userEmail }: WorkspaceShellProps) {
           {/* 历史分组 */}
           <div className="flex-1 overflow-y-auto px-2 py-2">
             {!collapsed ? (
-              grouped.length === 0 ? (
+              historyLoading ? (
+                <div className="px-3 py-4 text-xs text-muted-foreground">加载历史…</div>
+              ) : grouped.length === 0 ? (
                 <div className="flex h-full flex-col items-center justify-center gap-2 px-3 py-10 text-center text-xs text-muted-foreground">
                   <MessageSquare className="h-5 w-5" />
                   <span>{t.noHistory}</span>
@@ -355,6 +361,20 @@ export function WorkspaceShell({ userEmail }: WorkspaceShellProps) {
                   <Languages className="mr-2 h-4 w-4" />
                   语言：{locale === "zh" ? "中文" : "English"}
                 </DropdownMenuItem>
+                {showAdminEntry ? (
+                  <DropdownMenuItem
+                    onClick={() =>
+                      window.open(
+                        process.env.NEXT_PUBLIC_ADMIN_CONSOLE_URL ?? "http://localhost:3001",
+                        "_blank",
+                        "noopener,noreferrer"
+                      )
+                    }
+                  >
+                    <LayoutDashboard className="mr-2 h-4 w-4" />
+                    管理后台
+                  </DropdownMenuItem>
+                ) : null}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={onSignOut}>
                   <LogOut className="mr-2 h-4 w-4" />

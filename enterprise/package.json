@@ -1,6 +1,6 @@
 {
   "name": "@agenticx/enterprise",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "AgenticX Enterprise — 企业级大模型应用一体化平台（前台 + 后台 + AI 网关）",
   "scripts": {
@@ -11,14 +11,24 @@
     "test": "turbo run test",
     "clean": "turbo run clean && rm -rf node_modules",
     "visual-tour": "tsx scripts/e2e-visual-tour.ts",
-    "visual-tour:install": "playwright install chromium"
+    "visual-tour:install": "playwright install chromium",
+    "load-test:keypool": "tsx scripts/load-test-keypool.ts",
+    "e2e:iam": "tsx scripts/e2e-iam.ts",
+    "e2e:sso": "tsx scripts/e2e-sso.ts",
+    "migrate:legacy-runtime": "tsx scripts/migrate-runtime-legacy.ts",
+    "sso:oidc-smoke": "tsx scripts/sso/oidc-smoke.ts",
+    "sso:saml-mock": "node scripts/sso/mock-saml-idp/index.mjs",
+    "sso:saml-mock-setup": "bash scripts/sso/mock-saml-idp/setup-keypair.sh",
+    "saml:mock": "pnpm sso:saml-mock"
   },
   "devDependencies": {
+    "@agenticx/iam-core": "workspace:*",
     "@types/node": "^20.11.0",
     "playwright": "^1.59.1",
     "tsx": "^4.21.0",
     "turbo": "^2.3.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "xml-crypto": "^6.0.0"
   },
   "packageManager": "pnpm@9.12.0",
   "engines": {

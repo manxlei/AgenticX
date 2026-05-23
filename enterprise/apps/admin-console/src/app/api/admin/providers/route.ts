@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireAdminSession } from "../../../../lib/admin-auth";
+import { requireAdminScope } from "../../../../lib/admin-auth";
 import {
   createProvider,
   listProviders,
@@ -14,21 +14,31 @@ function parseRoute(value: unknown): ProviderRoute | undefined {
 }
 
 export async function GET() {
-  const auth = await requireAdminSession();
+  const auth = await requireAdminScope(["provider:read"]);
   if (!auth.ok) return auth.response;
 
-  return NextResponse.json({
-    code: "00000",
-    message: "ok",
-    data: {
-      providers: listProviders(),
-      templates: PROVIDER_TEMPLATES,
-    },
-  });
+  try {
+    return NextResponse.json({
+      code: "00000",
+      message: "ok",
+      data: {
+        providers: await listProviders(),
+        templates: PROVIDER_TEMPLATES,
+      },
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        code: "50000",
+        message: error instanceof Error ? error.message : "failed to load providers",
+      },
+      { status: 500 }
+    );
+  }
 }
 
 export async function POST(request: Request) {
-  const auth = await requireAdminSession();
+  const auth = await requireAdminScope(["provider:create"]);
   if (!auth.ok) return auth.response;
 
   try {
@@ -46,7 +56,7 @@ export async function POST(request: Request) {
     if (!input.id || !input.baseUrl) {
       return NextResponse.json({ code: "40000", message: "id and baseUrl are required" }, { status: 400 });
     }
-    const created = createProvider(input);
+    const created = await createProvider(input);
     return NextResponse.json({ code: "00000", message: "ok", data: { provider: created } });
   } catch (error) {
     return NextResponse.json(

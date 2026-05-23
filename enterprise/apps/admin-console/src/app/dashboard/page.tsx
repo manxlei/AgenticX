@@ -20,7 +20,6 @@ import {
   EmptyState,
   LineCard,
   PageHeader,
-  SparkLine,
   StatCard,
   chartPalette,
 } from "@agenticx/ui";
@@ -53,6 +52,16 @@ type KpiData = {
 };
 
 const REFRESH_MS = 5000;
+
+async function readJsonBody<T>(res: Response, fallback: T): Promise<T> {
+  const raw = await res.text();
+  if (!raw.trim()) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
 
 export default function DashboardPage() {
   const [kpi, setKpi] = useState<KpiData>({
@@ -88,8 +97,10 @@ export default function DashboardPage() {
             body: JSON.stringify({ limit: 20 }),
           }),
         ]);
-        const meteringJson = (await meteringRes.json()) as { data?: { rows?: MeteringRow[] } };
-        const auditJson = (await auditRes.json()) as { data?: { items?: AuditEvent[] } };
+        const emptyMetering = { data: { rows: [] as MeteringRow[] } };
+        const emptyAudit = { data: { items: [] as AuditEvent[] } };
+        const meteringJson = await readJsonBody<{ data?: { rows?: MeteringRow[] } }>(meteringRes, emptyMetering);
+        const auditJson = await readJsonBody<{ data?: { items?: AuditEvent[] } }>(auditRes, emptyAudit);
         if (!active) return;
         const rows = meteringJson.data?.rows ?? [];
         const audits = auditJson.data?.items ?? [];
@@ -253,7 +264,7 @@ export default function DashboardPage() {
           icon={<BarChart3 />}
           delta={{ value: "12.4", trend: "up" }}
           accentClassName="bg-primary"
-          footer={<SparkLine data={kpi.callsSeries.length ? kpi.callsSeries : [{ v: 0 }, { v: 0 }]} color={chartPalette[0]} />}
+          footer={<span className="text-xs text-muted-foreground">近 24 小时累计</span>}
         />
         <StatCard
           label="今日消耗（USD）"
@@ -261,7 +272,7 @@ export default function DashboardPage() {
           icon={<DollarSign />}
           delta={{ value: "3.1", trend: "up" }}
           accentClassName="bg-chart-3"
-          footer={<SparkLine data={kpi.costSeries.length ? kpi.costSeries : [{ v: 0 }, { v: 0 }]} color={chartPalette[2]} />}
+          footer={<span className="text-xs text-muted-foreground">按模型计费估算</span>}
         />
         <StatCard
           label="命中合规事件"

@@ -74,6 +74,13 @@ bash scripts/start-dev.sh     # 每天开工跑这一条
 
 > 默认 `owner` 已自带 `workspace:chat` 权限；旧种子环境若 HMR 命中也会被自动补齐，无需手动改库。
 
+### 启用 OIDC SSO（统一认证）
+
+已支持 OIDC SSO 登录（portal + admin）。配置参考：
+
+- `docs/runbooks/sso-oidc-setup.md`
+- `docs/runbooks/sso-acceptance-checklist.md`
+
 ### 让聊天回真实模型（推荐 ① · admin GUI 控制）
 
 后台 → 平台配置 → **模型服务**：
@@ -85,8 +92,9 @@ bash scripts/start-dev.sh     # 每天开工跑这一条
 5. 用该用户的账号登录前台 portal：模型下拉只会出现刚才分配的模型，发送消息走真调
 6. 顶部 token chip 实时显示「↑输入 ↓输出 Σ合计」累计
 
-> 配置数据落在 `enterprise/.runtime/admin/{providers,user-models}.json`（chmod 600，已 `.gitignore`）。
-> Gateway 后台每 5 秒重读一次，admin 改完几秒内生效，无需重启。
+> **运行时配置（模型服务 / 用户可见模型 / Token 配额）以 Postgres 为单一数据源**（表 `enterprise_runtime_*`）。
+> 本地开发若仍保留 `enterprise/.runtime/admin/{providers,user-models,quotas}.json`，会在 `bootstrap.sh` / `start-dev.sh` 与 `pnpm migrate:legacy-runtime` 时**幂等导入** PG；导入后 admin / portal 均只读 PG。
+> Gateway 后台每 5 秒重读一次 provider 配置，admin 改完几秒内生效，无需重启。
 
 ### 让聊天回真实模型（备选 ② · 环境变量）
 
@@ -130,7 +138,8 @@ bash scripts/bootstrap.sh --mode=server
 4. `pnpm install`
 5. 启动 postgres + redis（local）；server 模式跳过
 6. 跑 `db:migrate` + `db:seed`
-7. 生成 RSA-2048 JWT 密钥对至 `enterprise/.local-secrets/`（local）
+7. 跑 `migrate:legacy-runtime`（将 `.runtime/admin/*.json` 幂等导入 PG）
+8. 生成 RSA-2048 JWT 密钥对至 `enterprise/.local-secrets/`（local）
 
 常用选项：
 
@@ -164,10 +173,23 @@ pnpm exec turbo run dev \
 
 ## 相关文档
 
-- 产品架构：`../docs/plans/2026-04-21-agenticx-enterprise-architecture.md`
-- 插件协议：`./docs/plugin-protocol/`
-- API 契约：`./docs/api/`
-- 部署手册：`./docs/deployment/`
+完整文档索引：**[docs/README.md](./docs/README.md)**
+
+| 主题 | 路径 |
+|---|---|
+| 架构总览 | [docs/architecture/overview.md](./docs/architecture/overview.md) |
+| 数据流 | [docs/architecture/data-flow.md](./docs/architecture/data-flow.md) |
+| API 契约 | [docs/api/README.md](./docs/api/README.md) |
+| 数据库 Schema | [docs/database/schema.md](./docs/database/schema.md) |
+| RBAC Scopes | [docs/rbac/scopes.md](./docs/rbac/scopes.md) |
+| Gateway | [docs/gateway/overview.md](./docs/gateway/overview.md) |
+| 插件协议 | [docs/plugin-protocol/README.md](./docs/plugin-protocol/README.md) |
+| Features / Packages / Apps | [docs/features/](./docs/features/) · [docs/packages/](./docs/packages/) · [docs/apps/](./docs/apps/) |
+| 本地开发 / 排障 | [docs/development/local-dev.md](./docs/development/local-dev.md) · [docs/development/troubleshooting.md](./docs/development/troubleshooting.md) |
+| 测试 | [docs/testing/README.md](./docs/testing/README.md) |
+| 部署 | [docs/deployment/README.md](./docs/deployment/README.md) |
+| 客户定制协作 | [docs/guides/enterprise-customers-collaboration.md](./docs/guides/enterprise-customers-collaboration.md) |
+| 产品架构（主仓） | [../docs/plans/2026-04-21-agenticx-enterprise-architecture.md](../docs/plans/2026-04-21-agenticx-enterprise-architecture.md) |
 
 ## License
 

@@ -50,6 +50,16 @@ type PortalModelOption = {
   isDefault: boolean;
 };
 
+/** 会话 active_model（provider/model）在可见列表为空时的展示兜底。 */
+function formatActiveModelFallback(modelId: string): string {
+  const slash = modelId.indexOf("/");
+  if (slash <= 0) return modelId;
+  const provider = modelId.slice(0, slash);
+  const model = modelId.slice(slash + 1);
+  if (!model) return modelId;
+  return `${model} · ${provider}`;
+}
+
 type MachiChatViewProps = {
   client: ChatClient;
 };
@@ -87,7 +97,10 @@ export function MachiChatView({ client }: MachiChatViewProps) {
     errorMessage,
     sessionTokens,
     responseVersionsByUserMessageId,
-    bootstrap,
+    hydrateSessions,
+    historyLoading,
+    historyError,
+    sessionMessagesLoading,
     renameSession,
     switchModel,
     sendMessage,
@@ -145,11 +158,8 @@ export function MachiChatView({ client }: MachiChatViewProps) {
   }, [modelsLoaded, availableModels, activeModel, switchModel]);
 
   React.useEffect(() => {
-    if (sessions.length > 0) return;
-    if (activeSessionId) return;
-    const initial = availableModels.find((m) => m.isDefault) ?? availableModels[0];
-    bootstrap({ defaultModel: initial?.id, title: "欢迎使用 AgenticX" });
-  }, [activeSessionId, sessions.length, bootstrap, availableModels]);
+    void hydrateSessions();
+  }, [hydrateSessions]);
 
   React.useEffect(() => {
     if (!modelMenuOpen) return;
@@ -188,6 +198,23 @@ export function MachiChatView({ client }: MachiChatViewProps) {
     () => availableModels.find((m) => m.id === activeModel) ?? null,
     [availableModels, activeModel]
   );
+
+  const modelTriggerLabel = React.useMemo(() => {
+    if (activeOption) return activeOption.label;
+    if (!modelsLoaded) return "加载中...";
+    if (activeModel && activeModel !== "mock-model-v1") {
+      return formatActiveModelFallback(activeModel);
+    }
+    return availableModels.length === 0 ? "无可用模型" : "选择模型";
+  }, [activeOption, modelsLoaded, activeModel, availableModels.length]);
+
+  const modelMenuEmptyHint = React.useMemo(() => {
+    if (availableModels.length > 0) return null;
+    if (activeModel && activeModel !== "mock-model-v1") {
+      return `当前会话使用 ${formatActiveModelFallback(activeModel)}，但该模型未分配给您的账号。请联系管理员在「用户管理 → 可见模型分配」中勾选可用模型。`;
+    }
+    return "暂无可用模型，请联系管理员在「平台配置 · 模型服务」启用模型，并在「用户管理 → 可见模型分配」中为您勾选。";
+  }, [availableModels.length, activeModel]);
 
   const visibleMessages = React.useMemo(() => {
     if (!activeSessionId) return [];
@@ -261,11 +288,26 @@ export function MachiChatView({ client }: MachiChatViewProps) {
 
   const composer = (
     <div className="mx-auto w-full max-w-4xl space-y-3">
+      {historyError && (
+        <Alert variant="warning" className="border-warning/30 bg-warning-soft/80 shadow-sm">
+          <ShieldAlert className="h-5 w-5" />
+          <div>
+            <AlertTitle>历史同步</AlertTitle>
+            <AlertDescription>{historyError}</AlertDescription>
+          </div>
+        </Alert>
+      )}
       {errorMessage && (
         <Alert variant="warning" className="border-warning/30 bg-warning-soft/80 shadow-sm">
           <ShieldAlert className="h-5 w-5" />
-          <AlertTitle>{t.complianceTitle}</AlertTitle>
-          <AlertDescription>{errorMessage}</AlertDescription>
+          <div>
+            <AlertTitle>
+              {/合规|策略/.test(errorMessage) && !/Gateway/i.test(errorMessage)
+                ? t.complianceTitle
+                : t.chatErrorTitle}
+            </AlertTitle>
+            <AlertDescription>{errorMessage}</AlertDescription>
+          </div>
         </Alert>
       )}
 
@@ -317,8 +359,8 @@ export function MachiChatView({ client }: MachiChatViewProps) {
                 }}
               >
                 {availableModels.length === 0 ? (
-                  <div className="px-3 py-3 text-xs text-muted-foreground">
-                    暂无可用模型，请联系管理员在「平台配置 · 模型服务」启用并分配。
+                  <div className="px-3 py-3 text-xs leading-relaxed text-muted-foreground">
+                    {modelMenuEmptyHint}
                   </div>
                 ) : (
                   availableModels.map((opt) => {
@@ -360,7 +402,7 @@ export function MachiChatView({ client }: MachiChatViewProps) {
               onClick={() => setModelMenuOpen((prev) => !prev)}
               className="flex h-8 items-center gap-1.5 rounded-full px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground"
             >
-              <span>{activeOption?.label ?? (modelsLoaded ? "无可用模型" : "加载中...")}</span>
+              <span>{modelTriggerLabel}</span>
               <ChevronDown className={`h-3.5 w-3.5 transition-transform ${modelMenuOpen ? "rotate-180" : ""}`} />
             </button>
           </div>
@@ -384,7 +426,7 @@ export function MachiChatView({ client }: MachiChatViewProps) {
                 onBlur={() => {
                   setIsEditingTitle(false);
                   if (activeSessionId) {
-                    renameSession(activeSessionId, sessionTitle.trim() || "New chat");
+                    void renameSession(activeSessionId, sessionTitle.trim() || "New chat");
                   }
                 }}
                 onKeyDown={(e) => {
@@ -460,7 +502,7 @@ export function MachiChatView({ client }: MachiChatViewProps) {
             /* 欢迎态 */
             <div className="relative flex h-full flex-col items-center justify-start gap-8 overflow-y-auto px-4 py-8 md:justify-center">
               <div className="flex flex-col items-center gap-4 text-center">
-                <div className="relative">
+                <div className="relative rounded-md border-2 border-border dark:border-white/90 dark:shadow-[0_0_0_1px_rgba(255,255,255,0.06)]">
                   <MachiAvatar size={210} className="relative h-[210px] w-[210px]" />
                 </div>
                 <div>
@@ -498,6 +540,11 @@ export function MachiChatView({ client }: MachiChatViewProps) {
             </div>
           ) : (
             <div className="relative h-full min-h-0">
+              {sessionMessagesLoading && (
+                <div className="absolute inset-0 z-10 flex items-center justify-center bg-background/60 text-sm text-muted-foreground backdrop-blur-[1px]">
+                  加载消息…
+                </div>
+              )}
               <MessageList
                 messages={visibleMessages}
                 className="h-full"

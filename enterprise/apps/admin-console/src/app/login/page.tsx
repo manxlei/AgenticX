@@ -1,7 +1,7 @@
 "use client";
 
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   Alert,
   AlertDescription,
@@ -17,14 +17,24 @@ import {
   MachiAvatar,
   Separator,
 } from "@agenticx/ui";
+import { getAdminSsoErrorMessageZh } from "@agenticx/auth/src/services/oidc-error-codes";
 import { ArrowRight, ShieldAlert, ShieldCheck } from "lucide-react";
+import { getAdminSsoProviderOptions, pickPreferredSsoProvider } from "../../lib/admin-sso-provider-options";
 
-export default function LoginPage() {
+function LoginPageInner() {
   const router = useRouter();
-  const [email, setEmail] = useState("owner@agenticx.local");
+  const searchParams = useSearchParams();
+  const [email, setEmail] = useState("admin@agenticx.local");
   const [password, setPassword] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const ssoProviders = useMemo(() => getAdminSsoProviderOptions(), []);
+
+  useEffect(() => {
+    const raw = searchParams.get("sso_error");
+    if (!raw) return;
+    setStatus(getAdminSsoErrorMessageZh(raw));
+  }, [searchParams]);
 
   const signIn = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -172,8 +182,21 @@ export default function LoginPage() {
               </Separator>
 
               <div className="grid grid-cols-2 gap-2">
-                <Button variant="outline" type="button" disabled>
-                  SSO（敬请期待）
+                <Button
+                  variant="outline"
+                  type="button"
+                  disabled={ssoProviders.length === 0}
+                  onClick={() => {
+                    const provider = pickPreferredSsoProvider(ssoProviders);
+                    const providerId = provider?.id ?? "default";
+                    const startPath =
+                      provider?.protocol === "saml"
+                        ? "/api/auth/sso/saml/start"
+                        : "/api/auth/sso/oidc/start";
+                    window.location.href = `${startPath}?provider=${encodeURIComponent(providerId)}`;
+                  }}
+                >
+                  企业 SSO 登录
                 </Button>
                 <Button variant="outline" type="button" disabled>
                   LDAP（敬请期待）
@@ -197,5 +220,13 @@ export default function LoginPage() {
         <span>Apache 2.0</span>
       </div>
     </main>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={null}>
+      <LoginPageInner />
+    </Suspense>
   );
 }

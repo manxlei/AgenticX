@@ -2,10 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AvatarSidebar } from "./components/AvatarSidebar";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { TokenDashboardPanel } from "./components/TokenDashboardPanel";
 import { LiteChatView } from "./components/LiteChatView";
 import { PaneManager } from "./components/PaneManager";
 import { SidebarResizer } from "./components/SidebarResizer";
 import { Topbar } from "./components/Topbar";
+import { VoiceFocusMode } from "./components/VoiceFocusMode";
 import type { ForwardConfirmPayload } from "./components/ForwardPicker";
 import { rememberSessionForAvatar } from "./utils/avatar-last-session";
 import { mapLoadedSessionMessage, type LoadedSessionMessage } from "./utils/session-message-map";
@@ -242,9 +244,9 @@ export function App() {
   const planMode = useAppStore((s) => s.planMode);
   const setPlanMode = useAppStore((s) => s.setPlanMode);
   const focusMode = useAppStore((s) => s.focusMode);
-  const focusModeTall = useAppStore((s) => s.focusModeTall);
   const toggleFocusMode = useAppStore((s) => s.toggleFocusMode);
   const theme = useAppStore((s) => s.theme);
+  const themeColor = useAppStore((s) => s.themeColor);
   const setTheme = useAppStore((s) => s.setTheme);
   const setAgxAccount = useAppStore((s) => s.setAgxAccount);
   const chatStyle = useAppStore((s) => s.chatStyle);
@@ -259,6 +261,8 @@ export function App() {
   const closeConfirm = useAppStore((s) => s.closeConfirm);
   const openSettings = useAppStore((s) => s.openSettings);
   const closeSettings = useAppStore((s) => s.closeSettings);
+  const tokenDashboardOpen = useAppStore((s) => s.tokenDashboard.open);
+  const closeTokenDashboard = useAppStore((s) => s.closeTokenDashboard);
   const updateSettings = useAppStore((s) => s.updateSettings);
   const setActiveModel = useAppStore((s) => s.setActiveModel);
   const setPaneModel = useAppStore((s) => s.setPaneModel);
@@ -269,9 +273,15 @@ export function App() {
   const sessionInitDoneRef = useRef(false);
   const workspaceHydratedRef = useRef(false);
   const [windowResizing, setWindowResizing] = useState(false);
+  const [responsiveStage, setResponsiveStage] = useState<0 | 1 | 2>(0);
   const [startupOptimizing, setStartupOptimizing] = useState(true);
   const [configLoaded, setConfigLoaded] = useState(false);
   const windowResizeTimerRef = useRef<number | null>(null);
+  const responsiveStageRef = useRef<0 | 1 | 2>(0);
+  const responsiveSnapshotRef = useRef<{
+    sidebarOpen?: boolean;
+    panes?: Record<string, { taskspace: boolean; history: boolean; members: boolean }>;
+  } | null>(null);
   const subAgentsRef = useRef(subAgents);
   const subAgentSessionRef = useRef<Record<string, string>>({});
   const staleMissCountRef = useRef<Record<string, number>>({});
@@ -283,7 +293,7 @@ export function App() {
     agentName: string;
     summary: string;
     sessionId: string;
-    status: "completed" | "failed";
+    status: "completed" | "failed" | "paused";
     attempts?: number;
   }>>([]);
   const autoReportingRef = useRef(false);
@@ -321,8 +331,9 @@ export function App() {
   }, []);
 
   const refreshMcpStatus = useCallback(async (sid?: string) => {
-    const effectiveSid = sid || useAppStore.getState().sessionId;
-    if (!effectiveSid) return;
+    // Allow empty sid: backend returns process-level MCP configs so the
+    // Settings panel is not blocked by a not-yet-bound session (FR-3).
+    const effectiveSid = sid || useAppStore.getState().sessionId || "";
     const status = await window.agenticxDesktop.loadMcpStatus(effectiveSid);
     if (status.ok && Array.isArray(status.servers)) {
       setMcpServers(
@@ -493,6 +504,12 @@ export function App() {
                 a.skills_enabled && typeof a.skills_enabled === "object"
                   ? { ...a.skills_enabled }
                   : undefined,
+              brainsEnabled:
+                a.brains_enabled === "*"
+                  ? "*"
+                  : Array.isArray(a.brains_enabled)
+                    ? a.brains_enabled.map(String)
+                    : undefined,
               defaultProvider: a.default_provider ?? "",
               defaultModel: a.default_model ?? "",
             })),
@@ -817,7 +834,7 @@ export function App() {
             provider?: string;
             model?: string;
             task?: string;
-            status?: "pending" | "running" | "completed" | "failed" | "cancelled";
+            status?: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
             result_summary?: string;
             error_text?: string;
             recent_events?: Array<{ type?: string; data?: Record<string, unknown> }>;
@@ -874,6 +891,8 @@ export function App() {
                 ? item.error_text || "执行异常"
                 : status === "cancelled"
                   ? "已中断"
+                  : status === "paused"
+                    ? summaryText || item.error_text || "已暂停，可稍后继续"
                   : "执行中";
           const pendingConfirm =
             hasPendingConfirm
@@ -898,14 +917,25 @@ export function App() {
           });
 
           if (
-            (effectiveStatus === "completed" || effectiveStatus === "failed") &&
+            (effectiveStatus === "completed" || effectiveStatus === "failed" || effectiveStatus === "paused") &&
             !completionNotifiedRef.current.has(id)
           ) {
             completionNotifiedRef.current.add(id);
             const agentName = item.name ?? id;
-            const emoji = effectiveStatus === "completed" ? "✅" : "❌";
-            const statusLabel = effectiveStatus === "completed" ? "已完成" : "执行失败";
-            const summaryBody = summaryText || (effectiveStatus === "failed" ? (item.error_text || "未知错误") : "任务已结束");
+            const emoji = effectiveStatus === "completed" ? "✅" : effectiveStatus === "paused" ? "⏸" : "❌";
+            const statusLabel =
+              effectiveStatus === "completed"
+                ? "已完成"
+                : effectiveStatus === "paused"
+                  ? "已暂停"
+                  : "执行失败";
+            const summaryBody = summaryText || (
+              effectiveStatus === "failed"
+                ? (item.error_text || "未知错误")
+                : effectiveStatus === "paused"
+                  ? (item.error_text || "任务已暂停，可稍后继续")
+                  : "任务已结束"
+            );
             const completionMsg = `${emoji} **子智能体 ${agentName} ${statusLabel}**\n\n${summaryBody}`;
             const store = useAppStore.getState();
             const matchingPane = resolvePaneForSession(sid, id);
@@ -918,7 +948,12 @@ export function App() {
               agentName,
               summary: summaryBody,
               sessionId: sid,
-              status: effectiveStatus === "completed" ? "completed" : "failed",
+              status:
+                effectiveStatus === "completed"
+                  ? "completed"
+                  : effectiveStatus === "paused"
+                    ? "paused"
+                    : "failed",
               attempts: 0,
             });
           }
@@ -1048,12 +1083,12 @@ export function App() {
 
         const agentLines = items
           .map((it) => {
-            const state = it.status === "completed" ? "已完成" : "失败";
+            const state = it.status === "completed" ? "已完成" : it.status === "paused" ? "已暂停" : "失败";
             return `- 【${it.agentName}】(${it.agentId}) [${state}]: ${it.summary.slice(0, 300)}`;
           })
           .join("\n");
         const triggerMsg =
-          `[系统通知] 以下子智能体已结束（可能成功或失败），请立即向用户主动汇报：完成情况/失败原因、产出文件列表、下一步建议。\n${agentLines}`;
+          `[系统通知] 以下子智能体已结束或暂停（可能成功、失败或因限流/轮次触顶暂停），请立即向用户主动汇报：完成情况/暂停原因/失败原因、产出文件列表、下一步建议。\n${agentLines}`;
 
         const paneProvider = String(matchingPane.modelProvider ?? "").trim();
         const paneModel = String(matchingPane.modelName ?? "").trim();
@@ -1186,10 +1221,6 @@ export function App() {
 
   useEffect(() => {
     try {
-      const savedTheme = window.localStorage.getItem("agx-theme");
-      if (savedTheme === "dark" || savedTheme === "light" || savedTheme === "dim") {
-        setTheme(savedTheme);
-      }
       const savedSidebarWidth = window.localStorage.getItem("agx-sidebar-width");
       if (savedSidebarWidth) {
         document.documentElement.style.setProperty("--sidebar-width", savedSidebarWidth);
@@ -1197,16 +1228,48 @@ export function App() {
     } catch {
       // ignore storage failures
     }
+  }, []);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const layout = await window.agenticxDesktop.loadLayout();
+        if (!layout.ok) return;
+        const saved = String(layout.theme ?? "").trim();
+        if (saved === "light" || saved === "dark") {
+          if (useAppStore.getState().theme !== saved) {
+            setTheme(saved);
+          }
+          return;
+        }
+        if (saved === "dim") {
+          if (useAppStore.getState().theme !== "dark") {
+            setTheme("dark");
+          }
+          return;
+        }
+        // First run after upgrade: seed ~/.agenticx/layout.json from localStorage.
+        const current = useAppStore.getState().theme;
+        if (current === "light" || current === "dark" || current === "dim") {
+          void window.agenticxDesktop.saveUiPrefs({ theme: current });
+        }
+      } catch {
+        // ignore; localStorage fallback from store init remains
+      }
+    })();
   }, [setTheme]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
-    try {
-      window.localStorage.setItem("agx-theme", theme);
-    } catch {
-      // ignore storage failures
-    }
-  }, [theme]);
+    document.documentElement.setAttribute("data-theme-color", themeColor);
+    void window.agenticxDesktop.syncTitleBarOverlay(theme);
+  }, [theme, themeColor]);
+
+  useEffect(() => {
+    void window.agenticxDesktop.platform().then((platform) => {
+      document.documentElement.setAttribute("data-platform", platform);
+    });
+  }, []);
 
   useEffect(() => {
     // Initial account hydration and subscription to device-flow OAuth events.
@@ -1267,6 +1330,112 @@ export function App() {
     };
   }, []);
 
+  // Responsive auto-collapse: 窗口越窄越先收侧栏面板，最后才收主导航
+  // Stage 0: 全展开 (>= STAGE1_BREAK)
+  // Stage 1: 自动收起每个 pane 的「工作区 / 历史对话 / 群成员」面板 (< STAGE1_BREAK)
+  // Stage 2: 进一步收起左侧主导航栏 (< STAGE2_BREAK)
+  // 当窗口重新拉宽并跨回阈值时，恢复进入窄屏前用户原本展开的面板/导航。
+  useEffect(() => {
+    const STAGE1_BREAK = 1180;
+    const STAGE2_BREAK = 820;
+
+    const computeStage = (w: number): 0 | 1 | 2 => {
+      if (w < STAGE2_BREAK) return 2;
+      if (w < STAGE1_BREAK) return 1;
+      return 0;
+    };
+
+    const applyStage = (newStage: 0 | 1 | 2) => {
+      const prev = responsiveStageRef.current;
+      if (prev === newStage) return;
+      const state = useAppStore.getState();
+      // Focus 模式下完全交给浮窗自身布局，不参与响应式折叠
+      if (state.focusMode) {
+        responsiveStageRef.current = newStage;
+        setResponsiveStage(newStage);
+        return;
+      }
+
+      if (newStage > prev) {
+        const snap = responsiveSnapshotRef.current ?? {};
+        if (prev < 1 && newStage >= 1) {
+          const panesMap: Record<
+            string,
+            { taskspace: boolean; history: boolean; members: boolean }
+          > = {};
+          state.panes.forEach((p) => {
+            panesMap[p.id] = {
+              taskspace: !!p.taskspacePanelOpen,
+              history: !!p.historyOpen,
+              members: !!p.membersPanelOpen,
+            };
+          });
+          snap.panes = panesMap;
+        }
+        if (prev < 2 && newStage === 2) {
+          snap.sidebarOpen = !state.sidebarCollapsed;
+        }
+        responsiveSnapshotRef.current = snap;
+
+        useAppStore.setState((s) => {
+          const patch: Partial<typeof s> = {};
+          if (newStage >= 1) {
+            patch.panes = s.panes.map((p) => ({
+              ...p,
+              taskspacePanelOpen: false,
+              historyOpen: false,
+              membersPanelOpen: false,
+            }));
+          }
+          if (newStage === 2 && !s.sidebarCollapsed) {
+            patch.sidebarCollapsed = true;
+          }
+          return patch as typeof s;
+        });
+      } else {
+        const snap = responsiveSnapshotRef.current;
+        useAppStore.setState((s) => {
+          const patch: Partial<typeof s> = {};
+          if (prev === 2 && newStage < 2 && snap?.sidebarOpen !== undefined) {
+            patch.sidebarCollapsed = !snap.sidebarOpen;
+          }
+          if (newStage === 0 && snap?.panes) {
+            const map = snap.panes;
+            patch.panes = s.panes.map((p) => {
+              const rec = map[p.id];
+              if (!rec) return p;
+              return {
+                ...p,
+                taskspacePanelOpen: rec.taskspace,
+                historyOpen: rec.history,
+                membersPanelOpen: rec.members,
+              };
+            });
+          }
+          return patch as typeof s;
+        });
+        if (newStage === 0) {
+          responsiveSnapshotRef.current = null;
+        } else if (newStage < 2 && responsiveSnapshotRef.current) {
+          delete responsiveSnapshotRef.current.sidebarOpen;
+        }
+      }
+      responsiveStageRef.current = newStage;
+      setResponsiveStage(newStage);
+    };
+
+    const handle = () => applyStage(computeStage(window.innerWidth));
+    // 首次挂载与可能的工作区状态恢复后各跑一次，保证窄屏启动也能收起
+    handle();
+    const settleTimer = window.setTimeout(handle, 250);
+
+    window.addEventListener("resize", handle, { passive: true });
+    return () => {
+      window.removeEventListener("resize", handle);
+      window.clearTimeout(settleTimer);
+    };
+  }, []);
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       setStartupOptimizing(false);
@@ -1292,7 +1461,9 @@ export function App() {
       } else if (action === "toggle-plan-mode") {
         setPlanMode(!planMode);
       } else if (action === "toggle-focus-mode") {
-        toggleFocusMode();
+        // 快捷键场景：把当前 activePaneId 作为目标 pane 传给灵巧模式，
+        // 让历史继承 / 写回都对齐用户正在聊的那个会话（非硬编码 pane-meta）。
+        toggleFocusMode(useAppStore.getState().activePaneId);
       } else if (action === "open-keybindings") {
         setKeybindingsPanelOpen(true);
       }
@@ -1812,17 +1983,30 @@ export function App() {
     };
   }, [apiBase, addPane, setActivePaneId, setActiveAvatarId, setPaneMessages, setPaneSessionId]);
 
+  const sidebarOverlayMode =
+    userMode === "pro" &&
+    !!apiBase &&
+    !focusMode &&
+    responsiveStage === 2 &&
+    !sidebarCollapsed;
+
   return (
     <div
       className={`agx-app ${
         sidebarCollapsed || userMode !== "pro" || !apiBase ? "sidebar-collapsed" : ""
-      } ${windowResizing ? "window-resizing" : ""} ${startupOptimizing ? "startup-optimizing" : ""} ${
-        focusMode ? "focus-mode" : ""
-      } ${focusModeTall ? "focus-mode-tall" : ""}`}
+      } ${windowResizing ? "window-resizing" : ""} ${startupOptimizing ? "startup-optimizing" : ""} ${focusMode ? "agx-voice-focus-app" : ""} ${
+        sidebarOverlayMode ? "sidebar-overlay" : ""
+      }`}
     >
       {!configLoaded ? (
         <div className="flex h-full min-h-0 w-full items-center justify-center text-sm text-text-faint">
           正在加载配置…
+        </div>
+      ) : focusMode && apiBase ? (
+        <VoiceFocusMode />
+      ) : focusMode ? (
+        <div className="flex h-full min-h-0 w-full items-center justify-center px-6 text-center text-sm text-[var(--text-danger,var(--destructive,#ef4444))]">
+          AgenticX 后端未就绪，无法进入灵巧语音模式。
         </div>
       ) : apiBase ? (
         <>
@@ -1831,6 +2015,14 @@ export function App() {
               <AvatarSidebar />
               <SidebarResizer />
             </div>
+          ) : null}
+          {sidebarOverlayMode ? (
+            <div
+              className="agx-sidebar-overlay-backdrop"
+              onClick={() => setSidebarCollapsed(true)}
+              role="presentation"
+              aria-hidden
+            />
           ) : null}
           <div className="agx-main-shell">
             {userMode === "pro" && !focusMode ? (
@@ -1908,6 +2100,7 @@ export function App() {
         groups={groups}
         onForwardFavorite={handleForwardFavorite}
       />
+      <TokenDashboardPanel open={tokenDashboardOpen} onClose={() => closeTokenDashboard()} />
     </div>
   );
 }

@@ -41,9 +41,9 @@ export function PaneDivider({ onDrag, direction = "horizontal" }: Props) {
       title={isVertical ? "拖拽调整窗格高度" : "拖拽调整窗格宽度"}
     >
       {isVertical ? (
-        <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[rgba(255,255,255,0.06)] transition group-hover:bg-[rgba(255,255,255,0.18)]" />
+        <div className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-[var(--border-strong)] transition-all duration-200 group-hover:h-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
       ) : (
-        <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-[rgba(255,255,255,0.06)] transition group-hover:bg-[rgba(255,255,255,0.18)]" />
+        <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-[var(--border-strong)] transition-all duration-200 group-hover:w-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
       )}
     </div>
   );

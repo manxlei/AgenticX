@@ -10,11 +10,13 @@ export type SubAgentStatus =
   | "pending"
   | "awaiting_confirm"
   | "running"
+  | "paused"
   | "completed"
   | "failed"
   | "cancelled";
 export type ConfirmStrategy = "manual" | "semi-auto" | "auto";
 export type ThemeMode = "dark" | "light" | "dim";
+export type ThemeColor = "blue" | "green" | "pink" | "yellow" | "white";
 export type ChatStyle = "im" | "terminal" | "clean";
 /** MCP 列表展示态（与 Studio `/api/mcp/servers` 对齐，近似 Cursor 绿/红/灰语义） */
 export type McpServer = {
@@ -45,6 +47,8 @@ export type Avatar = {
   toolsEnabled?: Record<string, boolean>;
   /** Per-skill overrides: false = disabled for this avatar; missing = inherit global. */
   skillsEnabled?: Record<string, boolean>;
+  /** null = global brains only; "*" = all visible; string[] = explicit brain ids */
+  brainsEnabled?: "*" | string[] | null;
   /** Default LLM provider the avatar uses when a session has no explicit model yet. */
   defaultProvider?: string;
   /** Default LLM model the avatar uses when a session has no explicit model yet. */
@@ -119,7 +123,19 @@ export type ChatPane = {
   sessionTokens: { input: number; output: number };
   /** Temporary highlight terms from session-history search navigation. */
   historySearchTerms: string[];
+  /** Harness mode for this pane's session (code_dev vs daily_office). */
+  sessionMode?: "code_dev" | "daily_office";
 };
+
+/** Lifecycle for merged tool_call + tool_result rows in chat (desktop Meta pane). */
+export type ToolCallStatus = "pending" | "running" | "done" | "error" | "cancelled";
+
+/** Flat inline notices for context/token budget events (not expandable tool cards). */
+export type ContextNoticeKind =
+  | "budget_compress"
+  | "compactor_cb"
+  | "compaction_reactive"
+  | "compaction_proactive";
 
 export type Message = {
   id: string;
@@ -136,7 +152,39 @@ export type Message = {
   forwardedHistory?: ForwardedHistoryCard;
   attachments?: MessageAttachment[];
   inlineConfirm?: PendingConfirm;
+  /** Correlates tool_call / tool_result / tool_progress from runtime SSE (`tool_call_id`). */
+  toolCallId?: string;
+  toolName?: string;
+  toolArgs?: Record<string, unknown>;
+  toolStatus?: ToolCallStatus;
+  toolElapsedSec?: number;
+  /** One-line preview for collapsed header while running or after done. */
+  toolResultPreview?: string;
+  /** Consecutive tool messages with the same id render inside one TurnToolGroupCard. */
+  toolGroupId?: string;
+  /** Live stdout/stderr lines for long-running tools (e.g. bash_exec). */
+  toolStreamLines?: string[];
+  /** Parsed from model `<followups>` block; shown as chips after reply completes. */
+  suggestedQuestions?: string[];
+  /** Renders as flat ContextNoticeLine instead of ToolCallCard. */
+  noticeKind?: ContextNoticeKind;
 };
+
+/** Extras allowed on tool messages from `addPaneMessage` / `addMessage`. */
+export type MessageToolExtras = Pick<
+  Message,
+  | "toolCallId"
+  | "toolName"
+  | "toolArgs"
+  | "toolStatus"
+  | "toolElapsedSec"
+  | "toolResultPreview"
+  | "toolGroupId"
+  | "toolStreamLines"
+  | "inlineConfirm"
+  | "suggestedQuestions"
+  | "noticeKind"
+>;
 
 export type ForwardedHistoryItem = {
   sender: string;
@@ -160,6 +208,7 @@ export type MessageAttachment = {
   dataUrl?: string;
   sourcePath?: string;
   referenceToken?: boolean;
+  composerRefLabel?: string;
 };
 
 export type QueuedMessage = {
@@ -212,21 +261,6 @@ type ConfirmState = {
   context?: Record<string, unknown>;
 };
 
-type FocusSnapshot = {
-  sidebarCollapsed: boolean;
-  panePanels: Record<
-    string,
-    {
-      historyOpen: boolean;
-      taskspacePanelOpen: boolean;
-      membersPanelOpen: boolean;
-      spawnsColumnOpen: boolean;
-      spawnsColumnSuppressAuto: boolean;
-      spawnsColumnBaselineIds: string[];
-    }
-  >;
-};
-
 export type ProviderEntry = {
   apiKey: string;
   baseUrl: string;
@@ -254,6 +288,15 @@ type SettingsState = {
   apiKey: string;
 };
 
+export type TokenDashboardRange = "day" | "week" | "month" | "total" | "custom";
+
+type TokenDashboardState = {
+  open: boolean;
+  range: TokenDashboardRange;
+  customFrom: string;
+  customTo: string;
+};
+
 type AppState = {
   apiBase: string;
   apiToken: string;
@@ -265,6 +308,7 @@ type AppState = {
   codePreview: string;
   confirm: ConfirmState;
   settings: SettingsState;
+  tokenDashboard: TokenDashboardState;
   activeProvider: string;
   activeModel: string;
   userMode: "pro" | "lite";
@@ -274,12 +318,27 @@ type AppState = {
   planMode: boolean;
   sidebarCollapsed: boolean;
   focusMode: boolean;
-  focusModeTall: boolean;
-  focusSnapshot: FocusSnapshot | null;
+  /**
+   * 灵巧模式（语音）当前绑定的 pane id。
+   *
+   * 由 `toggleFocusMode(paneId)` / `enterFocusMode(paneId)` 写入；
+   * VoiceFocusMode 读取它解析 sessionId/avatarId，从而：
+   *   1. 把对应 session 最近 ~20 轮历史作为上下文注入 realtime provider；
+   *   2. 把电话中的 user/assistant final 文本追加回该 session（而非硬编码 pane-meta）。
+   * 退出灵巧模式时清空。
+   */
+  focusModePaneId: string | null;
+  /**
+   * 退出灵巧语音模式后，对应 ChatPane 需强制滚到底部一次（绕过 remount 时 flushJumpToBottomFab 误判 unpinned）。
+   * 由 ChatPane 消费后立即清空。
+   */
+  focusExitScrollBottomPaneId: string | null;
+  clearFocusExitScrollBottomPaneId: () => void;
   theme: ThemeMode;
   /** Machi 官网账号登录状态（与 AccountTab / Topbar 共享，首屏和事件回调同步）。 */
   agxAccount: { loggedIn: boolean; email: string; displayName: string };
   chatStyle: ChatStyle;
+  themeColor: ThemeColor;
   /** Global user nickname shown on all bubbles and sent as context label (empty → 「我」). */
   userNickname: string;
   /** Custom avatar for current user. */
@@ -300,12 +359,27 @@ type AppState = {
   sessionCatalogRevision: number;
   bumpSessionCatalogRevision: () => void;
   /** After merge-forward, target pane runs one normal /api/chat with this text (cleared when consumed). */
-  forwardAutoReply: { paneId: string; sessionId: string; text: string } | null;
-  setForwardAutoReply: (job: { paneId: string; sessionId: string; text: string } | null) => void;
+  forwardAutoReply: {
+    paneId: string;
+    sessionId: string;
+    text: string;
+    suppressUserEcho?: boolean;
+    skipUserHistory?: boolean;
+  } | null;
+  setForwardAutoReply: (
+    job: {
+      paneId: string;
+      sessionId: string;
+      text: string;
+      suppressUserEcho?: boolean;
+      skipUserHistory?: boolean;
+    } | null
+  ) => void;
   /** Per-pane queued user messages (sent automatically after current stream ends). */
   pendingMessages: Record<string, QueuedMessage[]>;
   enqueuePaneMessage: (paneId: string, msg: QueuedMessage) => void;
   dequeuePaneMessage: (paneId: string) => QueuedMessage | undefined;
+  takePendingMessage: (paneId: string, msgId: string) => QueuedMessage | undefined;
   removePendingMessage: (paneId: string, msgId: string) => void;
   editPendingMessage: (paneId: string, msgId: string, newText: string) => void;
   clearPendingMessages: (paneId: string) => void;
@@ -321,11 +395,11 @@ type AppState = {
   setKeybindingsPanelOpen: (v: boolean) => void;
   setPlanMode: (v: boolean) => void;
   setSidebarCollapsed: (v: boolean | ((prev: boolean) => boolean)) => void;
-  enterFocusMode: () => void;
+  enterFocusMode: (paneId?: string) => void;
   exitFocusMode: () => void;
-  toggleFocusMode: () => void;
-  setFocusModeTall: (v: boolean) => void;
+  toggleFocusMode: (paneId?: string) => void;
   setTheme: (theme: ThemeMode) => void;
+  setThemeColor: (color: ThemeColor) => void;
   setAgxAccount: (acct: { loggedIn: boolean; email: string; displayName: string }) => void;
   setChatStyle: (style: ChatStyle) => void;
   setUserNickname: (name: string) => void;
@@ -363,12 +437,36 @@ type AppState = {
         | "timestamp"
         | "forwardedHistory"
         | "inlineConfirm"
+        | "suggestedQuestions"
       >
-    >
+    > &
+      Partial<MessageToolExtras>
   ) => void;
+  /** Merge *patch* into the last pane message with the given *role* (search from end). */
+  mergeLastPaneMessageByRole: (paneId: string, role: MsgRole, patch: Partial<Message>) => boolean;
+  /** Merge fields into an existing pane `tool` message by `toolCallId`. */
+  updatePaneMessageByToolCallId: (
+    paneId: string,
+    toolCallId: string,
+    patch: Partial<
+      Pick<Message, "content" | "toolStatus" | "toolElapsedSec" | "toolResultPreview" | "toolStreamLines" | "inlineConfirm">
+    > & {
+      appendStreamLine?: string;
+    }
+  ) => boolean;
+  /** Lite / global `messages` list: merge tool rows by `toolCallId` (mirrors pane path). */
+  updateMessageByToolCallId: (
+    toolCallId: string,
+    patch: Partial<
+      Pick<Message, "content" | "toolStatus" | "toolElapsedSec" | "toolResultPreview" | "toolStreamLines" | "inlineConfirm">
+    > & {
+      appendStreamLine?: string;
+    }
+  ) => boolean;
   updateLastPaneMessage: (paneId: string, content: string) => void;
   clearPaneMessages: (paneId: string) => void;
   setPaneSessionId: (paneId: string, sessionId: string, modelHint?: { provider?: string; model?: string }) => void;
+  setPaneSessionMode: (paneId: string, mode: "code_dev" | "daily_office") => void;
   setPaneMessages: (paneId: string, messages: Message[]) => void;
   setPaneHistorySearchTerms: (paneId: string, terms: string[]) => void;
   togglePaneHistory: (paneId: string) => void;
@@ -409,8 +507,11 @@ type AppState = {
         | "forwardedHistory"
         | "inlineConfirm"
       >
-    >
+    > &
+      Partial<MessageToolExtras>
   ) => void;
+  /** Lite/global list: merge *patch* into the last message with *role* (by id sync to active pane). */
+  mergeLastMessageByRole: (role: MsgRole, patch: Partial<Message>) => boolean;
   insertMessageAfter: (afterId: string, msg: Omit<Message, "id">) => string;
   clearMessages: () => void;
   addSubAgent: (item: Pick<SubAgent, "id" | "name" | "role" | "task" | "provider" | "model"> & { sessionId?: string }) => void;
@@ -437,6 +538,10 @@ type AppState = {
       >
     >
   ) => void;
+  openTokenDashboard: () => void;
+  closeTokenDashboard: () => void;
+  setTokenDashboardRange: (range: TokenDashboardRange) => void;
+  setTokenDashboardCustomRange: (from: string, to: string) => void;
 };
 
 function uid(): string {
@@ -469,6 +574,8 @@ function makeDefaultPane(): ChatPane {
 }
 
 const CHAT_STYLE_STORAGE_KEY = "agx-chat-style";
+const THEME_STORAGE_KEY = "agx-theme";
+const THEME_COLOR_STORAGE_KEY = "agx-theme-color";
 const USER_DISPLAY_NAME_KEY = "agx-user-display-name";
 const USER_PREFERENCE_KEY = "agx-user-preference";
 const USER_AVATAR_URL_KEY = "agx-user-avatar-url";
@@ -483,6 +590,27 @@ function loadChatStyle(): ChatStyle {
     // ignore storage errors
   }
   return "im";
+}
+
+function loadTheme(): ThemeMode {
+  try {
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+    if (saved === "dark" || saved === "light") return saved;
+    if (saved === "dim") return "dark";
+  } catch {
+    // ignore storage errors
+  }
+  return "dark";
+}
+
+function loadThemeColor(): ThemeColor {
+  try {
+    const saved = window.localStorage.getItem(THEME_COLOR_STORAGE_KEY);
+    if (saved === "blue" || saved === "green" || saved === "pink" || saved === "yellow" || saved === "white") return saved as ThemeColor;
+  } catch {
+    // ignore storage errors
+  }
+  return "pink";
 }
 
 function loadUserNickname(): string {
@@ -601,9 +729,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   planMode: false,
   sidebarCollapsed: false,
   focusMode: false,
-  focusModeTall: false,
-  focusSnapshot: null,
-  theme: "dark",
+  focusModePaneId: null,
+  focusExitScrollBottomPaneId: null,
+  theme: loadTheme(),
+  themeColor: loadThemeColor(),
   agxAccount: { loggedIn: false, email: "", displayName: "" },
   chatStyle: loadChatStyle(),
   userNickname: loadUserNickname(),
@@ -627,6 +756,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   codePreview: "",
   confirm: { open: false, requestId: "", question: "", agentId: "meta" },
   settings: { open: false, provider: "", model: "", apiKey: "", defaultProvider: "", providers: {} },
+  tokenDashboard: { open: false, range: "month", customFrom: "", customTo: "" },
   setApiBase: (apiBase) => set({ apiBase }),
   setApiToken: (apiToken) => set({ apiToken }),
   setSessionId: (sessionId) => set({ sessionId }),
@@ -662,95 +792,74 @@ export const useAppStore = create<AppState>((set, get) => ({
       sidebarCollapsed:
         typeof next === "function" ? next(state.sidebarCollapsed) : next,
     })),
-  setFocusModeTall: (v) => set({ focusModeTall: v }),
-  enterFocusMode: () => {
-    const already = get().focusMode;
-    set((state) => {
-      if (state.focusMode) return state;
-      const panePanels: FocusSnapshot["panePanels"] = {};
-      for (const pane of state.panes) {
-        panePanels[pane.id] = {
-          historyOpen: pane.historyOpen,
-          taskspacePanelOpen: pane.taskspacePanelOpen,
-          membersPanelOpen: pane.membersPanelOpen,
-          spawnsColumnOpen: pane.spawnsColumnOpen,
-          spawnsColumnSuppressAuto: pane.spawnsColumnSuppressAuto,
-          spawnsColumnBaselineIds: [...(pane.spawnsColumnBaselineIds ?? [])],
-        };
-      }
-      return {
-        focusMode: true,
-        focusModeTall: false,
-        focusSnapshot: {
-          sidebarCollapsed: state.sidebarCollapsed,
-          panePanels,
-        },
-        sidebarCollapsed: true,
-        panes: state.panes.map((pane) => ({
-          ...pane,
-          historyOpen: false,
-          taskspacePanelOpen: false,
-          membersPanelOpen: false,
-          spawnsColumnOpen: false,
-        })),
-      };
-    });
+  enterFocusMode: (paneId?: string) => {
+    const state = get();
+    // 解析触发 pane：显式入参 > 当前 activePaneId > 默认 pane-meta。
+    // 群聊 pane 的语音多路由场景暂未支持，统一回落到 pane-meta（与 ChatPane 顶栏按钮的可见性策略保持一致）。
+    const candidate = (paneId || state.activePaneId || "pane-meta").trim();
+    const targetPane = state.panes.find((p) => p.id === candidate);
+    const isGroup = Boolean(targetPane?.avatarId && targetPane.avatarId.startsWith("group:"));
+    const resolved = !targetPane || isGroup ? "pane-meta" : targetPane.id;
+    const already = state.focusMode;
     if (!already) {
-      // Fire-and-forget: shrink the actual Electron window to a compact
-      // capsule. Older preload builds may not expose this IPC — in that case
-      // we silently fall back to in-renderer layout only.
+      set({ focusMode: true, focusModePaneId: resolved });
       try {
         void window.agenticxDesktop?.focusModeEnter?.();
       } catch {
-        // ignore IPC errors; UI-only focus mode still works
+        /* ignore IPC errors */
       }
+    } else if (state.focusModePaneId !== resolved) {
+      set({ focusModePaneId: resolved });
     }
   },
   exitFocusMode: () => {
-    const wasActive = get().focusMode;
-    set((state) => {
-      if (!state.focusMode) return state;
-      const snapshot = state.focusSnapshot;
-      if (!snapshot) {
-        return { focusMode: false, focusModeTall: false, focusSnapshot: null };
-      }
-      return {
-        focusMode: false,
-        focusModeTall: false,
-        focusSnapshot: null,
-        sidebarCollapsed: snapshot.sidebarCollapsed,
-        panes: state.panes.map((pane) => {
-          const paneSnapshot = snapshot.panePanels[pane.id];
-          if (!paneSnapshot) return pane;
-          return {
-            ...pane,
-            historyOpen: paneSnapshot.historyOpen,
-            taskspacePanelOpen: paneSnapshot.taskspacePanelOpen,
-            membersPanelOpen: paneSnapshot.membersPanelOpen,
-            spawnsColumnOpen: paneSnapshot.spawnsColumnOpen,
-            spawnsColumnSuppressAuto: paneSnapshot.spawnsColumnSuppressAuto,
-            spawnsColumnBaselineIds: [...paneSnapshot.spawnsColumnBaselineIds],
-          };
-        }),
-      };
+    const state = get();
+    const wasActive = state.focusMode;
+    if (!wasActive) return;
+    const paneForScroll = (state.focusModePaneId ?? state.activePaneId ?? "").trim();
+    set({
+      focusMode: false,
+      focusModePaneId: null,
+      focusExitScrollBottomPaneId: paneForScroll || null,
     });
-    if (wasActive) {
-      try {
-        void window.agenticxDesktop?.focusModeExit?.();
-      } catch {
-        // ignore IPC errors; window will stay at current size
-      }
+    try {
+      void window.agenticxDesktop?.focusModeExit?.();
+    } catch {
+      /* ignore IPC errors */
     }
   },
-  toggleFocusMode: () => {
+  clearFocusExitScrollBottomPaneId: () => set({ focusExitScrollBottomPaneId: null }),
+  toggleFocusMode: (paneId?: string) => {
     const state = get();
     if (state.focusMode) {
       state.exitFocusMode();
       return;
     }
-    state.enterFocusMode();
+    state.enterFocusMode(paneId);
   },
-  setTheme: (theme) => set({ theme }),
+  setTheme: (theme) =>
+    set(() => {
+      try {
+        window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+      } catch {
+        // ignore storage errors
+      }
+      try {
+        void window.agenticxDesktop.saveUiPrefs({ theme });
+      } catch {
+        // ignore when not running inside Electron (e.g. unit tests)
+      }
+      return { theme };
+    }),
+  setThemeColor: (themeColor) =>
+    set(() => {
+      try {
+        window.localStorage.setItem(THEME_COLOR_STORAGE_KEY, themeColor);
+      } catch {
+        // ignore storage errors
+      }
+      return { themeColor };
+    }),
   setAgxAccount: (agxAccount) => set({ agxAccount }),
   setChatStyle: (chatStyle) =>
     set(() => {
@@ -886,6 +995,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       },
     }));
     return first;
+  },
+  takePendingMessage: (paneId, msgId) => {
+    const queue = get().pendingMessages[paneId] ?? [];
+    const item = queue.find((m) => m.id === msgId);
+    if (!item) return undefined;
+    set((state) => ({
+      pendingMessages: {
+        ...state.pendingMessages,
+        [paneId]: (state.pendingMessages[paneId] ?? []).filter((m) => m.id !== msgId),
+      },
+    }));
+    return item;
   },
   removePendingMessage: (paneId, msgId) =>
     set((state) => ({
@@ -1027,6 +1148,70 @@ export const useAppStore = create<AppState>((set, get) => ({
           : pane
       ),
     })),
+  updatePaneMessageByToolCallId: (paneId, toolCallId, patch) => {
+    let found = false;
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const idx = pane.messages.findIndex(
+          (m) => m.role === "tool" && m.toolCallId === toolCallId
+        );
+        if (idx < 0) return pane;
+        found = true;
+        const msgs = [...pane.messages];
+        const prev = msgs[idx];
+        const { appendStreamLine, ...rest } = patch;
+        let nextStream = prev.toolStreamLines;
+        if (appendStreamLine !== undefined && appendStreamLine !== "") {
+          nextStream = [...(prev.toolStreamLines ?? []), appendStreamLine].slice(-200);
+        } else if (rest.toolStreamLines !== undefined) {
+          nextStream = rest.toolStreamLines;
+        }
+        msgs[idx] = {
+          ...prev,
+          ...rest,
+          ...(nextStream !== undefined ? { toolStreamLines: nextStream } : {}),
+        };
+        return { ...pane, messages: msgs };
+      }),
+    }));
+    return found;
+  },
+  updateMessageByToolCallId: (toolCallId, patch) => {
+    let found = false;
+    set((state) => {
+      const idx = state.messages.findIndex((m) => m.role === "tool" && m.toolCallId === toolCallId);
+      if (idx < 0) return state;
+      found = true;
+      const prev = state.messages[idx];
+      const { appendStreamLine, ...rest } = patch;
+      let nextStream = prev.toolStreamLines;
+      if (appendStreamLine !== undefined && appendStreamLine !== "") {
+        nextStream = [...(prev.toolStreamLines ?? []), appendStreamLine].slice(-200);
+      } else if (rest.toolStreamLines !== undefined) {
+        nextStream = rest.toolStreamLines;
+      }
+      const updated: Message = {
+        ...prev,
+        ...rest,
+        ...(nextStream !== undefined ? { toolStreamLines: nextStream } : {}),
+      };
+      const messages = [...state.messages];
+      messages[idx] = updated;
+      const msgId = updated.id;
+      return {
+        messages,
+        panes: state.panes.map((pane) => {
+          const pi = pane.messages.findIndex((m) => m.id === msgId);
+          if (pi < 0) return pane;
+          const pm = [...pane.messages];
+          pm[pi] = updated;
+          return { ...pane, messages: pm };
+        }),
+      };
+    });
+    return found;
+  },
   updateLastPaneMessage: (paneId, content) =>
     set((state) => ({
       panes: state.panes.map((pane) => {
@@ -1037,6 +1222,24 @@ export const useAppStore = create<AppState>((set, get) => ({
         return { ...pane, messages: msgs };
       }),
     })),
+  mergeLastPaneMessageByRole: (paneId, role, patch) => {
+    let found = false;
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        const msgs = [...pane.messages];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i].role === role) {
+            msgs[i] = { ...msgs[i], ...patch };
+            found = true;
+            break;
+          }
+        }
+        return { ...pane, messages: msgs };
+      }),
+    }));
+    return found;
+  },
   clearPaneMessages: (paneId) =>
     set((state) => ({
       panes: state.panes.map((pane) =>
@@ -1075,14 +1278,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     const hintModel = String(modelHint?.model ?? "").trim();
     set((state) => {
       // Priority chain when binding a session to a pane:
-      //   modelHint (usually = session.provider/model from backend)
+      //   modelHint (session.provider/model from backend, e.g. history switch)
+      //   > pane.modelProvider/modelName (user's current picker selection)
       //   > avatar.defaultProvider/defaultModel
       //   > settings.defaultProvider + providers[default].model
-      // Leave empty strings alone so UI can still show "未选模型" if nothing
-      // is configured anywhere — but only for explicit empty hint cases.
+      // Lazy session create must not clobber a manual model switch on the pane.
       const pane = state.panes.find((p) => p.id === paneId);
+      const paneProvider = (pane?.modelProvider || "").trim();
+      const paneModel = (pane?.modelName || "").trim();
       let resolvedProvider = hintProvider;
       let resolvedModel = hintModel;
+      if (!resolvedProvider || !resolvedModel) {
+        if (paneProvider && paneModel) {
+          if (!resolvedProvider) resolvedProvider = paneProvider;
+          if (!resolvedModel) resolvedModel = paneModel;
+        }
+      }
       if (!resolvedProvider || !resolvedModel) {
         const avatar = pane?.avatarId
           ? state.avatars.find((a) => a.id === pane.avatarId)
@@ -1090,14 +1301,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         const avatarProvider = (avatar?.defaultProvider || "").trim();
         const avatarModel = (avatar?.defaultModel || "").trim();
         if (avatarProvider && avatarModel) {
-          resolvedProvider = avatarProvider;
-          resolvedModel = avatarModel;
+          if (!resolvedProvider) resolvedProvider = avatarProvider;
+          if (!resolvedModel) resolvedModel = avatarModel;
         } else {
           const dp = (state.settings.defaultProvider || "").trim();
           const dm = (state.settings.providers[dp]?.model || "").trim();
           if (dp && dm) {
-            resolvedProvider = dp;
-            resolvedModel = dm;
+            if (!resolvedProvider) resolvedProvider = dp;
+            if (!resolvedModel) resolvedModel = dm;
           }
         }
       }
@@ -1128,6 +1339,12 @@ export const useAppStore = create<AppState>((set, get) => ({
       return next as AppState;
     });
   },
+  setPaneSessionMode: (paneId, mode) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, sessionMode: mode } : pane
+      ),
+    })),
   setPaneMessages: (paneId, messages) =>
     set((state) => ({
       panes: state.panes.map((pane) => (pane.id === paneId ? { ...pane, messages } : pane)),
@@ -1150,40 +1367,31 @@ export const useAppStore = create<AppState>((set, get) => ({
       ),
     })),
   togglePaneHistory: (paneId) =>
-    set((state) => {
-      if (state.focusMode) return state;
-      return {
-        panes: state.panes.map((pane) =>
-          pane.id === paneId ? { ...pane, historyOpen: !pane.historyOpen } : pane
-        ),
-      };
-    }),
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, historyOpen: !pane.historyOpen } : pane
+      ),
+    })),
   cycleSidePanel: (paneId, tab) =>
-    set((state) => {
-      if (state.focusMode) return state;
-      return {
-        panes: state.panes.map((pane) => {
-          if (pane.id !== paneId) return pane;
-          if (tab === "workspace") {
-            return { ...pane, taskspacePanelOpen: !pane.taskspacePanelOpen, sidePanelTab: "workspace" };
-          }
-          return { ...pane, membersPanelOpen: !pane.membersPanelOpen, sidePanelTab: "members" };
-        }),
-      };
-    }),
+    set((state) => ({
+      panes: state.panes.map((pane) => {
+        if (pane.id !== paneId) return pane;
+        if (tab === "workspace") {
+          return { ...pane, taskspacePanelOpen: !pane.taskspacePanelOpen, sidePanelTab: "workspace" };
+        }
+        return { ...pane, membersPanelOpen: !pane.membersPanelOpen, sidePanelTab: "members" };
+      }),
+    })),
   openSidePanel: (paneId, tab) =>
-    set((state) => {
-      if (state.focusMode) return state;
-      return {
-        panes: state.panes.map((pane) =>
-          pane.id === paneId
-            ? tab === "workspace"
-              ? { ...pane, taskspacePanelOpen: true, sidePanelTab: "workspace" }
-              : { ...pane, membersPanelOpen: true, sidePanelTab: "members" }
-            : pane
-        ),
-      };
-    }),
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? tab === "workspace"
+            ? { ...pane, taskspacePanelOpen: true, sidePanelTab: "workspace" }
+            : { ...pane, membersPanelOpen: true, sidePanelTab: "members" }
+          : pane
+      ),
+    })),
   toggleTaskspacePanel: (paneId) => {
     get().cycleSidePanel(paneId, "workspace");
   },
@@ -1201,47 +1409,38 @@ export const useAppStore = create<AppState>((set, get) => ({
       panes: state.panes.map((pane) => (pane.id === paneId ? { ...pane, contextInherited: inherited } : pane)),
     })),
   setSpawnsColumnOpen: (paneId, open) =>
-    set((state) => {
-      if (state.focusMode) return state;
-      return {
-        panes: state.panes.map((pane) =>
-          pane.id === paneId
-            ? {
-                ...pane,
-                spawnsColumnOpen: open,
-                ...(open ? { spawnsColumnSuppressAuto: false, spawnsColumnBaselineIds: [] } : {}),
-              }
-            : pane
-        ),
-      };
-    }),
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              spawnsColumnOpen: open,
+              ...(open ? { spawnsColumnSuppressAuto: false, spawnsColumnBaselineIds: [] } : {}),
+            }
+          : pane
+      ),
+    })),
   dismissSpawnsColumn: (paneId, baselineSubAgentIds) =>
-    set((state) => {
-      if (state.focusMode) return state;
-      return {
-        panes: state.panes.map((pane) =>
-          pane.id === paneId
-            ? {
-                ...pane,
-                spawnsColumnOpen: false,
-                spawnsColumnSuppressAuto: true,
-                spawnsColumnBaselineIds: [...baselineSubAgentIds],
-              }
-            : pane
-        ),
-      };
-    }),
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? {
+              ...pane,
+              spawnsColumnOpen: false,
+              spawnsColumnSuppressAuto: true,
+              spawnsColumnBaselineIds: [...baselineSubAgentIds],
+            }
+          : pane
+      ),
+    })),
   clearSpawnsColumnSuppress: (paneId) =>
-    set((state) => {
-      if (state.focusMode) return state;
-      return {
-        panes: state.panes.map((pane) =>
-          pane.id === paneId
-            ? { ...pane, spawnsColumnSuppressAuto: false, spawnsColumnBaselineIds: [] }
-            : pane
-        ),
-      };
-    }),
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId
+          ? { ...pane, spawnsColumnSuppressAuto: false, spawnsColumnBaselineIds: [] }
+          : pane
+      ),
+    })),
   addPaneTerminalTab: (paneId, cwd, labelHint, ccBridgePty) =>
     set((state) => {
       const pane = state.panes.find((p) => p.id === paneId);
@@ -1305,6 +1504,32 @@ export const useAppStore = create<AppState>((set, get) => ({
         ),
       };
     }),
+  mergeLastMessageByRole: (role, patch) => {
+    let found = false;
+    set((state) => {
+      const msgs = [...state.messages];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        if (msgs[i].role !== role) continue;
+        const updated = { ...msgs[i], ...patch };
+        msgs[i] = updated;
+        found = true;
+        const mid = updated.id;
+        return {
+          messages: msgs,
+          panes: state.panes.map((pane) =>
+            pane.id === state.activePaneId
+              ? {
+                  ...pane,
+                  messages: pane.messages.map((m) => (m.id === mid ? { ...m, ...patch } : m)),
+                }
+              : pane
+          ),
+        };
+      }
+      return state;
+    });
+    return found;
+  },
   insertMessageAfter: (afterId, msg) => {
     const newId = uid();
     set((state) => {
@@ -1402,5 +1627,21 @@ export const useAppStore = create<AppState>((set, get) => ({
       settings: { ...state.settings, open: false, openToTab: undefined },
     })),
   updateSettings: (patch) =>
-    set((state) => ({ settings: { ...state.settings, ...patch } }))
+    set((state) => ({ settings: { ...state.settings, ...patch } })),
+  openTokenDashboard: () =>
+    set((state) => ({
+      tokenDashboard: { ...state.tokenDashboard, open: true },
+    })),
+  closeTokenDashboard: () =>
+    set((state) => ({
+      tokenDashboard: { ...state.tokenDashboard, open: false },
+    })),
+  setTokenDashboardRange: (range) =>
+    set((state) => ({
+      tokenDashboard: { ...state.tokenDashboard, range },
+    })),
+  setTokenDashboardCustomRange: (customFrom, customTo) =>
+    set((state) => ({
+      tokenDashboard: { ...state.tokenDashboard, customFrom, customTo, range: "custom" },
+    })),
 }));

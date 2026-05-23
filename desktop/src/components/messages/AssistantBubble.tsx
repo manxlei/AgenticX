@@ -5,7 +5,9 @@ import {
   chatMarkdownComponents,
   chatRehypePlugins,
   chatRemarkPlugins,
+  chatUrlTransform,
   normalizeChatMarkdownContent,
+  MarkdownContext,
 } from "./markdown-components";
 
 type Props = {
@@ -14,16 +16,20 @@ type Props = {
 };
 
 export function AssistantBubble({ message, badge }: Props) {
+  const isStreaming = message.id === "__stream__";
   return (
-    <div className="mr-8 min-w-0 overflow-hidden rounded-xl rounded-tl-sm border border-border bg-surface-bubble px-3 py-2 text-sm">
+    <div className="mr-8 min-w-0 overflow-hidden rounded-xl rounded-tl-sm border border-border bg-surface-bubble px-3 py-2 text-[15px] leading-relaxed">
       {badge}
-      <ReactMarkdown
-        remarkPlugins={chatRemarkPlugins}
-        rehypePlugins={chatRehypePlugins}
-        components={chatMarkdownComponents}
-      >
-        {normalizeChatMarkdownContent(message.content)}
-      </ReactMarkdown>
+      <MarkdownContext.Provider value={{ isStreaming }}>
+        <ReactMarkdown
+          remarkPlugins={chatRemarkPlugins}
+          rehypePlugins={chatRehypePlugins}
+          components={chatMarkdownComponents}
+          urlTransform={chatUrlTransform}
+        >
+          {normalizeChatMarkdownContent(message.content, { isStreaming })}
+        </ReactMarkdown>
+      </MarkdownContext.Provider>
     </div>
   );
 }

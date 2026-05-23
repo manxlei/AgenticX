@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { Ban, ChevronDown, ChevronRight, Clock3, Loader2 } from "lucide-react";
 import { useAppStore, type Avatar, type GroupChat } from "../store";
 import { DEFAULT_META_AVATAR_URL } from "../constants/meta-avatar";
@@ -105,6 +106,10 @@ export function AvatarSidebar() {
   // (issue #11).
   const [avatarsLoaded, setAvatarsLoaded] = useState(false);
   const [groupsLoaded, setGroupsLoaded] = useState(false);
+  const [avatarsHeight, setAvatarsHeight] = useState<number | null>(null);
+  const [groupsHeight, setGroupsHeight] = useState<number | null>(null);
+  const avatarsContainerRef = useRef<HTMLDivElement>(null);
+  const groupsContainerRef = useRef<HTMLDivElement>(null);
   const [settingsPanel, setSettingsPanel] = useState<
     | { mode: "avatar"; avatarId: string }
     | { mode: "machi" }
@@ -133,6 +138,12 @@ export function AvatarSidebar() {
               a.skills_enabled && typeof a.skills_enabled === "object"
                 ? { ...a.skills_enabled }
                 : undefined,
+            brainsEnabled:
+              a.brains_enabled === "*"
+                ? "*"
+                : Array.isArray(a.brains_enabled)
+                  ? a.brains_enabled.map(String)
+                  : undefined,
             defaultProvider: a.default_provider ?? "",
             defaultModel: a.default_model ?? "",
           }))
@@ -643,6 +654,52 @@ export function AvatarSidebar() {
     });
   }, [avatars]);
 
+  const startResizeAvatars = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    // 避免分身增高时与「群聊+定时」两个 flex-1 子项均摊收缩：先固定群聊高度，仅由定时区让出空间
+    if (!groupsCollapsed && groupsHeight == null) {
+      const gh = groupsContainerRef.current?.getBoundingClientRect().height;
+      if (gh && gh > 0) setGroupsHeight(gh);
+    }
+    const startY = event.clientY;
+    const startHeight = avatarsContainerRef.current?.getBoundingClientRect().height || 100;
+    const onMove = (moveEvent: MouseEvent) => {
+      const delta = moveEvent.clientY - startY;
+      const next = Math.max(36, startHeight + delta);
+      setAvatarsHeight(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const startResizeGroups = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    // 避免群聊增高时与分身区 flex-1 均摊收缩：先固定分身区高度，仅由定时区让出空间
+    if (!avatarsCollapsed && avatarsHeight == null) {
+      const ah = avatarsContainerRef.current?.getBoundingClientRect().height;
+      if (ah && ah > 0) setAvatarsHeight(ah);
+    }
+    const startY = event.clientY;
+    const startHeight = groupsContainerRef.current?.getBoundingClientRect().height || 100;
+    const onMove = (moveEvent: MouseEvent) => {
+      const delta = moveEvent.clientY - startY;
+      const next = Math.max(36, startHeight + delta);
+      setGroupsHeight(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
   return (
     <>
       <aside className="flex h-full w-full flex-col bg-surface-sidebar">
@@ -669,31 +726,36 @@ export function AvatarSidebar() {
             className="h-8 w-8 shrink-0 rounded-full object-cover"
           />
           <div className="min-w-0 flex-1">
-            <div className="truncate text-sm font-medium">Machi</div>
-            <div className="truncate text-[10px] text-text-faint">全局调度</div>
+            <div className="truncate text-[15px] font-medium">Machi</div>
+            {/* <div className="truncate text-xs text-text-faint">全局调度</div> */}
           </div>
         </button>
 
-        <div className="flex-1 overflow-y-auto py-1">
+        <div className="flex-1 flex flex-col py-1 min-h-0">
           {/* Avatar list */}
-          <div className="flex items-center justify-between px-4 py-1.5">
-            <button
-              type="button"
-              className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-text-faint hover:text-text-subtle"
-              onClick={() => setAvatarsCollapsed((v) => !v)}
-            >
-              {avatarsCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-              <span>分身 ({avatarsLoaded ? avatars.length : "…"})</span>
-            </button>
-            <button
-              className="rounded px-1.5 py-0.5 text-[11px] text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
-              onClick={() => setCreateOpen(true)}
-            >
-              + 新建
-            </button>
-          </div>
-          {!avatarsCollapsed && (
-            <div className="pb-1">
+          <div
+            ref={avatarsContainerRef}
+            className={`flex flex-col ${avatarsCollapsed ? "shrink-0" : avatarsHeight ? "shrink-0" : "flex-1 min-h-0"}`}
+            style={!avatarsCollapsed && avatarsHeight ? { height: avatarsHeight } : undefined}
+          >
+            <div className="flex shrink-0 items-center justify-between px-4 py-1.5">
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-text-faint hover:text-text-subtle"
+                onClick={() => setAvatarsCollapsed((v) => !v)}
+              >
+                {avatarsCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                <span>分身 ({avatarsLoaded ? avatars.length : "…"})</span>
+              </button>
+              <button
+                className="rounded px-1.5 py-0.5 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+                onClick={() => setCreateOpen(true)}
+              >
+                + 新建
+              </button>
+            </div>
+            {!avatarsCollapsed && (
+              <div className="flex-1 overflow-y-auto pb-1">
               {sortedAvatars.length === 0 && (
                 <div className="px-3 py-4 text-center text-xs text-text-faint">
                   {avatarsLoaded ? (
@@ -745,40 +807,55 @@ export function AvatarSidebar() {
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-1">
-                          <span className="truncate text-sm">{avatar.name}</span>
-                          {avatar.pinned && <span className="text-[10px] text-amber-400">*</span>}
+                          <span className="truncate text-[15px]">{avatar.name}</span>
+                          {avatar.pinned && <span className="text-xs text-amber-400">*</span>}
                         </div>
                         {avatar.role && (
-                          <div className="truncate text-[10px] text-text-faint">{avatar.role}</div>
+                          <div className="truncate text-xs text-text-faint">{avatar.role}</div>
                         )}
                       </div>
                     </button>
                   </div>
                 );
               })}
+              </div>
+            )}
+          </div>
+
+          {!avatarsCollapsed && !groupsCollapsed && (
+            <div
+              className="group relative min-h-[14px] shrink-0 cursor-row-resize touch-none"
+              onMouseDown={startResizeAvatars}
+              title="拖拽调整分身区域高度"
+            >
+              <div className="pointer-events-none absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-[var(--border-strong)] transition-all duration-200 group-hover:h-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
             </div>
           )}
 
           {/* Group chats */}
-          <div className="mt-2">
-            <div className="flex items-center justify-between px-4 py-1.5">
+          <div
+            ref={groupsContainerRef}
+            className={`flex flex-col mt-2 ${groupsCollapsed ? "shrink-0" : groupsHeight ? "shrink-0" : "flex-1 min-h-0"}`}
+            style={!groupsCollapsed && groupsHeight ? { height: groupsHeight } : undefined}
+          >
+            <div className="flex shrink-0 items-center justify-between px-4 py-1.5">
               <button
                 type="button"
-                className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-text-faint hover:text-text-subtle"
+                className="inline-flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-text-faint hover:text-text-subtle"
                 onClick={() => setGroupsCollapsed((v) => !v)}
               >
                 {groupsCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
                 <span>群聊 ({groupsLoaded ? groups.length : "…"})</span>
               </button>
               <button
-                className="rounded px-1.5 py-0.5 text-[11px] text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+                className="rounded px-1.5 py-0.5 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
                 onClick={() => setGroupCreateOpen(true)}
               >
                 + 新建
               </button>
             </div>
             {!groupsCollapsed && (
-              <div className="pb-1">
+              <div className="flex-1 overflow-y-auto pb-1">
                 {groups.map((group, groupIndex) => {
                   const groupAvatarId = `group:${group.id}`;
                   const hasPane = panes.some((item) => item.avatarId === groupAvatarId);
@@ -814,8 +891,8 @@ export function AvatarSidebar() {
                         )}
                       </div>
                       <div className="min-w-0 flex-1">
-                        <div className="truncate text-xs">{group.name}</div>
-                        <div className="truncate text-[10px] text-text-faint">
+                        <div className="truncate text-[15px]">{group.name}</div>
+                        <div className="truncate text-xs text-text-faint">
                           {group.avatarIds.length} avatars ·{" "}
                           {group.avatarIds
                             .map((id) => avatars.find((a) => a.id === id)?.name || id.slice(0, 4))
@@ -829,26 +906,36 @@ export function AvatarSidebar() {
             )}
           </div>
 
+          {!groupsCollapsed && !automationCollapsed && (
+            <div
+              className="group relative min-h-[14px] shrink-0 cursor-row-resize touch-none"
+              onMouseDown={startResizeGroups}
+              title="拖拽调整群聊区域高度"
+            >
+              <div className="pointer-events-none absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-[var(--border-strong)] transition-all duration-200 group-hover:h-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
+            </div>
+          )}
+
           {/* Scheduled tasks */}
-          <div className="mt-2 pb-2">
-            <div className="flex items-center justify-between px-4 py-1.5">
+          <div className={`flex flex-col mt-2 pb-2 ${automationCollapsed ? "shrink-0" : "flex-1 min-h-0"}`}>
+            <div className="flex shrink-0 items-center justify-between px-4 py-1.5">
               <button
                 type="button"
-                className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-text-faint hover:text-text-subtle"
+                className="inline-flex items-center gap-1 text-xs font-semibold uppercase tracking-wider text-text-faint hover:text-text-subtle"
                 onClick={() => setAutomationCollapsed((v) => !v)}
               >
                 {automationCollapsed ? <ChevronRight className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
                 <span>定时 ({automationTasks.length})</span>
               </button>
               <button
-                className="rounded px-1.5 py-0.5 text-[11px] text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+                className="rounded px-1.5 py-0.5 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
                 onClick={() => openSettings()}
               >
                 管理
               </button>
             </div>
             {!automationCollapsed && (
-              <div className="pb-1">
+              <div className="flex-1 overflow-y-auto pb-1">
                 {automationTasks.length === 0 && (
                   <div className="px-3 py-4 text-center text-xs text-text-faint">
                     暂无定时任务，可在「设置 - 自动化」创建
@@ -893,8 +980,8 @@ export function AvatarSidebar() {
                           )}
                         </div>
                         <div className="min-w-0 flex-1">
-                          <div className="truncate text-xs">{task.name}</div>
-                          <div className="truncate text-[10px] text-text-faint">
+                          <div className="truncate text-[15px]">{task.name}</div>
+                          <div className="truncate text-xs text-text-faint">
                             {isRunning ? "运行中..." : task.enabled ? "已启用" : "已暂停"}
                             {task.lastRunStatus === "error" ? " · 最近失败" : ""}
                           </div>
@@ -949,7 +1036,7 @@ export function AvatarSidebar() {
           ].map((item) => (
             <button
               key={item.id}
-              className={`w-full px-3 py-1.5 text-left text-xs transition ${
+              className={`w-full px-3 py-2 text-left text-[13px] transition ${
                 item.id === "delete"
                   ? "text-rose-400 hover:bg-rose-500/10"
                   : "text-text-muted hover:bg-surface-hover"
@@ -969,7 +1056,7 @@ export function AvatarSidebar() {
           style={{ left: groupContextMenu.x, top: groupContextMenu.y }}
         >
           <button
-            className="w-full px-3 py-1.5 text-left text-xs text-text-muted transition hover:bg-surface-hover"
+            className="w-full px-3 py-2 text-left text-[13px] text-text-muted transition hover:bg-surface-hover"
             onClick={() => void handleGroupContextAction("view")}
           >
             查看群聊
@@ -985,7 +1072,7 @@ export function AvatarSidebar() {
         >
           <button
             type="button"
-            className="w-full px-3 py-1.5 text-left text-xs text-text-muted transition hover:bg-surface-hover"
+            className="w-full px-3 py-2 text-left text-[13px] text-text-muted transition hover:bg-surface-hover"
             onClick={() => {
               const { taskId } = automationContextMenu;
               setAutomationContextMenu(null);
@@ -1198,26 +1285,26 @@ function GroupEditorInline({
         className="w-80 max-w-[95vw] rounded-xl border border-border bg-surface-panel p-4 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className="mb-3 text-sm font-semibold text-white">{initialGroup ? "编辑群聊" : "新建群聊"}</h3>
+        <h3 className="mb-3 text-[15px] font-semibold text-white">{initialGroup ? "编辑群聊" : "新建群聊"}</h3>
 
-        <label className="mb-1 block text-[11px] text-text-subtle">群名称</label>
+        <label className="mb-1 block text-xs text-text-subtle">群名称</label>
         <input
-          className="mb-3 w-full rounded-md border border-border bg-surface-card px-2.5 py-1.5 text-xs text-text-primary outline-none focus:border-border-strong"
+          className="mb-3 w-full rounded-md border border-border bg-surface-card px-2.5 py-2 text-[13px] text-text-primary outline-none focus:border-border-strong"
           value={name}
           onChange={(e) => setName(e.target.value)}
           placeholder="输入群聊名称"
           autoFocus
         />
 
-        <label className="mb-1 block text-[11px] text-text-subtle">选择分身</label>
+        <label className="mb-1 block text-xs text-text-subtle">选择分身</label>
         <div className="mb-3 max-h-36 overflow-y-auto rounded-md border border-border bg-surface-card p-1.5">
           {avatars.length === 0 && (
-            <div className="py-2 text-center text-[11px] text-text-faint">暂无可用分身</div>
+            <div className="py-2 text-center text-xs text-text-faint">暂无可用分身</div>
           )}
           {avatars.map((a) => (
             <label
               key={a.id}
-              className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-xs text-text-muted hover:bg-surface-hover"
+              className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-[13px] text-text-muted hover:bg-surface-hover"
             >
               <input
                 type="checkbox"
@@ -1226,14 +1313,14 @@ function GroupEditorInline({
                 className="accent-cyan-500"
               />
               <span className="truncate">{a.name}</span>
-              {a.role && <span className="ml-auto truncate text-[10px] text-text-faint">{a.role}</span>}
+              {a.role && <span className="ml-auto truncate text-xs text-text-faint">{a.role}</span>}
             </label>
           ))}
         </div>
 
         {saveNotice ? (
           <div
-            className={`mb-3 rounded-md border px-2.5 py-2 text-[11px] ${
+            className={`mb-3 rounded-md border px-2.5 py-2 text-xs ${
               saveNotice.type === "success"
                 ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-300"
                 : saveNotice.type === "warning"
@@ -1250,7 +1337,7 @@ function GroupEditorInline({
             {initialGroup ? (
               <button
                 type="button"
-                className="rounded-md px-3 py-1.5 text-xs text-rose-400 transition hover:bg-rose-500/10"
+                className="rounded-md px-3 py-1.5 text-[13px] text-rose-400 transition hover:bg-rose-500/10"
                 onClick={() => {
                   if (!onDelete || !initialGroup) return;
                   void onDelete(initialGroup.id);
@@ -1263,14 +1350,14 @@ function GroupEditorInline({
           <div className="flex shrink-0 items-center gap-2">
             <button
               type="button"
-              className="rounded-md px-3 py-1.5 text-xs text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
+              className="rounded-md px-3 py-1.5 text-[13px] text-text-subtle transition hover:bg-surface-hover hover:text-text-strong"
               onClick={onClose}
             >
               取消
             </button>
             <button
               type="button"
-              className="rounded-md bg-cyan-600 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-cyan-500 disabled:opacity-40"
+              className="rounded-md bg-btnPrimary px-3 py-1.5 text-xs font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover disabled:opacity-40"
               disabled={!name.trim() || selectedIds.size === 0 || loading}
               onClick={() => void handleSave()}
             >

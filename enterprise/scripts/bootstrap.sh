@@ -101,6 +101,17 @@ random_hex() {
   fi
 }
 
+is_placeholder_secret() {
+  case "${1:-}" in
+    ""|replace-with-32-plus-bytes-random-secret|replace-with-32-plus-byte-encryption-key|replace-with-client-secret)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 #################################
 # 2. 预检
 #################################
@@ -154,7 +165,7 @@ if [ -z "${ADMIN_CONSOLE_SESSION_SECRET:-}" ]; then
 fi
 
 # --- 3.3 ADMIN_CONSOLE_LOGIN_EMAIL / PASSWORD ---
-: "${ADMIN_CONSOLE_LOGIN_EMAIL:=owner@agenticx.local}"
+: "${ADMIN_CONSOLE_LOGIN_EMAIL:=admin@agenticx.local}"
 
 if [ -z "${ADMIN_CONSOLE_LOGIN_PASSWORD:-}" ]; then
   warn "未设置 ADMIN_CONSOLE_LOGIN_PASSWORD（后台管理员登录密码）"
@@ -170,11 +181,16 @@ if [ "$MODE" = "local" ]; then
   : "${DEFAULT_TENANT_ID:=01J00000000000000000000001}"
   : "${DEFAULT_DEPT_ID:=01J00000000000000000000003}"
   if [ -z "${AUTH_DEV_OWNER_PASSWORD:-}" ]; then
-    warn "未设置 AUTH_DEV_OWNER_PASSWORD（前台种子 owner 密码）"
-    echo "    可与后台登录密码不同；同样要求 ≥14 位 + 四类字符" >&2
-    prompted_owner_password="$(prompt_secret AUTH_DEV_OWNER_PASSWORD '前台种子 owner 密码' 14)"
-    printf -v AUTH_DEV_OWNER_PASSWORD "%s" "$prompted_owner_password"
-    unset prompted_owner_password
+    warn "未设置 AUTH_DEV_OWNER_PASSWORD（前台种子账号密码）"
+    if [ -n "${ADMIN_CONSOLE_LOGIN_PASSWORD:-}" ]; then
+      AUTH_DEV_OWNER_PASSWORD="$ADMIN_CONSOLE_LOGIN_PASSWORD"
+      ok "AUTH_DEV_OWNER_PASSWORD 默认复用 ADMIN_CONSOLE_LOGIN_PASSWORD"
+    else
+      echo "    同样要求 ≥14 位 + 四类字符" >&2
+      prompted_owner_password="$(prompt_secret AUTH_DEV_OWNER_PASSWORD '前台种子账号密码' 14)"
+      printf -v AUTH_DEV_OWNER_PASSWORD "%s" "$prompted_owner_password"
+      unset prompted_owner_password
+    fi
   fi
 else
   : "${ENABLE_DEV_BOOTSTRAP:=false}"
@@ -201,9 +217,77 @@ if [ -z "${AUTH_JWT_PRIVATE_KEY:-}" ] || [ -z "${AUTH_JWT_PUBLIC_KEY:-}" ]; then
   fi
 fi
 
-# --- 3.6 网关地址 ---
+# --- 3.6 网关地址与 admin internal 拉取（local 默认接通 PG 里的模型服务配置）---
 : "${GATEWAY_BASE_URL:=http://127.0.0.1:8088}"
 : "${GATEWAY_COMPLETIONS_URL:=http://127.0.0.1:8088/v1/chat/completions}"
+: "${ADMIN_CONSOLE_DEV_URL:=http://127.0.0.1:3001}"
+
+if [ "$MODE" = "local" ]; then
+  GATEWAY_INTERNAL_TOKEN_FILE="$SECRETS_DIR/gateway_internal.token"
+  if [ ! -f "$GATEWAY_INTERNAL_TOKEN_FILE" ]; then
+    random_hex 16 > "$GATEWAY_INTERNAL_TOKEN_FILE"
+    chmod 600 "$GATEWAY_INTERNAL_TOKEN_FILE"
+    ok "generated gateway internal token at $GATEWAY_INTERNAL_TOKEN_FILE"
+  else
+    ok "gateway internal token already exists"
+  fi
+  : "${GATEWAY_REMOTE_PROVIDERS_URL:=${ADMIN_CONSOLE_DEV_URL}/api/internal/providers}"
+  : "${GATEWAY_REMOTE_QUOTA_CONFIG_URL:=${ADMIN_CONSOLE_DEV_URL}/api/internal/quotas}"
+  : "${GATEWAY_REMOTE_POLICY_SNAPSHOT_URL:=${ADMIN_CONSOLE_DEV_URL}/api/internal/policy-snapshot}"
+  : "${GATEWAY_REMOTE_CHANNELS_URL:=${ADMIN_CONSOLE_DEV_URL}/api/internal/channels}"
+  : "${GATEWAY_INTERNAL_BASE_URL:=${GATEWAY_BASE_URL}}"
+  : "${GATEWAY_CHANNEL_REGISTRY:=on}"
+  : "${GATEWAY_MCP_HOSTING:=on}"
+fi
+
+# --- 3.7 Next 公开展示用 SSO（按钮是否可用；非 secret）---
+# local 模式给出开发入口；server 模式不自动启用，避免未配置真实 IdP 时暴露不可用按钮。
+if [ "$MODE" = "local" ]; then
+  : "${NEXT_PUBLIC_SSO_PROVIDERS:=default:企业统一认证}"
+else
+  : "${NEXT_PUBLIC_SSO_PROVIDERS:=}"
+fi
+: "${SSO_RETURN_TO_ALLOWLIST:=/workspace,/dashboard}"
+: "${SSO_DEFAULT_ROLE_CODES:=member}"
+: "${SSO_JIT_ROLE_ALLOWLIST:=member,admin}"
+# SAML 双栈一键回退开关（默认 false）；详见 docs/runbooks/sso-saml-setup.md。
+: "${SSO_SAML_DISABLED:=false}"
+
+if [ "$MODE" = "local" ]; then
+  if is_placeholder_secret "${SSO_STATE_SIGNING_SECRET:-}"; then
+    SSO_STATE_SIGNING_SECRET="$(random_hex 32)"
+    ok "generated SSO_STATE_SIGNING_SECRET (local)"
+  fi
+  if is_placeholder_secret "${SSO_PROVIDER_SECRET_KEY:-}"; then
+    SSO_PROVIDER_SECRET_KEY="$(random_hex 32)"
+    ok "generated SSO_PROVIDER_SECRET_KEY (local)"
+  fi
+else
+  if is_placeholder_secret "${SSO_STATE_SIGNING_SECRET:-}"; then
+    err "server 模式必须外部提供 SSO_STATE_SIGNING_SECRET，不能使用占位值"
+    exit 1
+  fi
+  if is_placeholder_secret "${SSO_PROVIDER_SECRET_KEY:-}"; then
+    err "server 模式必须外部提供 SSO_PROVIDER_SECRET_KEY，不能使用占位值"
+    exit 1
+  fi
+fi
+
+# --- 3.8 OIDC provider 默认项 ---
+# 仅 local 模式落开发占位；server 模式必须由部署环境提供真实 IdP 配置。
+if [ "$MODE" = "local" ]; then
+  : "${SSO_OIDC_DEFAULT_ISSUER:=https://idp.example.com/realms/agenticx}"
+  : "${SSO_OIDC_DEFAULT_CLIENT_ID:=agenticx-portal}"
+  : "${SSO_OIDC_DEFAULT_CLIENT_SECRET:=replace-with-client-secret}"
+  : "${SSO_OIDC_DEFAULT_REDIRECT_URI:=http://localhost:3000/api/auth/sso/oidc/callback}"
+  : "${SSO_OIDC_DEFAULT_ADMIN_REDIRECT_URI:=http://localhost:3001/api/auth/sso/oidc/callback}"
+  : "${SSO_OIDC_DEFAULT_SCOPES:=openid profile email groups}"
+  : "${SSO_OIDC_DEFAULT_CLAIM_EMAIL:=email}"
+  : "${SSO_OIDC_DEFAULT_CLAIM_NAME:=name}"
+  : "${SSO_OIDC_DEFAULT_CLAIM_DEPT:=department}"
+  : "${SSO_OIDC_DEFAULT_CLAIM_ROLES:=groups}"
+  : "${SSO_OIDC_DEFAULT_CLAIM_EXTERNAL_ID:=sub}"
+fi
 
 #################################
 # 4. 落盘 .env.local（不含 PEM 内容，仅存文件路径）
@@ -227,6 +311,34 @@ AUTH_JWT_PUBLIC_KEY_FILE='${AUTH_JWT_PUBLIC_KEY_FILE:-}'
 
 GATEWAY_BASE_URL='$GATEWAY_BASE_URL'
 GATEWAY_COMPLETIONS_URL='$GATEWAY_COMPLETIONS_URL'
+GATEWAY_INTERNAL_TOKEN_FILE='${GATEWAY_INTERNAL_TOKEN_FILE:-}'
+GATEWAY_REMOTE_PROVIDERS_URL='${GATEWAY_REMOTE_PROVIDERS_URL:-}'
+GATEWAY_REMOTE_QUOTA_CONFIG_URL='${GATEWAY_REMOTE_QUOTA_CONFIG_URL:-}'
+GATEWAY_REMOTE_POLICY_SNAPSHOT_URL='${GATEWAY_REMOTE_POLICY_SNAPSHOT_URL:-}'
+GATEWAY_REMOTE_CHANNELS_URL='${GATEWAY_REMOTE_CHANNELS_URL:-}'
+GATEWAY_INTERNAL_BASE_URL='${GATEWAY_INTERNAL_BASE_URL:-}'
+GATEWAY_CHANNEL_REGISTRY='${GATEWAY_CHANNEL_REGISTRY:-}'
+GATEWAY_MCP_HOSTING='${GATEWAY_MCP_HOSTING:-}'
+
+NEXT_PUBLIC_SSO_PROVIDERS='${NEXT_PUBLIC_SSO_PROVIDERS:-}'
+SSO_STATE_SIGNING_SECRET='$SSO_STATE_SIGNING_SECRET'
+SSO_RETURN_TO_ALLOWLIST='$SSO_RETURN_TO_ALLOWLIST'
+SSO_DEFAULT_ROLE_CODES='$SSO_DEFAULT_ROLE_CODES'
+SSO_JIT_ROLE_ALLOWLIST='$SSO_JIT_ROLE_ALLOWLIST'
+
+SSO_OIDC_DEFAULT_ISSUER='${SSO_OIDC_DEFAULT_ISSUER:-}'
+SSO_OIDC_DEFAULT_CLIENT_ID='${SSO_OIDC_DEFAULT_CLIENT_ID:-}'
+SSO_OIDC_DEFAULT_CLIENT_SECRET='${SSO_OIDC_DEFAULT_CLIENT_SECRET:-}'
+SSO_OIDC_DEFAULT_REDIRECT_URI='${SSO_OIDC_DEFAULT_REDIRECT_URI:-}'
+SSO_OIDC_DEFAULT_ADMIN_REDIRECT_URI='${SSO_OIDC_DEFAULT_ADMIN_REDIRECT_URI:-}'
+SSO_OIDC_DEFAULT_SCOPES='${SSO_OIDC_DEFAULT_SCOPES:-}'
+SSO_OIDC_DEFAULT_CLAIM_EMAIL='${SSO_OIDC_DEFAULT_CLAIM_EMAIL:-}'
+SSO_OIDC_DEFAULT_CLAIM_NAME='${SSO_OIDC_DEFAULT_CLAIM_NAME:-}'
+SSO_OIDC_DEFAULT_CLAIM_DEPT='${SSO_OIDC_DEFAULT_CLAIM_DEPT:-}'
+SSO_OIDC_DEFAULT_CLAIM_ROLES='${SSO_OIDC_DEFAULT_CLAIM_ROLES:-}'
+SSO_OIDC_DEFAULT_CLAIM_EXTERNAL_ID='${SSO_OIDC_DEFAULT_CLAIM_EXTERNAL_ID:-}'
+SSO_PROVIDER_SECRET_KEY='$SSO_PROVIDER_SECRET_KEY'
+SSO_SAML_DISABLED='${SSO_SAML_DISABLED}'
 EOF
 chmod 600 "$ENV_FILE"
 ok "wrote $ENV_FILE (chmod 600)"
@@ -275,6 +387,10 @@ log "running db:seed"
 (cd "$ENTERPRISE_DIR" && pnpm --filter @agenticx/db-schema db:seed)
 ok "db:seed done"
 
+log "running migrate:legacy-runtime"
+(cd "$ENTERPRISE_DIR" && pnpm migrate:legacy-runtime)
+ok "migrate:legacy-runtime done"
+
 #################################
 # 8. 结尾提示
 #################################
@@ -304,4 +420,5 @@ cat <<EOF
   - web-portal   http://localhost:3000
   - admin-console http://localhost:3001 （账号 ${ADMIN_CONSOLE_LOGIN_EMAIL}）
   - gateway      http://127.0.0.1:8088/healthz
+     （local 模式已默认 GATEWAY_REMOTE_PROVIDERS_URL → admin internal API，模型 Key 走 PG 真调）
 EOF

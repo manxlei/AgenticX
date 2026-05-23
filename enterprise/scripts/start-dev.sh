@@ -65,6 +65,11 @@ set -a
 source "$ENV_FILE"
 set +a
 
+if [ -z "${DATABASE_URL:-}" ]; then
+  export DATABASE_URL='postgresql://postgres:postgres@127.0.0.1:5432/agenticx'
+  echo "[start-dev] DATABASE_URL 未设置，回退到默认本地地址: $DATABASE_URL"
+fi
+
 # 2) PEM -> 环境变量（PEM 多行不能直接写进 .env.local）
 if [ -n "${AUTH_JWT_PRIVATE_KEY_FILE:-}" ] && [ -f "$AUTH_JWT_PRIVATE_KEY_FILE" ]; then
   AUTH_JWT_PRIVATE_KEY="$(cat "$AUTH_JWT_PRIVATE_KEY_FILE")"; export AUTH_JWT_PRIVATE_KEY
@@ -73,12 +78,42 @@ if [ -n "${AUTH_JWT_PUBLIC_KEY_FILE:-}" ] && [ -f "$AUTH_JWT_PUBLIC_KEY_FILE" ];
   AUTH_JWT_PUBLIC_KEY="$(cat "$AUTH_JWT_PUBLIC_KEY_FILE")"; export AUTH_JWT_PUBLIC_KEY
 fi
 
+# 3) Gateway internal token（与 admin internal API 共用，不落盘到 .env.local 明文）
+if [ -n "${GATEWAY_INTERNAL_TOKEN_FILE:-}" ] && [ -f "$GATEWAY_INTERNAL_TOKEN_FILE" ]; then
+  GATEWAY_INTERNAL_TOKEN="$(cat "$GATEWAY_INTERNAL_TOKEN_FILE")"; export GATEWAY_INTERNAL_TOKEN
+elif [ -n "${GATEWAY_INTERNAL_TOKEN:-}" ]; then
+  export GATEWAY_INTERNAL_TOKEN
+fi
+
 if [ -z "${AUTH_JWT_PRIVATE_KEY:-}" ] || [ -z "${AUTH_JWT_PUBLIC_KEY:-}" ]; then
   echo "[start-dev] 缺少 AUTH_JWT_PRIVATE_KEY / AUTH_JWT_PUBLIC_KEY，请检查 .env.local 与 .local-secrets/" >&2
   exit 1
 fi
 
-# 3) 子进程管理
+if [ -z "${GATEWAY_INTERNAL_TOKEN:-}" ] || [ -z "${GATEWAY_REMOTE_PROVIDERS_URL:-}" ]; then
+  echo "[start-dev] 警告：未配置 GATEWAY_INTERNAL_TOKEN（或 GATEWAY_INTERNAL_TOKEN_FILE）/ GATEWAY_REMOTE_PROVIDERS_URL；" >&2
+  echo "          gateway 将无法从 admin PG 读取模型厂商配置（前台聊天会回退 mock）。" >&2
+  echo "          请重新运行：bash scripts/bootstrap.sh" >&2
+fi
+
+# 3) 可选自动迁移：仅本地 DB 默认开启，避免共享库被意外改 schema。
+AUTO_MIGRATE="${AGX_AUTO_DB_MIGRATE:-1}"
+if [[ "$AUTO_MIGRATE" = "1" ]]; then
+  if [[ "$DATABASE_URL" == *"127.0.0.1"* || "$DATABASE_URL" == *"localhost"* ]]; then
+    echo "[start-dev] running local database migrations ..."
+    (
+      cd "$ENTERPRISE_DIR"
+      pnpm --filter @agenticx/db-schema db:migrate
+      pnpm migrate:legacy-runtime
+    )
+  else
+    echo "[start-dev] skip auto migration (non-local DATABASE_URL)."
+  fi
+else
+  echo "[start-dev] skip auto migration (AGX_AUTO_DB_MIGRATE=$AUTO_MIGRATE)."
+fi
+
+# 4) 子进程管理
 PIDS=()
 cleanup() {
   echo; echo "[start-dev] stopping services..."
@@ -89,23 +124,22 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
-# 4) 拉起 gateway
-echo "[start-dev] booting gateway (:8088) ..."
-(
-  cd "$ENTERPRISE_DIR/apps/gateway"
-  exec go run ./cmd/gateway
-) &
-PIDS+=("$!")
+wait_for_http() {
+  local label="$1"
+  local url="$2"
+  local max_attempts="${3:-60}"
+  for i in $(seq 1 "$max_attempts"); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      echo "[start-dev] $label ready"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "[start-dev] $label not ready after ${max_attempts}s" >&2
+  return 1
+}
 
-for i in $(seq 1 30); do
-  if curl -fsS "${GATEWAY_BASE_URL:-http://127.0.0.1:8088}/healthz" >/dev/null 2>&1; then
-    echo "[start-dev] gateway ready"
-    break
-  fi
-  sleep 1
-done
-
-# 5) 拉起 Next 应用（默认仅 enterprise，--all 时含 customers/*）
+# 5) 先拉起 Next 应用（gateway 依赖 admin internal API，须 admin 就绪后再启 gateway）
 TURBO_ARGS=(run dev "--ui=$TURBO_UI")
 if [ "$ALL_APPS" -eq 0 ]; then
   TURBO_ARGS+=(
@@ -124,11 +158,30 @@ echo "[start-dev] booting Next apps → $SCOPE"
 ) &
 PIDS+=("$!")
 
+wait_for_http "admin-console" "http://127.0.0.1:3001" 90 || true
+wait_for_http "web-portal" "http://127.0.0.1:3000" 90 || true
+
+# 6) admin 就绪后再拉起 gateway（避免 policy/providers 远程拉取 connection refused）
+echo "[start-dev] booting gateway (:8088) ..."
+(
+  cd "$ENTERPRISE_DIR/apps/gateway"
+  exec go run ./cmd/gateway
+) &
+PIDS+=("$!")
+
+if ! wait_for_http "gateway" "${GATEWAY_BASE_URL:-http://127.0.0.1:8088}/healthz" 45; then
+  echo "[start-dev] 警告：gateway 未在 45s 内就绪，前台聊天会报 Gateway request failed。" >&2
+  echo "[start-dev] 请检查上方 gateway 日志（常见：admin internal 401 / 上游模型配置）。" >&2
+fi
+
 echo
 echo "[start-dev] all services launching. Ctrl+C 结束。"
 echo "  - web-portal    http://localhost:3000"
 echo "  - admin-console http://localhost:3001"
 echo "  - gateway       ${GATEWAY_BASE_URL:-http://127.0.0.1:8088}/healthz"
+if [ -n "${GATEWAY_REMOTE_PROVIDERS_URL:-}" ]; then
+  echo "    providers ← ${GATEWAY_REMOTE_PROVIDERS_URL}"
+fi
 if [ "$ALL_APPS" -eq 1 ]; then
   echo "  - hechuang portal  http://localhost:3100"
   echo "  - hechuang admin   http://localhost:3101"

@@ -84,6 +84,7 @@ SAFE_COMMANDS = {
 }
 
 MAX_READ_CHARS = 20_000
+MAX_READ_CHARS_CODE_DEV = 8_000
 # Cap bash_exec command string size (defense in depth; matches audit remediation).
 MAX_BASH_EXEC_COMMAND_CHARS = 65536
 PATH_GUARDED_READ_COMMANDS = {"cat", "head", "tail", "grep", "find", "wc", "ls", "tree"}
@@ -123,10 +124,12 @@ _CONCURRENCY_SAFE_STUDIO_TOOLS = frozenset(
         "lsp_find_references",
         "lsp_hover",
         "lsp_diagnostics",
+        "code_outline",
         "list_scheduled_tasks",
         "get_automation_task_logs",
         "cc_bridge_list",
         "knowledge_search",  # Plan-Id: machi-kb-stage1-local-mvp — read-only vector search.
+        "web_search",
     }
 )
 
@@ -312,6 +315,36 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
                     "path": {"type": "string", "description": "File path."},
                     "start_line": {"type": "integer", "description": "Start line (1-based)."},
                     "end_line": {"type": "integer", "description": "End line (inclusive)."},
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_outline",
+            "description": (
+                "Return class/function signatures and one-line docstrings for code files "
+                "(no function bodies). Prefer this before file_read to save context. "
+                "Supports single file or directory (max 50 files)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Workspace file or directory path.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional filter by symbol or path substring.",
+                    },
+                    "max_files": {
+                        "type": "integer",
+                        "description": "Max files when path is a directory (default 50).",
+                    },
                 },
                 "required": ["path"],
                 "additionalProperties": False,
@@ -1034,11 +1067,10 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
         "function": {
             "name": "knowledge_search",
             "description": (
-                "Search the local knowledge base (Machi Stage-1 MVP). "
-                "Returns the top-k most relevant chunks with source path, chunk index, "
-                "similarity score, and the chunk text. Use this before making claims that "
-                "depend on user-provided documents. Returns {hits: [...], used_top_k, source: 'local'}. "
-                "If the KB is disabled or empty, `hits` will be an empty list."
+                "Search mounted document brains (知识库 / docs brain) for the current session. "
+                "Returns {hits, by_brain, used_top_k, brains} — hits are merged top-k; "
+                "by_brain groups results per brain. Respects avatar brain mount settings. "
+                "Optional brain_id searches a single brain. If nothing is mounted, returns a hint."
             ),
             "parameters": {
                 "type": "object",
@@ -1047,6 +1079,36 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
                     "top_k": {
                         "type": "integer",
                         "description": "Maximum number of chunks to return (1-20). Omit to use KB setting default Top-K.",
+                    },
+                    "brain_id": {
+                        "type": "string",
+                        "description": "Optional: search only this docs brain id (must be visible to the session avatar).",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search the public web for up-to-date information (news, live data, documentation "
+                "beyond knowledge cutoff). Prefer this for time-sensitive or externally verifiable "
+                "facts before answering."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search keywords or question."},
+                    "max_results": {
+                        "type": "integer",
+                        "description": (
+                            "Number of results (>=1). Omit to use workspace default; "
+                            "values are capped by the configured maximum."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -1272,6 +1334,89 @@ def merge_computer_use_tools_into(tool_list: List[Dict[str, Any]]) -> List[Dict[
         out.append(spec)
         seen.add(name)
     return out
+
+
+_CODE_SEARCH_TOOL: Dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "code_search",
+        "description": (
+            "Semantic/hybrid search over mounted code brains (设置 → 知识库 → 代码脑) "
+            "or a legacy global code_index codebase. Returns {hits, by_brain, brains}. "
+            "Prefer in Explore phase before reading whole files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "codebase_path": {
+                    "type": "string",
+                    "description": "Legacy: root path indexed via global code_index (omit when using code brains).",
+                },
+                "query": {"type": "string", "description": "Natural language or keyword query."},
+                "top_k": {"type": "integer", "description": "Number of hits (default 10)."},
+                "brain_id": {
+                    "type": "string",
+                    "description": "Optional: search only this code brain id.",
+                },
+                "strategy": {
+                    "type": "string",
+                    "enum": ["hybrid", "semantic", "bm25"],
+                    "description": "Search strategy (default hybrid).",
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+def code_index_config_enabled() -> bool:
+    try:
+        return bool(ConfigManager.get_value("code_index.enabled"))
+    except Exception:
+        return False
+
+
+def _has_enabled_code_brains() -> bool:
+    try:
+        from agenticx.brain.registry import BrainRegistry
+        from agenticx.brain.types import BrainType
+
+        BrainRegistry.instance().bootstrap()
+        return any(
+            b.enabled and b.type == BrainType.CODE for b in BrainRegistry.instance().list_brains()
+        )
+    except Exception:
+        return False
+
+
+def _code_search_tool_defs() -> List[Dict[str, Any]]:
+    return _code_index_tool_defs()
+
+
+def studio_tools_for_session(session: Optional[StudioSession] = None) -> List[Dict[str, Any]]:
+    """Studio/Meta tool list with optional code_search when mounted code brains exist."""
+    tools = merge_computer_use_tools_into(list(STUDIO_TOOLS))
+    try:
+        from agenticx.brain.mount import session_has_mounted_code_brains
+
+        if session is not None and session_has_mounted_code_brains(session):
+            extra = _code_search_tool_defs()
+            if extra:
+                names = {
+                    str(t.get("function", {}).get("name", ""))
+                    for t in tools
+                    if isinstance(t, dict)
+                }
+                for spec in extra:
+                    n = str(spec.get("function", {}).get("name", ""))
+                    if n and n not in names:
+                        tools.append(spec)
+                        names.add(n)
+    except Exception:
+        pass
+    return tools
 
 
 _MAX_DESKTOP_SCREENSHOT_BYTES_FOR_B64 = 950_000
@@ -1833,6 +1978,44 @@ def _bash_exec_default_timeout_sec() -> int:
     return max(30, min(3600, v))
 
 
+_CD_PEEL_BLOCK_METACHAR_RE = re.compile(r"\|\||\||>|<|\$\(|`")
+
+
+def _command_blocks_cd_prefix_peel(command: str) -> bool:
+    """If True, do not peel ``cd … &&`` into cwd + argv — preserves pipes/redirs/subshells."""
+    return bool(_CD_PEEL_BLOCK_METACHAR_RE.search(command))
+
+
+_STDERR_REDIRECT_PEEL_HINT_RES = (
+    re.compile(r"unrecognized arguments:.*2>", re.I),
+    re.compile(r"syntax error.*unexpected token", re.I),
+    re.compile(r"unexpected token.*'\|'", re.I),
+    re.compile(r"command not found.*&&", re.I),
+)
+
+
+def _stderr_suggests_redirect_peel_damage(text: str) -> bool:
+    return any(rx.search(text) for rx in _STDERR_REDIRECT_PEEL_HINT_RES)
+
+
+def _bash_stdout_output_hint(stdout: str) -> str:
+    """Append-only hint so models notice answers already in stdout (FR-10)."""
+    if not stdout or not stdout.strip():
+        return ""
+    lines = [ln for ln in stdout.splitlines() if ln.strip()]
+    paths: List[str] = []
+    for m in re.finditer(r"(?:/[\w./+\-]{3,}|~/[\w./+\-]{2,})", stdout[:50_000]):
+        g = m.group(0)
+        if g not in paths:
+            paths.append(g)
+        if len(paths) >= 2:
+            break
+    path_part = ", ".join(paths[:2]) if paths else "(无路径匹配)"
+    return (
+        f"\nOUTPUT_HINT: stdout 已包含 {len(lines)} 个非空行，主要文件路径线索 = {path_part}\n"
+    )
+
+
 def _try_peel_cd_prefix_parts(
     parts: List[str],
     session: Optional[StudioSession],
@@ -1904,7 +2087,11 @@ async def _tool_bash_exec(
         return "ERROR: empty command"
 
     if cwd is None:
-        peeled = _try_peel_cd_prefix_parts(parts, session)
+        peeled = (
+            None
+            if _command_blocks_cd_prefix_peel(command)
+            else _try_peel_cd_prefix_parts(parts, session)
+        )
         if peeled:
             cwd, parts = peeled
             command = shlex.join(parts)
@@ -1928,7 +2115,8 @@ async def _tool_bash_exec(
                 )
         except Exception:
             pass
-    if command_name == "cd":
+    # Standalone ``cd DIR`` helper only — compound commands stay on shell/exec path.
+    if command_name == "cd" and len(parts) <= 2:
         target = str(parts[1]) if len(parts) > 1 else "~"
         try:
             resolved = _resolve_workspace_path(target, session)
@@ -2079,11 +2267,166 @@ async def _tool_bash_exec(
 
     stdout = "\n".join(stdout_lines).strip()
     stderr = "\n".join(stderr_lines).strip()
-    return (
+    out = (
         f"exit_code={proc.returncode}\n"
         f"stdout:\n{stdout or '(empty)'}\n"
         f"stderr:\n{stderr or '(empty)'}"
     )
+    if proc.returncode != 0:
+        blob = f"{stdout}\n{stderr}"
+        if _stderr_suggests_redirect_peel_damage(blob):
+            out += (
+                "\n\n[HINT] 检测到 shell 元字符（如 2>&1 / | / > 等）可能因 `cd` 前缀剥离或参数拆分被破坏。"
+                "建议：(a) 移除命令内的 cd 前缀并在 bash_exec 的 cwd 参数指定工作目录；"
+                "或 (b) 使用 bash -c '...' 显式包裹整条命令。\n"
+            )
+    elif stdout and len(stdout) >= 200:
+        hint_line = _bash_stdout_output_hint(stdout)
+        if hint_line:
+            out += hint_line
+    return out
+
+
+def _max_read_chars_for_session(session: Optional[StudioSession]) -> int:
+    if session is None:
+        return MAX_READ_CHARS
+    try:
+        from agenticx.runtime.session_mode import is_code_dev
+
+        return MAX_READ_CHARS_CODE_DEV if is_code_dev(session) else MAX_READ_CHARS
+    except Exception:
+        return MAX_READ_CHARS
+
+
+def _tool_code_search(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    try:
+        from agenticx.code_index.tools import dispatch_code_search  # type: ignore
+    except ImportError:
+        return (
+            "ERROR: code_index 依赖未安装。请执行: pip install 'agenticx[code_index]'"
+        )
+    return dispatch_code_search(arguments, session)
+
+
+def _tool_code_index_create(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.code_index.tools import dispatch_code_index_create
+
+    return dispatch_code_index_create(arguments, session)
+
+
+def _tool_code_index_status(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.code_index.tools import dispatch_code_index_status
+
+    return dispatch_code_index_status(arguments, session)
+
+
+def _tool_code_index_clear(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.code_index.tools import dispatch_code_index_clear
+
+    return dispatch_code_index_clear(arguments, session)
+
+
+def _tool_code_index_cancel(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.code_index.tools import dispatch_code_index_cancel
+
+    return dispatch_code_index_cancel(arguments, session)
+
+
+_CODE_INDEX_LIFECYCLE_TOOLS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "code_index_create",
+            "description": "Start background indexing for a codebase (code_index.enabled).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codebase_path": {"type": "string", "description": "Root path to index."},
+                },
+                "required": ["codebase_path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_index_status",
+            "description": "Query code index build status for a codebase (or all tasks if path omitted).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codebase_path": {"type": "string", "description": "Optional root path."},
+                },
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_index_clear",
+            "description": "Drop in-memory code index for a codebase and free memory.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "codebase_path": {"type": "string", "description": "Root path to clear."},
+                },
+                "required": ["codebase_path"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "code_index_cancel",
+            "description": "Cooperatively cancel an in-progress code index build by task_id.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "Task id from code_index_create/status."},
+                },
+                "required": ["task_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def _code_index_tool_defs() -> List[Dict[str, Any]]:
+    if not code_index_config_enabled() and not _has_enabled_code_brains():
+        return []
+    try:
+        import importlib
+
+        importlib.import_module("agenticx.code_index")
+    except ImportError:
+        return []
+    tools: List[Dict[str, Any]] = [_CODE_SEARCH_TOOL]
+    if code_index_config_enabled():
+        tools.extend(_CODE_INDEX_LIFECYCLE_TOOLS)
+    return tools
+
+
+def _tool_code_outline(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    from agenticx.runtime.code_outline import build_outline, format_outline_result
+
+    raw_path = str(arguments.get("path", "")).strip()
+    if not raw_path:
+        return "ERROR: path is required"
+    try:
+        resolved = _resolve_workspace_path(raw_path, session, pick_existing=True)
+    except ValueError as exc:
+        return f"ERROR: {exc}"
+    query = str(arguments.get("query", "") or "").strip() or None
+    max_files = int(arguments.get("max_files") or 50)
+    max_files = min(max(max_files, 1), 50)
+    payload = build_outline(resolved, query=query, max_files=max_files)
+    if payload.get("error"):
+        return f"ERROR: {payload['error']}"
+    return format_outline_result(payload)
 
 
 def _tool_file_read(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
@@ -2103,6 +2446,8 @@ def _tool_file_read(arguments: Dict[str, Any], session: Optional[StudioSession] 
 
     start_line = arguments.get("start_line")
     end_line = arguments.get("end_line")
+    max_chars = _max_read_chars_for_session(session)
+    whole_file = start_line is None and end_line is None
     if start_line is not None or end_line is not None:
         lines = content.splitlines()
         start = max(1, int(start_line or 1))
@@ -2111,15 +2456,53 @@ def _tool_file_read(arguments: Dict[str, Any], session: Optional[StudioSession] 
             return "ERROR: invalid line range"
         selected = lines[start - 1 : end]
         numbered = [f"{idx+start}|{line}" for idx, line in enumerate(selected)]
-        return "\n".join(numbered)
+        out = "\n".join(numbered)
+        if session is not None:
+            from agenticx.runtime.code_read_cache import record_file_read
 
-    if len(content) > MAX_READ_CHARS:
-        out = content[:MAX_READ_CHARS] + f"\n... (truncated, total {len(content)} chars)"
+            record_file_read(session, path, start_line=start, end_line=end, total_lines=len(lines))
+        return out
+
+    if session is not None:
+        try:
+            from agenticx.runtime.code_read_cache import record_file_read
+            from agenticx.runtime.session_mode import (
+                EXPLORE_WHOLE_FILE_READ_WARN_KEY,
+                PHASE_EXPLORE,
+                get_session_phase,
+                is_code_dev,
+            )
+
+            record_file_read(
+                session,
+                path,
+                start_line=None,
+                end_line=None,
+                total_lines=len(content.splitlines()),
+            )
+            if is_code_dev(session) and get_session_phase(session) == PHASE_EXPLORE:
+                scratch = getattr(session, "scratchpad", None) or {}
+                if isinstance(scratch, dict):
+                    count = int(scratch.get(EXPLORE_WHOLE_FILE_READ_WARN_KEY, 0) or 0) + 1
+                    scratch[EXPLORE_WHOLE_FILE_READ_WARN_KEY] = str(count)
+        except Exception:
+            pass
+
+    if len(content) > max_chars:
+        suffix = (
+            f"\n... (truncated, total {len(content)} chars)"
+            + (
+                " 建议：code_dev 模式下请使用 start_line/end_line 缩小范围，或先用 code_outline。"
+                if max_chars <= MAX_READ_CHARS_CODE_DEV
+                else ""
+            )
+        )
+        out = content[:max_chars] + suffix
     else:
         out = content
     if session is not None:
         tracker = getattr(session, "file_state_tracker", None)
-        if tracker is not None and start_line is None and end_line is None:
+        if tracker is not None and whole_file:
             tracker.record_read(str(path), content)
     return out
 
@@ -2325,10 +2708,6 @@ def _tool_mcp_connect(arguments: Dict[str, Any], session: StudioSession) -> str:
     if not name:
         return "ERROR: missing server name"
 
-    if session.mcp_hub is None:
-        from agenticx.tools.mcp_hub import MCPHub
-
-        session.mcp_hub = MCPHub(clients=[], auto_mode=False)
     ok, detail = mcp_connect(session.mcp_hub, session.mcp_configs, session.connected_servers, name)
     if ok:
         return "OK"
@@ -3195,7 +3574,23 @@ def _tool_scratchpad_write(arguments: Dict[str, Any], session: StudioSession) ->
         return "ERROR: scratchpad key limit exceeded (50)"
     if len(value) > 10_000:
         value = value[:10_000] + "\n... (truncated to 10000 chars)"
+    old_value = scratchpad.get(key, "")
     scratchpad[key] = value
+    try:
+        from agenticx.runtime.session_mode import (
+            PHASE_AUTHOR,
+            PHASE_READ,
+            PHASE_SCRATCH_KEY,
+            is_code_dev,
+        )
+
+        if is_code_dev(session) and key == PHASE_SCRATCH_KEY:
+            prev = str(old_value or "").strip().lower()
+            new = value.strip().lower()
+            if prev == PHASE_READ and new == PHASE_AUTHOR:
+                setattr(session, "_code_dev_phase_compact_pending", True)
+    except Exception:
+        pass
     return f"OK: scratchpad[{key}] updated"
 
 
@@ -3250,13 +3645,10 @@ async def _tool_memory_append(
     return f"OK: appended to {target}"
 
 
-def _tool_knowledge_search(arguments: Dict[str, Any]) -> str:
-    """Search the Stage-1 local knowledge base.
-
-    Plan-Id: machi-kb-stage1-local-mvp (plan §2.3). Returns a JSON payload
-    matching ``KBSearchResponse.to_dict()`` so the UI and the model share the
-    same ``hits[]`` shape.
-    """
+def _tool_knowledge_search(
+    arguments: Dict[str, Any], session: Optional["StudioSession"] = None
+) -> str:
+    """Search mounted docs brains (multi-brain architecture)."""
 
     query = str(arguments.get("query", "")).strip()
     if not query:
@@ -3265,22 +3657,15 @@ def _tool_knowledge_search(arguments: Dict[str, Any]) -> str:
             ensure_ascii=False,
         )
     try:
+        from agenticx.brain.search import search_docs_brains
         from agenticx.studio.kb import KBManager
-    except Exception as exc:  # pragma: no cover - packaging issue
+    except Exception as exc:
         return json.dumps(
             {"ok": False, "error": f"KB subsystem unavailable: {exc}", "hits": []},
             ensure_ascii=False,
         )
 
-    try:
-        manager = KBManager.instance()
-    except Exception as exc:  # pragma: no cover - first-boot errors
-        return json.dumps(
-            {"ok": False, "error": f"KB not initialised: {exc}", "hits": []},
-            ensure_ascii=False,
-        )
-
-    cfg = manager.read_config()
+    cfg = KBManager.instance().read_config()
     default_top_k = int(getattr(getattr(cfg, "retrieval", None), "top_k", 5) or 5)
     raw_top_k = arguments.get("top_k")
     try:
@@ -3289,36 +3674,42 @@ def _tool_knowledge_search(arguments: Dict[str, Any]) -> str:
         top_k = default_top_k
     top_k = max(1, min(20, top_k))
 
-    if not cfg.enabled:
-        return json.dumps(
-            {
-                "ok": True,
-                "hits": [],
-                "used_top_k": 0,
-                "source": "local",
-                "disabled": True,
-                "hint": "Knowledge base is disabled in settings.",
-            },
-            ensure_ascii=False,
-        )
+    avatar_id = None
+    if session is not None:
+        avatar_id = str(getattr(session, "bound_avatar_id", "") or "").strip() or None
+    brain_id = str(arguments.get("brain_id") or "").strip() or None
 
     try:
-        hits = manager.runtime.search(query, top_k=top_k)
+        payload = search_docs_brains(
+            query=query,
+            top_k=top_k,
+            avatar_id=avatar_id,
+            brain_id=brain_id,
+        )
     except Exception as exc:
         return json.dumps(
             {"ok": False, "error": f"search failed: {exc}", "hits": []},
             ensure_ascii=False,
         )
+    return json.dumps(payload, ensure_ascii=False)
 
-    return json.dumps(
-        {
-            "ok": True,
-            "hits": [h.to_dict() for h in hits],
-            "used_top_k": len(hits),
-            "source": "local",
-        },
-        ensure_ascii=False,
-    )
+
+def _tool_web_search(arguments: Dict[str, Any]) -> str:
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return "ERROR: web_search requires a non-empty query"
+    raw_mr = arguments.get("max_results")
+    try:
+        from agenticx.studio.web_search.service import WebSearchService
+
+        svc = WebSearchService.from_config()
+        mr: int | None = None
+        if raw_mr is not None and str(raw_mr).strip() != "":
+            mr = int(raw_mr)
+        hits = svc.search(query, max_results=mr)
+        return WebSearchService.format_results(hits)
+    except Exception as exc:
+        return f"ERROR: web_search failed: {exc}"
 
 
 def _tool_memory_search(arguments: Dict[str, Any]) -> str:
@@ -3694,6 +4085,17 @@ async def _dispatch_lsp_tool(name: str, arguments: Dict[str, Any], session: Stud
     return json.dumps({"ok": False, "error": f"unknown LSP tool: {name}"}, ensure_ascii=False)
 
 
+# Project state harness tools (.agx/project state machine).
+try:
+    from agenticx.project_state.tools import project_state_tool_schemas as _project_state_schemas
+
+    STUDIO_TOOLS.extend(_project_state_schemas())
+except Exception as _exc:  # pragma: no cover - defensive import isolation
+    logging.getLogger(__name__).warning(
+        "project_state tool registration skipped: %s", _exc,
+    )
+
+
 _TOOL_REQUIRED_PARAMS: Dict[str, List[str]] = {}
 for _td in STUDIO_TOOLS:
     _fn = _td.get("function", {})
@@ -3890,10 +4292,32 @@ async def dispatch_tool_async(
     arguments = _repair_malformed_file_tool_arguments(name, arguments)
     required = _TOOL_REQUIRED_PARAMS.get(name)
     if required and not arguments:
+        # FR-B.1：空参数往往源于流式工具调用被截断或弱模型忘填字段；
+        # 错误文本必须强引导"立即重试本工具"，避免模型读到 ERROR 后转去
+        # 自言自语而放弃任务。对常见的文件类工具补充字段释义。
+        param_hints = {
+            "file_write": (
+                "path（绝对路径，不要省略）, content（要写入的完整文档正文，至少几百字的实际内容，不能是空字符串或省略号）"
+            ),
+            "file_edit": (
+                "path（绝对路径）, old_string（原文片段）, new_string（替换后的内容）"
+            ),
+            "skill_manage": (
+                "action（create / patch / delete）, name（skill 名称，可含子路径如 ima/notes）, "
+                "以及对应 action 所需的 markdown / old_string / new_string 字段"
+            ),
+            "schedule_task": (
+                "name（任务名）、frequency / time / date 至少一项、instruction（具体指令）、workspace（执行目录）"
+            ),
+        }
+        guidance = param_hints.get(name, "见工具 schema 中的 required 列表")
         return (
             f"ERROR: {name}() called with empty arguments. "
-            f"Required parameters: {', '.join(required)}. "
-            f"Please provide all required parameters."
+            f"Required parameters: {', '.join(required)}.\n"
+            f"参数说明：{guidance}\n"
+            f"行动要求：请立即重新调用 {name} 一次，并把上述所有必填参数完整填入；"
+            f"不要换其他工具、不要把这次失败汇报给用户、不要在没有重新调用前给出最终回复。"
+            f"如果你忘记了目标路径或正文内容，请回头查看用户最近的原始任务描述（含 [user-pending-question] 与 [user-goal-anchor]）以及 system prompt 里的工作区根，再生成完整调用。"
         )
     gate = confirm_gate or SyncConfirmGate()
     try:
@@ -3920,6 +4344,8 @@ async def dispatch_tool_async(
             )
         if name == "bash_exec":
             return await _tool_bash_exec(arguments, session, confirm_gate=gate, emit_event=event_callback)
+        if name == "code_outline":
+            return _tool_code_outline(arguments, session)
         if name == "file_read":
             return _tool_file_read(arguments, session)
         if name == "file_write":
@@ -3962,16 +4388,39 @@ async def dispatch_tool_async(
             return _tool_scratchpad_write(arguments, session)
         if name == "scratchpad_read":
             return _tool_scratchpad_read(arguments, session)
+        if name in {
+            "project_init",
+            "project_status",
+            "feature_select",
+            "feature_complete",
+            "progress_append",
+            "verify_run",
+        }:
+            from agenticx.project_state.tools import dispatch_project_state_tool
+
+            return await asyncio.to_thread(
+                dispatch_project_state_tool, name, arguments, session
+            )
         if name == "memory_append":
             return await _tool_memory_append(arguments, confirm_gate=gate, emit_event=event_callback)
         if name == "memory_search":
             return _tool_memory_search(arguments)
         if name == "knowledge_search":
-            # Plan-Id: machi-kb-stage1-local-mvp — offloaded to a thread so the
-            # underlying chromadb + litellm calls don't block the event loop.
-            return await asyncio.to_thread(_tool_knowledge_search, arguments)
+            return await asyncio.to_thread(_tool_knowledge_search, arguments, session)
+        if name == "web_search":
+            return await asyncio.to_thread(_tool_web_search, arguments)
         if name == "session_search":
             return _tool_session_search(arguments, session)
+        if name == "code_search":
+            return await asyncio.to_thread(_tool_code_search, arguments, session)
+        if name == "code_index_create":
+            return await asyncio.to_thread(_tool_code_index_create, arguments, session)
+        if name == "code_index_status":
+            return await asyncio.to_thread(_tool_code_index_status, arguments, session)
+        if name == "code_index_clear":
+            return await asyncio.to_thread(_tool_code_index_clear, arguments, session)
+        if name == "code_index_cancel":
+            return await asyncio.to_thread(_tool_code_index_cancel, arguments, session)
         if name == "ask_user":
             return _tool_ask_user(arguments, service_mode=isinstance(gate, AsyncConfirmGate))
         if name == "list_files":

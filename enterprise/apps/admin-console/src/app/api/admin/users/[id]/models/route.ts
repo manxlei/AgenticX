@@ -1,27 +1,28 @@
+import { getAdminUser } from "@agenticx/iam-core";
 import { NextResponse } from "next/server";
-import { requireAdminSession } from "../../../../../../lib/admin-auth";
-import { getUser } from "../../../../../../lib/users-store";
+import { requireAdminScope } from "../../../../../../lib/admin-auth";
 import { getUserModels, setUserModels } from "../../../../../../lib/user-models-store";
 
 export async function GET(_req: Request, context: { params: Promise<{ id: string }> }) {
-  const auth = await requireAdminSession();
+  const auth = await requireAdminScope(["user:read"]);
   if (!auth.ok) return auth.response;
   const { id } = await context.params;
-  if (!getUser(id)) {
+  const user = await getAdminUser(auth.session.tenantId, id);
+  if (!user) {
     return NextResponse.json({ code: "40400", message: "user not found" }, { status: 404 });
   }
   return NextResponse.json({
     code: "00000",
     message: "ok",
-    data: { userId: id, modelIds: getUserModels(id) },
+    data: { userId: id, modelIds: await getUserModels(id) },
   });
 }
 
 export async function PUT(request: Request, context: { params: Promise<{ id: string }> }) {
-  const auth = await requireAdminSession();
+  const auth = await requireAdminScope(["user:update"]);
   if (!auth.ok) return auth.response;
   const { id } = await context.params;
-  const user = getUser(id);
+  const user = await getAdminUser(auth.session.tenantId, id);
   if (!user) {
     return NextResponse.json({ code: "40400", message: "user not found" }, { status: 404 });
   }
@@ -29,8 +30,8 @@ export async function PUT(request: Request, context: { params: Promise<{ id: str
     const body = (await request.json()) as Record<string, unknown>;
     const raw = Array.isArray(body.modelIds) ? body.modelIds : [];
     const modelIds = raw.filter((x): x is string => typeof x === "string");
-    const saved = setUserModels(id, modelIds);
-    setUserModels(`email:${user.email.toLowerCase()}`, modelIds);
+    const saved = await setUserModels(id, modelIds);
+    await setUserModels(`email:${user.email.toLowerCase()}`, modelIds);
     return NextResponse.json({ code: "00000", message: "ok", data: { userId: id, modelIds: saved } });
   } catch (error) {
     return NextResponse.json(

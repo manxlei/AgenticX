@@ -1,7 +1,7 @@
 "use client";
 
-import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   Alert,
   AlertDescription,
@@ -34,13 +34,15 @@ import {
   Sparkles,
   Zap,
 } from "lucide-react";
+import { getPortalSsoErrorMessageZh } from "@agenticx/auth/src/services/oidc-error-codes";
 import { usePortalCopy } from "../../lib/portal-copy";
+import { getPortalSsoProviderOptions, pickPreferredSsoProvider } from "../../lib/sso-provider-options";
 
-export default function AuthPage() {
-  const router = useRouter();
+function AuthPageInner() {
+  const searchParams = useSearchParams();
   const t = usePortalCopy();
   const { locale, setLocale } = useLocale();
-  const [signInEmail, setSignInEmail] = useState("owner@agenticx.local");
+  const [signInEmail, setSignInEmail] = useState("admin@agenticx.local");
   const [signInPassword, setSignInPassword] = useState("");
   const [signUpEmail, setSignUpEmail] = useState("");
   const [signUpUsername, setSignUpUsername] = useState("");
@@ -48,6 +50,16 @@ export default function AuthPage() {
   const [confirmPassword, setConfirmPassword] = useState("");
   const [status, setStatus] = useState<{ type: "error" | "success" | "info"; message: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const ssoProviders = useMemo(() => getPortalSsoProviderOptions(), []);
+
+  useEffect(() => {
+    const raw = searchParams.get("sso_error");
+    if (!raw) return;
+    setStatus({
+      type: "error",
+      message: getPortalSsoErrorMessageZh(raw),
+    });
+  }, [searchParams]);
 
   const handleSignIn = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -57,6 +69,7 @@ export default function AuthPage() {
     try {
       const response = await fetch("/api/auth/login", {
         method: "POST",
+        credentials: "include",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ email: signInEmail, password: signInPassword }),
       });
@@ -66,7 +79,10 @@ export default function AuthPage() {
         return;
       }
       setStatus({ type: "success", message: t.signInSuccess });
-      router.push("/workspace");
+      const returnTo = searchParams.get("returnTo");
+      const destination =
+        returnTo && returnTo.startsWith("/") && !returnTo.startsWith("//") ? returnTo : "/workspace";
+      window.location.assign(destination);
     } finally {
       setBusy(false);
     }
@@ -329,9 +345,18 @@ export default function AuthPage() {
                   type="button"
                   variant="outline"
                   size="sm"
-                  disabled
+                  disabled={ssoProviders.length === 0}
+                  onClick={() => {
+                    const provider = pickPreferredSsoProvider(ssoProviders);
+                    const providerId = provider?.id ?? "default";
+                    const startPath =
+                      provider?.protocol === "saml"
+                        ? "/api/auth/sso/saml/start"
+                        : "/api/auth/sso/oidc/start";
+                    window.location.href = `${startPath}?provider=${encodeURIComponent(providerId)}&returnTo=${encodeURIComponent("/workspace")}`;
+                  }}
                 >
-                  SSO
+                  企业 SSO
                 </Button>
                 <Button
                   type="button"
@@ -361,5 +386,13 @@ export default function AuthPage() {
         <span>Made with ❤ in Beijing</span>
       </div>
     </main>
+  );
+}
+
+export default function AuthPage() {
+  return (
+    <Suspense fallback={null}>
+      <AuthPageInner />
+    </Suspense>
   );
 }

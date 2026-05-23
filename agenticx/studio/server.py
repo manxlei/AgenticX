@@ -19,7 +19,7 @@ import smtplib
 import subprocess
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from typing import AsyncGenerator
@@ -58,9 +58,14 @@ from agenticx.cli.studio_mcp import (
 from agenticx.llms.provider_resolver import ProviderResolver
 from agenticx.runtime import AgentRuntime, AutoApproveConfirmGate
 from agenticx.runtime.auto_solve import AutoSolveMode
-from agenticx.runtime.events import EventType, RuntimeEvent
+from agenticx.runtime.events import EventType, RuntimeEvent, normalize_tool_sse_payload
 from agenticx.runtime.loop_controller import LoopController
-from agenticx.cli.agent_tools import META_TOOL_NAMES, STUDIO_TOOLS, merge_computer_use_tools_into
+from agenticx.cli.agent_tools import (
+    META_TOOL_NAMES,
+    STUDIO_TOOLS,
+    _code_search_tool_defs,
+    merge_computer_use_tools_into,
+)
 from agenticx.runtime.meta_tools import META_AGENT_TOOLS, META_LEADER_LABEL_SCRATCH_KEY
 from agenticx.runtime.prompts.meta_agent import _build_taskspaces_context, build_meta_agent_system_prompt
 from agenticx.runtime.group_router import (
@@ -69,13 +74,27 @@ from agenticx.runtime.group_router import (
     expand_mentions_with_meta_leader,
 )
 from agenticx.runtime.team_manager import AgentTeamManager
-from agenticx.studio.protocols import ChatRequest, ConfirmResponse, SessionState, SseEvent
+from agenticx.studio.protocols import (
+    ChatRequest,
+    ConfirmResponse,
+    ContinueRequest,
+    SessionState,
+    SseEvent,
+)
+from agenticx.studio.continuation import (
+    ContinuationReason,
+    ContinuationSource,
+    prepare_continue,
+)
 from agenticx.studio.session_manager import (
     SessionManager,
     managed_session_binding_matches_avatar_query,
 )
 from agenticx.tools.mcp_hub import MCPHub
 from agenticx.studio.kb.routes import register_kb_routes
+from agenticx.studio.code_index.routes import register_code_index_routes
+from agenticx.brain.routes import register_brain_routes
+from agenticx.studio.voice_endpoints import register_voice_endpoints
 from agenticx.memory.workspace_memory import WorkspaceMemoryStore
 from agenticx.workspace.loader import (
     append_long_term_memory,
@@ -185,10 +204,48 @@ def _get_mcp_connect_cancelled(studio_session: Any) -> set[str]:
     return getattr(studio_session, "mcp_connect_cancelled")
 
 
+def _runtime_error_counts_as_failure(event: RuntimeEvent) -> bool:
+    """Return True when a runtime ERROR should leave the session interrupted."""
+    if event.type != EventType.ERROR.value:
+        return False
+    data = event.data if isinstance(event.data, dict) else {}
+    text = str(data.get("text", "") or "")
+    severity = str(data.get("severity", "") or "").strip().lower()
+    detector = str(data.get("detector", "") or "").strip().lower()
+    if severity == "warning":
+        return False
+    if "已达到最大工具调用轮数" in text:
+        return False
+    if detector in {"token_budget_compress", "compactor_circuit_breaker"}:
+        return False
+    return True
+
+
+def _resolve_chat_end_execution_state(
+    manager: SessionManager,
+    session_id: str,
+    *,
+    saw_final: bool,
+    had_runtime_failure: bool,
+) -> str:
+    """Pick idle vs interrupted when a chat SSE stream ends."""
+    if manager.should_interrupt(session_id):
+        return "interrupted"
+    if had_runtime_failure and not saw_final:
+        return "interrupted"
+    return "idle"
+
+
 def _runtime_event_to_sse_lines(event: RuntimeEvent) -> list[str]:
     """Serialize RuntimeEvent to SSE data line(s); emit token_usage after final when usage present."""
     event_data = dict(event.data)
     event_data.setdefault("agent_id", event.agent_id)
+    if event.type in (
+        EventType.TOOL_CALL.value,
+        EventType.TOOL_RESULT.value,
+        EventType.TOOL_PROGRESS.value,
+    ):
+        event_data = normalize_tool_sse_payload(event_data)
     usage_meta = None
     if event.type == EventType.FINAL.value:
         usage_meta = event_data.pop("usage_metadata", None)
@@ -457,6 +514,12 @@ def create_studio_app() -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def _studio_lifespan(app: FastAPI):
+        # Initialise process-level MCP hub and kick off background restore.
+        from agenticx.runtime.global_mcp_manager import GlobalMcpManager as _GmcpM
+
+        _gmcp = _GmcpM.load_or_init()
+        _gmcp.schedule_restore()
+
         gw_task: asyncio.Task | None = None
         try:
             from agenticx.gateway.client import GatewayClient, load_gateway_client_settings
@@ -481,7 +544,117 @@ def create_studio_app() -> FastAPI:
         except Exception as exc:
             logger.debug("WeChat adapter not started: %s", exc)
 
+        longrun_bg: asyncio.Task[None] | None = None
+        try:
+            from agenticx.longrun.bootstrap import maybe_start_longrun
+
+            longrun_bg = await maybe_start_longrun(app)
+            app.state.longrun_background_task = longrun_bg
+        except Exception as exc:
+            logger.debug("LongRun orchestrator not started: %s", exc)
+
+        def _preload_code_index_model() -> None:
+            try:
+                from agenticx.code_index.config import load_code_index_config
+                from agenticx.code_index.manager import CodeIndexManager
+
+                cfg = load_code_index_config()
+                if cfg.enabled or cfg.preload_model:
+                    CodeIndexManager.instance().preload_model()
+            except ImportError:
+                logger.debug("code_index optional deps not installed; skip preload")
+            except Exception as exc:
+                logger.warning("code_index model preload failed: %s", exc)
+
+        try:
+            from agenticx.code_index.config import load_code_index_config
+
+            if load_code_index_config().preload_model:
+                loop = asyncio.get_running_loop()
+                loop.run_in_executor(None, _preload_code_index_model)
+        except ImportError:
+            pass
+
+        async def _internal_continue(
+            session_id: str,
+            *,
+            reason: str,
+            source: str,
+            skip_dedupe: bool = False,
+        ) -> bool:
+            sid = str(session_id or "").strip()
+            if not sid:
+                return False
+            managed = manager.get(sid, touch=False)
+            if managed is None:
+                return False
+            exec_state = str(getattr(managed, "execution_state", "idle") or "idle")
+            ok, prompt, _round_n, _notice = prepare_continue(
+                managed,
+                reason=reason,  # type: ignore[arg-type]
+                source=source,  # type: ignore[arg-type]
+                execution_state=exec_state,
+                skip_dedupe=skip_dedupe,
+            )
+            if not ok:
+                return False
+            manager.persist(sid)
+            chat_payload = ChatRequest(
+                session_id=sid,
+                user_input=prompt,
+                skip_user_history=True,
+                provider=managed.studio_session.provider_name,
+                model=managed.studio_session.model_name,
+            )
+
+            class _SupervisorRequest:
+                async def is_disconnected(self) -> bool:
+                    return False
+
+            stream_resp = await chat(
+                chat_payload,
+                _SupervisorRequest(),  # type: ignore[arg-type]
+                desktop_token,
+            )
+            if stream_resp.body_iterator is not None:
+                async for _chunk in stream_resp.body_iterator:
+                    pass
+            return True
+
+        try:
+            from agenticx.studio.supervisor import maybe_start_supervisor
+
+            await maybe_start_supervisor(app, manager, _internal_continue)
+        except Exception as exc:
+            logger.debug("Session supervisor not started: %s", exc)
+
         yield
+
+        if longrun_bg is not None:
+            longrun_bg.cancel()
+            try:
+                await longrun_bg
+            except asyncio.CancelledError:
+                pass
+        sup = getattr(app.state, "session_supervisor", None)
+        if sup is not None:
+            try:
+                await sup.stop()
+            except Exception as exc:
+                logger.debug("Session supervisor stop error: %s", exc)
+
+        orch = getattr(app.state, "longrun_orchestrator", None)
+        if orch is not None:
+            try:
+                await orch.stop()
+            except Exception as exc:
+                logger.debug("LongRun orchestrator stop error: %s", exc)
+
+        # Shutdown: close all MCP child processes via the global hub.
+        try:
+            await _GmcpM.singleton().close_all()
+        except Exception as exc:
+            logger.warning("GlobalMcpManager.close_all error on shutdown: %s", exc)
 
         if wechat_adapter is not None:
             try:
@@ -722,6 +895,10 @@ def create_studio_app() -> FastAPI:
         if x_agx_desktop_token != desktop_token:
             raise HTTPException(status_code=401, detail="invalid desktop token")
 
+    _verify_desktop_token = _check_token
+
+    register_voice_endpoints(app, manager=manager, check_token=_check_token)
+
     def _check_mcp_admin_token(x_agx_desktop_token: str | None) -> None:
         if not desktop_token:
             raise HTTPException(status_code=403, detail="desktop token required for MCP admin APIs")
@@ -809,7 +986,7 @@ def create_studio_app() -> FastAPI:
     def _modelscope_headers() -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "AgenticX/0.3.7",
+            "User-Agent": "AgenticX/0.3.9",
         }
         token = str(os.getenv("MODELSCOPE_API_TOKEN", "")).strip()
         if token:
@@ -953,6 +1130,16 @@ def create_studio_app() -> FastAPI:
         }
         return out or None
 
+    def _sanitize_avatar_brains_enabled(raw: Any) -> Any:
+        if raw is None:
+            return None
+        if raw == "*":
+            return "*"
+        if isinstance(raw, list):
+            ids = [str(x).strip() for x in raw if str(x).strip()]
+            return ids or None
+        return None
+
     def _load_global_tools_policy() -> dict[str, bool]:
         try:
             raw = ConfigManager.get_value("tools_enabled")
@@ -1017,6 +1204,50 @@ def create_studio_app() -> FastAPI:
             if allowed:
                 filtered.append(tool)
         return filtered
+
+    def _strip_disabled_web_search_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        try:
+            raw = ConfigManager.get_value("web_search") or {}
+            if not isinstance(raw, dict):
+                return tools
+            en = raw.get("enabled", True)
+            if isinstance(en, str):
+                en = en.strip().lower() in ("1", "true", "yes", "on")
+            if bool(en):
+                return tools
+        except Exception:
+            return tools
+        return [t for t in tools if str((t.get("function") or {}).get("name", "")).strip() != "web_search"]
+
+    def _maybe_inject_code_search_tools(
+        sess: Any,
+        tools: list[dict[str, Any]],
+        *,
+        avatar_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Inject code_search when the session has mounted code brains (avatar/Meta)."""
+        try:
+            from agenticx.brain.mount import session_has_mounted_code_brains
+
+            if not session_has_mounted_code_brains(sess, avatar_id=avatar_id):
+                return tools
+            extra = _code_search_tool_defs()
+            if not extra:
+                return tools
+            existing_names = {
+                str((t.get("function") or {}).get("name", "")).strip()
+                for t in tools
+                if isinstance(t, dict)
+            }
+            merged = list(tools)
+            for spec in extra:
+                name = str((spec.get("function") or {}).get("name", "")).strip()
+                if name and name not in existing_names:
+                    merged.append(spec)
+                    existing_names.add(name)
+            return merged
+        except Exception:
+            return tools
 
     def _sse_event(event: str, data: dict[str, Any]) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -1127,6 +1358,95 @@ def create_studio_app() -> FastAPI:
             )
         return out
 
+    def _looks_like_filesystem_path(key: str) -> bool:
+        text = str(key or "").strip()
+        if not text:
+            return False
+        if text.startswith("file:"):
+            return True
+        if "/" in text or "\\" in text:
+            return True
+        if len(text) > 2 and text[1] == ":" and text[2] in {"/", "\\"}:
+            return True
+        return False
+
+    def _guess_mime_from_filename(name: str) -> str:
+        lower = str(name or "").lower()
+        if lower.endswith(".py"):
+            return "text/x-python"
+        if lower.endswith(".ts") or lower.endswith(".tsx"):
+            return "text/typescript"
+        if lower.endswith(".js") or lower.endswith(".jsx"):
+            return "text/javascript"
+        if lower.endswith(".md"):
+            return "text/markdown"
+        if lower.endswith(".json"):
+            return "application/json"
+        if lower.endswith(".yaml") or lower.endswith(".yml"):
+            return "text/yaml"
+        if lower.endswith(".txt"):
+            return "text/plain"
+        return "application/octet-stream"
+
+    def _history_attachments_from_context_files(context_files: dict[str, str]) -> list[dict[str, Any]]:
+        """Metadata-only rows so Desktop can replay file cards after session reload (no file body)."""
+        out: list[dict[str, Any]] = []
+        if not context_files:
+            return out
+        seen: set[str] = set()
+        for raw_key, raw_body in context_files.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            body = str(raw_body or "")
+            if body.strip() == "[图片文件]" or body.startswith("[图片:"):
+                continue
+            parts = key.split(":")
+            display_name = key
+            size_val = len(body.encode("utf-8")) if body else 0
+            reference_token = False
+            source_path = ""
+            composer_ref_label = ""
+            if key.startswith("@dir:"):
+                dir_parts = key.split(":", 2)
+                if len(dir_parts) == 3:
+                    display_name = key
+                    source_path = dir_parts[2]
+                    composer_ref_label = dir_parts[1]
+                    reference_token = True
+            elif len(parts) >= 3 and parts[-1].isdigit() and parts[-2].isdigit():
+                display_name = str(parts[0] or "").strip() or key
+                try:
+                    size_val = int(parts[-2])
+                except ValueError:
+                    size_val = len(body.encode("utf-8")) if body else 0
+            elif _looks_like_filesystem_path(key):
+                display_name = os.path.basename(str(key).replace("\\", "/")) or key
+                source_path = key
+                reference_token = False
+                size_val = len(body.encode("utf-8")) if body else 0
+            else:
+                display_name = os.path.basename(str(key).replace("\\", "/")) or key
+                source_path = key if _looks_like_filesystem_path(key) else ""
+
+            dedupe_key = key.casefold()
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            mime = _guess_mime_from_filename(display_name)
+            out.append(
+                {
+                    "name": display_name,
+                    "mime_type": mime,
+                    "size": int(max(0, size_val)),
+                    "source_path": str(source_path or "").strip(),
+                    "reference_token": bool(reference_token),
+                    "composer_ref_label": composer_ref_label,
+                    "kind": "context_file",
+                }
+            )
+        return out
+
     @app.get("/api/session", response_model=SessionState)
     async def get_or_create_session(
         session_id: str | None = Query(default=None),
@@ -1181,27 +1501,8 @@ def create_studio_app() -> FastAPI:
                 avatar_id=avatar_id or None,
                 avatar_name=avatar_cfg.name if avatar_cfg else None,
             )
-            try:
-                managed.studio_session.mcp_configs = load_available_servers()
-            except Exception as exc:
-                logger.warning("Failed to load MCP server configs: %s", exc)
-                managed.studio_session.mcp_configs = {}
-            auto_connect_names = _resolve_mcp_auto_connect_setting()
-            scoped_auto_connect_names = _effective_auto_connect_names_for_session(
-                auto_connect_names,
-                mcp_configs=managed.studio_session.mcp_configs,
-            )
-            if managed.studio_session.mcp_configs and scoped_auto_connect_names != []:
-                managed.studio_session.mcp_hub = MCPHub(clients=[], auto_mode=False)
-                try:
-                    await auto_connect_servers_async(
-                        managed.studio_session.mcp_hub,
-                        managed.studio_session.mcp_configs,
-                        managed.studio_session.connected_servers,
-                        scoped_auto_connect_names,
-                    )
-                except Exception as exc:
-                    logger.warning("MCP auto-connect failed: %s", exc)
+            # MCP state is now process-level; no per-session auto-connect.
+            # The global hub is already live (or being restored in background).
         sess = managed.studio_session
         return SessionState(
             session_id=managed.session_id,
@@ -1237,6 +1538,123 @@ def create_studio_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="session_id is required")
         messages = manager.get_messages(session_id)
         return {"ok": True, "messages": messages}
+
+    # -------------------------------------------------------------------
+    # Project state harness — read-only views over .agx/project/
+    # -------------------------------------------------------------------
+    @app.get("/api/projects")
+    async def list_projects(
+        session_id: str | None = Query(default=None),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        from pathlib import Path as _Path
+
+        from agenticx.project_state.store import (
+            ProjectStateError as _PSError,
+            ProjectStore as _Store,
+            locate_project_root as _locate,
+        )
+
+        candidate_roots: list[_Path] = []
+        if session_id:
+            managed = manager.get(session_id, touch=False)
+            if managed is not None:
+                taskspaces = getattr(managed.studio_session, "taskspaces", None) or []
+                for ts in taskspaces:
+                    if isinstance(ts, dict):
+                        path = str(ts.get("path", "") or "").strip()
+                        if path:
+                            candidate_roots.append(_Path(path).expanduser())
+                wd = str(getattr(managed.studio_session, "workspace_dir", "") or "").strip()
+                if wd:
+                    candidate_roots.append(_Path(wd).expanduser())
+        if not candidate_roots:
+            candidate_roots.append(_Path.cwd())
+
+        seen: set[str] = set()
+        projects: list[dict] = []
+        for root in candidate_roots:
+            try:
+                resolved = root.resolve(strict=False)
+            except OSError:
+                continue
+            if str(resolved) in seen or not resolved.is_dir():
+                continue
+            seen.add(str(resolved))
+            try:
+                project_root = _locate(resolved, use_fallback=False, create=False)
+            except _PSError:
+                continue
+            try:
+                store = _Store(project_root)
+                status = store.load_status()
+                feature_list = store.load_feature_list()
+            except _PSError as exc:
+                projects.append({"workspace_root": str(resolved), "error": str(exc)})
+                continue
+            projects.append(
+                {
+                    "workspace_root": str(resolved),
+                    "project_root": str(store.root),
+                    "project_id": status.project_id,
+                    "phase": status.phase,
+                    "feature_count": len(feature_list.features),
+                }
+            )
+        return {"ok": True, "projects": projects}
+
+    @app.get("/api/projects/status")
+    async def get_project_status(
+        workspace_root: str = Query(...),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        from pathlib import Path as _Path
+
+        from agenticx.project_state.feature_list import summarize as _summarize
+        from agenticx.project_state.store import (
+            ProjectStateError as _PSError,
+            ProjectStore as _Store,
+        )
+
+        try:
+            store = _Store.open(_Path(workspace_root).expanduser())
+            status = store.load_status()
+            feature_list = store.load_feature_list()
+        except _PSError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return {
+            "ok": True,
+            "project_root": str(store.root),
+            "status": status.to_dict(),
+            "feature_list": feature_list.to_dict(),
+            "counts": _summarize(feature_list),
+        }
+
+    @app.get("/api/projects/progress")
+    async def get_project_progress(
+        workspace_root: str = Query(...),
+        tail: int = Query(default=100, ge=0, le=500),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        from pathlib import Path as _Path
+
+        from agenticx.project_state.store import (
+            ProjectStateError as _PSError,
+            ProjectStore as _Store,
+        )
+
+        try:
+            store = _Store.open(_Path(workspace_root).expanduser())
+        except _PSError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        return {
+            "ok": True,
+            "project_root": str(store.root),
+            "progress_tail": store.read_progress_tail(int(tail)),
+        }
 
     @app.post("/api/session/messages/delete")
     async def delete_session_messages(
@@ -1355,8 +1773,10 @@ def create_studio_app() -> FastAPI:
         session_id = str(payload.get("session_id", "") or "").strip()
         if not session_id:
             raise HTTPException(status_code=400, detail="session_id is required")
-        if not manager.request_interrupt(session_id):
-            raise HTTPException(status_code=400, detail="invalid session_id")
+        managed = manager.get(session_id, touch=False)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        manager.request_interrupt(session_id)
         manager.set_execution_state(session_id, "interrupted")
         manager.persist(session_id)
         return {"ok": True, "session_id": session_id}
@@ -1398,8 +1818,32 @@ def create_studio_app() -> FastAPI:
             manager.auto_title_session(payload.session_id, payload.user_input)
 
         session = managed.studio_session
+        try:
+            from agenticx.runtime.prompts.code_mode import ensure_code_dev_workflow_skill
+
+            ensure_code_dev_workflow_skill(session)
+        except Exception:
+            pass
         if payload.context_files:
             session.context_files.update(_normalize_context_files(payload.context_files))
+        if payload.skill_slugs:
+            try:
+                from agenticx.tools.skill_bundle import SkillBundleLoader
+
+                _skill_loader = SkillBundleLoader()
+                _skill_loader.scan()
+                for _slug in payload.skill_slugs:
+                    _slug = str(_slug).strip()
+                    if not _slug:
+                        continue
+                    _skill_key = f"skill:{_slug}"
+                    if _skill_key in session.context_files:
+                        continue
+                    _skill_content = _skill_loader.get_skill_content(_slug)
+                    if _skill_content:
+                        session.context_files[_skill_key] = _skill_content
+            except Exception as _skill_exc:
+                logger.warning("skill_slugs inject error: %s", _skill_exc)
         image_inputs = _normalize_image_inputs(payload.image_inputs)
         pending_subagent_summaries = session.scratchpad.pop("__pending_subagent_summaries__", [])
         if isinstance(pending_subagent_summaries, list):
@@ -1427,10 +1871,63 @@ def create_studio_app() -> FastAPI:
             image_inputs = []
 
         def _resolve_llm():
-            return ProviderResolver.resolve(
-                provider_name=session.provider_name,
-                model=session.model_name,
-            )
+            try:
+                return ProviderResolver.resolve(
+                    provider_name=session.provider_name,
+                    model=session.model_name,
+                )
+            except ValueError as exc:
+                # 自愈：历史会话可能绑定了 custom_openai_* 且未保存 model。
+                # 这类会触发 "missing model configuration"，若直接抛错会让 SSE
+                # 在某些 Python 版本下进入异常断流路径，前端只能看到 network error。
+                if "missing model configuration" not in str(exc):
+                    raise
+                cfg = ConfigManager.load()
+                preferred = str(cfg.default_provider or "").strip().lower()
+                fallback_candidates: list[str] = []
+                if preferred:
+                    fallback_candidates.append(preferred)
+                fallback_candidates.extend(
+                    [
+                        "openai",
+                        "anthropic",
+                        "zhipu",
+                        "volcengine",
+                        "bailian",
+                        "qianfan",
+                        "kimi",
+                        "minimax",
+                        "ollama",
+                    ]
+                )
+                seen: set[str] = set()
+                for provider_name in fallback_candidates:
+                    key = str(provider_name or "").strip().lower()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    provider_cfg = cfg.get_provider(key)
+                    fallback_model = str(provider_cfg.model or "").strip()
+                    if not fallback_model:
+                        continue
+                    try:
+                        llm = ProviderResolver.resolve(
+                            provider_name=key,
+                            model=fallback_model,
+                        )
+                    except Exception:
+                        continue
+                    # 回写当前会话，避免后续每轮都走降级逻辑。
+                    session.provider_name = key
+                    session.model_name = fallback_model
+                    logger.warning(
+                        "[chat] auto-fallback model due to missing session model: sid=%s provider=%s model=%s",
+                        payload.session_id,
+                        key,
+                        fallback_model,
+                    )
+                    return llm
+                raise
 
         target_agent_id = (payload.agent_id or "meta").strip() or "meta"
         if target_agent_id != "meta":
@@ -1510,6 +2007,7 @@ def create_studio_app() -> FastAPI:
         if is_group_session:
             manager.clear_interrupt(payload.session_id)
             manager.set_execution_state(payload.session_id, "running")
+            setattr(session, "_usage_owner_session_id", payload.session_id)
             async def _group_chat_stream() -> AsyncGenerator[str, None]:
                 try:
                     llm_factory = lambda provider, model: ProviderResolver.resolve(
@@ -1618,8 +2116,11 @@ def create_studio_app() -> FastAPI:
         try:
             llm = _resolve_llm()
         except Exception as exc:
+            llm_init_err_text = f"LLM init failed: {exc}"
             async def _error_stream() -> AsyncGenerator[str, None]:
-                err = SseEvent(type="error", data={"text": f"LLM init failed: {exc}"})
+                # Python 3.13 no longer allows closing over `exc` from except scope.
+                # Copy the message into a normal local before defining the generator.
+                err = SseEvent(type="error", data={"text": llm_init_err_text})
                 yield f"data: {json.dumps(err.model_dump(), ensure_ascii=False)}\n\n"
                 yield 'data: {"type":"done","data":{}}\n\n'
             return StreamingResponse(_error_stream(), media_type="text/event-stream")
@@ -1756,6 +2257,16 @@ def create_studio_app() -> FastAPI:
             )
             if ws:
                 prompt += f"\n## 工作目录\n- {ws}\n"
+            try:
+                from agenticx.runtime.prompts.meta_agent import (
+                    _build_followup_questions_block,
+                    _build_web_search_capability_block,
+                )
+
+                prompt += "\n" + _build_web_search_capability_block()
+                prompt += _build_followup_questions_block()
+            except Exception:
+                pass
             return prompt
 
         if is_automation_session:
@@ -1775,6 +2286,12 @@ def create_studio_app() -> FastAPI:
         else:
             effective_tools_source = list(META_AGENT_TOOLS)
         effective_tools_source = merge_computer_use_tools_into(effective_tools_source)
+        effective_tools_source = _strip_disabled_web_search_tools(effective_tools_source)
+        effective_tools_source = _maybe_inject_code_search_tools(
+            session,
+            effective_tools_source,
+            avatar_id=active_avatar_id if is_avatar_session else None,
+        )
         effective_tools: list = _filter_tools_by_policy(
             effective_tools_source,
             avatar_tools_enabled=avatar_tools_enabled,
@@ -1784,6 +2301,8 @@ def create_studio_app() -> FastAPI:
         async def _event_stream() -> AsyncGenerator[str, None]:
             runtime_task: "asyncio.Task[None] | None" = None
             meta_done = False
+            saw_final = False
+            had_runtime_failure = False
             keep_runtime_after_disconnect = bool(
                 getattr(payload, "keep_runtime_after_disconnect", False)
             )
@@ -1878,6 +2397,16 @@ def create_studio_app() -> FastAPI:
                             )
                         user_message_content = content_blocks
                         history_user_attachments = _history_attachments_from_image_inputs(image_inputs)
+                    _turn_cf = (
+                        _normalize_context_files(payload.context_files)
+                        if getattr(payload, "context_files", None)
+                        else {}
+                    )
+                    _cf_hist = _history_attachments_from_context_files(_turn_cf)
+                    if _cf_hist:
+                        if history_user_attachments is None:
+                            history_user_attachments = []
+                        history_user_attachments.extend(_cf_hist)
                     async for event in runtime.run_turn(
                         effective_input,
                         session,
@@ -1888,6 +2417,8 @@ def create_studio_app() -> FastAPI:
                         user_message_content=user_message_content,
                         history_user_attachments=history_user_attachments,
                         persist_user_message=not bool(getattr(payload, "skip_user_history", False)),
+                        usage_session_id=payload.session_id,
+                        usage_avatar_id=str(getattr(managed, "avatar_id", "") or ""),
                     ):
                         await event_queue.put(event)
                     await event_queue.put(None)
@@ -1918,11 +2449,14 @@ def create_studio_app() -> FastAPI:
                             for line in _runtime_event_to_sse_lines(event):
                                 yield line
                         if event.type == EventType.FINAL.value and event.agent_id == "meta":
+                            saw_final = True
                             snap = str(getattr(managed, "session_name", None) or "").strip()
                             if manager.claim_llm_title_slot(payload.session_id, snap):
                                 asyncio.create_task(
                                     _llm_suggest_session_title_job(manager, payload.session_id)
                                 )
+                        elif _runtime_error_counts_as_failure(event):
+                            had_runtime_failure = True
                     if not meta_done:
                         continue
                     # Do not block the main chat stream on background sub-agent execution.
@@ -1931,6 +2465,7 @@ def create_studio_app() -> FastAPI:
                     if event_queue.empty():
                         break
             except Exception as exc:
+                had_runtime_failure = True
                 err = SseEvent(type="error", data={"text": f"Runtime error: {exc}"})
                 if not client_disconnected:
                     yield f"data: {json.dumps(err.model_dump(), ensure_ascii=False)}\n\n"
@@ -1946,14 +2481,127 @@ def create_studio_app() -> FastAPI:
                             "[chat] runtime finished after disconnect session=%s",
                             payload.session_id,
                         )
+                elif runtime_task is not None and runtime_task.done():
+                    task_exc = runtime_task.exception()
+                    if task_exc is not None:
+                        had_runtime_failure = True
                 _flush_taskspace_hint(payload.session_id, session)
+                end_state = _resolve_chat_end_execution_state(
+                    manager,
+                    payload.session_id,
+                    saw_final=saw_final,
+                    had_runtime_failure=had_runtime_failure,
+                )
                 manager.clear_interrupt(payload.session_id)
-                manager.set_execution_state(payload.session_id, "idle")
+                manager.set_execution_state(payload.session_id, end_state)
                 manager.persist(payload.session_id)
             if not client_disconnected:
                 yield 'data: {"type":"done","data":{}}\n\n'
 
         return StreamingResponse(_event_stream(), media_type="text/event-stream")
+
+    @app.post("/api/sessions/{session_id}/continue")
+    async def continue_session(
+        session_id: str,
+        payload: ContinueRequest,
+        request: Request,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> StreamingResponse:
+        _check_token(x_agx_desktop_token)
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        managed = manager.get(sid, touch=False)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="session not found")
+
+        reason = str(payload.reason or "manual").strip().lower()
+        if reason not in {"stall", "interrupted", "exhausted", "rate_limit", "manual"}:
+            reason = "manual"
+        source = str(payload.source or "desktop_manual").strip().lower()
+        if source not in {"desktop_manual", "desktop_auto_nudge", "supervisor"}:
+            source = "desktop_manual"
+
+        exec_state = str(getattr(managed, "execution_state", "idle") or "idle")
+        if source == "desktop_manual" and exec_state == "running":
+            async def _still_running() -> AsyncGenerator[str, None]:
+                evt = SseEvent(
+                    type="continuation_rejected",
+                    data={"text": "任务仍在后台执行中，可继续等待或主动中断"},
+                )
+                yield f"data: {json.dumps(evt.model_dump(), ensure_ascii=False)}\n\n"
+                yield 'data: {"type":"done","data":{}}\n\n'
+
+            return StreamingResponse(_still_running(), media_type="text/event-stream")
+
+        max_nudge = int(
+            __import__("agenticx.studio.continuation", fromlist=["get_runtime_value"]).get_runtime_value(
+                "runtime.stall_auto_nudge_max_per_session", 2
+            )
+            or 2
+        )
+        ok, prompt, round_n, notice = prepare_continue(
+            managed,
+            reason=reason,  # type: ignore[arg-type]
+            source=source,  # type: ignore[arg-type]
+            execution_state=exec_state,
+            max_rounds=max_nudge if source == "desktop_auto_nudge" else None,
+        )
+        if not ok:
+            async def _deduped() -> AsyncGenerator[str, None]:
+                evt = SseEvent(type="continuation_rejected", data={"text": "续跑请求已去重，请稍后再试"})
+                yield f"data: {json.dumps(evt.model_dump(), ensure_ascii=False)}\n\n"
+                yield 'data: {"type":"done","data":{}}\n\n'
+
+            return StreamingResponse(_deduped(), media_type="text/event-stream")
+
+        manager.persist(sid)
+
+        async def _wrapped_stream() -> AsyncGenerator[str, None]:
+            notice_evt = SseEvent(
+                type="continuation_notice",
+                data={
+                    "text": notice.get("content", ""),
+                    "reason": reason,
+                    "source": source,
+                    "continuation_round": round_n,
+                    "metadata": notice.get("metadata", {}),
+                },
+            )
+            yield f"data: {json.dumps(notice_evt.model_dump(), ensure_ascii=False)}\n\n"
+            chat_payload = ChatRequest(
+                session_id=sid,
+                user_input=prompt,
+                skip_user_history=True,
+                provider=managed.studio_session.provider_name,
+                model=managed.studio_session.model_name,
+            )
+            inner = await chat(chat_payload, request, x_agx_desktop_token)
+            if inner.body_iterator is not None:
+                async for chunk in inner.body_iterator:
+                    yield chunk
+
+        return StreamingResponse(_wrapped_stream(), media_type="text/event-stream")
+
+    @app.put("/api/sessions/{session_id}/unattended")
+    async def set_session_unattended(
+        session_id: str,
+        payload: dict,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise HTTPException(status_code=400, detail="session_id is required")
+        managed = manager.get(sid, touch=False)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        enabled = bool(payload.get("enabled", False))
+        from agenticx.studio.supervisor import set_session_unattended_enabled
+
+        set_session_unattended_enabled(managed.studio_session, enabled)
+        manager.persist(sid)
+        return {"ok": True, "session_id": sid, "unattended_enabled": enabled}
 
     @app.post("/api/loop")
     async def run_loop(
@@ -2016,6 +2664,12 @@ def create_studio_app() -> FastAPI:
                 loop_avatar_tools_enabled = _sanitize_tools_enabled(loop_avatar_cfg.tools_enabled)
         loop_tools_source: list = list(STUDIO_TOOLS) if loop_is_avatar else list(META_AGENT_TOOLS)
         loop_tools_source = merge_computer_use_tools_into(loop_tools_source)
+        loop_tools_source = _strip_disabled_web_search_tools(loop_tools_source)
+        loop_tools_source = _maybe_inject_code_search_tools(
+            session,
+            loop_tools_source,
+            avatar_id=loop_avatar_id if loop_is_avatar else None,
+        )
         loop_tools: list = _filter_tools_by_policy(
             loop_tools_source,
             avatar_tools_enabled=loop_avatar_tools_enabled,
@@ -2238,29 +2892,41 @@ def create_studio_app() -> FastAPI:
 
     @app.get("/api/mcp/servers")
     async def list_mcp_servers(
-        session_id: str = Query(...),
+        session_id: str = Query(default=""),
         reload: bool = Query(default=True),
         x_agx_desktop_token: str | None = Header(default=None),
     ) -> dict:
         _check_mcp_admin_token(x_agx_desktop_token)
-        managed = manager.get(session_id, touch=False)
+        from agenticx.runtime.global_mcp_manager import GlobalMcpManager
+        from types import SimpleNamespace
+
+        sid = (session_id or "").strip()
+        managed = manager.get(sid, touch=False) if sid else None
+        # No-session fallback: return process-level configs + connection state
+        # so the Settings panel works even before a session is bound (FR-1).
         if managed is None:
-            raise HTTPException(status_code=404, detail="session not found")
-        sess = managed.studio_session
-        if reload:
-            try:
-                sess.mcp_configs = load_available_servers()
-            except Exception as exc:
-                logger.warning("Failed to reload MCP configs: %s", exc)
-        configs = sess.mcp_configs if isinstance(sess.mcp_configs, dict) else {}
-        connected = (
-            sess.connected_servers
-            if isinstance(sess.connected_servers, set)
-            else set(sess.connected_servers or [])
-        )
-        tool_counts = _mcp_tool_counts_for_session(sess)
-        tool_names_map = _mcp_tool_names_for_session(sess)
-        server_ops = _get_mcp_server_ops(sess)
+            gmcp = GlobalMcpManager.singleton()
+            if reload:
+                gmcp._reload_configs_if_needed()
+            configs = gmcp.mcp_configs if isinstance(gmcp.mcp_configs, dict) else {}
+            connected = set(gmcp.connected_servers or set())
+            shim = SimpleNamespace(mcp_hub=gmcp.hub)
+            tool_counts = _mcp_tool_counts_for_session(shim)
+            tool_names_map = _mcp_tool_names_for_session(shim)
+            server_ops: dict = {}
+        else:
+            sess = managed.studio_session
+            if reload:
+                GlobalMcpManager.singleton()._reload_configs_if_needed()
+            configs = sess.mcp_configs if isinstance(sess.mcp_configs, dict) else {}
+            connected = (
+                sess.connected_servers
+                if isinstance(sess.connected_servers, set)
+                else set(sess.connected_servers or [])
+            )
+            tool_counts = _mcp_tool_counts_for_session(sess)
+            tool_names_map = _mcp_tool_names_for_session(sess)
+            server_ops = _get_mcp_server_ops(sess)
         servers = []
         for name, cfg in sorted(configs.items()):
             in_connected = name in connected
@@ -2313,10 +2979,9 @@ def create_studio_app() -> FastAPI:
         result = import_mcp_config(source_path)
         if not result.get("ok"):
             raise HTTPException(status_code=400, detail=str(result.get("error", "import failed")))
-        try:
-            managed.studio_session.mcp_configs = load_available_servers()
-        except Exception:
-            managed.studio_session.mcp_configs = {}
+        # Trigger config hot-reload in GlobalMcpManager (invalidate mtime cache).
+        from agenticx.runtime.global_mcp_manager import GlobalMcpManager
+        GlobalMcpManager.singleton()._configs_mtime = 0.0
         return result
 
     @app.post("/api/mcp/connect")
@@ -2344,8 +3009,6 @@ def create_studio_app() -> FastAPI:
         else:
             preflight_msg = "准备连接：初始化 MCP 客户端…"
         _set_mcp_server_op(sess, name, phase="preparing", message=preflight_msg)
-        if sess.mcp_hub is None:
-            sess.mcp_hub = MCPHub(clients=[], auto_mode=False)
         _set_mcp_server_op(sess, name, phase="connecting", message="连接中：握手并发现工具…")
         cancelled_set = _get_mcp_connect_cancelled(sess)
         cancelled_set.discard(name)
@@ -2709,14 +3372,6 @@ def create_studio_app() -> FastAPI:
             _set_mcp_server_op(sess, name, phase="idle", message="未连接")
             return {"ok": True, "name": name}
         _set_mcp_server_op(sess, name, phase="disconnecting", message="断开中：正在关闭 MCP 客户端…")
-        if sess.mcp_hub is None:
-            sess.connected_servers.discard(name)
-            try:
-                remove_mcp_auto_connect_name(name)
-            except Exception as exc:
-                logger.warning("MCP auto_connect remove failed: %s", exc)
-            _set_mcp_server_op(sess, name, phase="idle", message="未连接")
-            return {"ok": True, "name": name}
         okd, err = await mcp_disconnect_async(sess.mcp_hub, sess.mcp_configs, sess.connected_servers, name)
         if not okd:
             err_text = err.strip() or f"disconnect failed: {name}"
@@ -3062,16 +3717,18 @@ def create_studio_app() -> FastAPI:
                 if str(key).strip()
             }
         skills_enabled = _sanitize_avatar_skills_enabled(payload.get("skills_enabled"))
+        brains_enabled = _sanitize_avatar_brains_enabled(payload.get("brains_enabled"))
         config = avatar_registry.create_avatar(
             name=name,
             role=str(payload.get("role", "")).strip(),
             avatar_url=str(payload.get("avatar_url", "")).strip(),
             system_prompt=str(payload.get("system_prompt", "")).strip(),
-            created_by=str(payload.get("created_by", "manual")).strip(),
+            created_by=str(payload.get("created_by", "")).strip(),
             default_provider=str(payload.get("default_provider", "")).strip(),
             default_model=str(payload.get("default_model", "")).strip(),
             tools_enabled=tools_enabled,
             skills_enabled=skills_enabled,
+            brains_enabled=brains_enabled,
         )
         return {"ok": True, "avatar": config.to_dict()}
 
@@ -3089,6 +3746,11 @@ def create_studio_app() -> FastAPI:
             payload = dict(payload)
             payload["skills_enabled"] = _sanitize_avatar_skills_enabled(
                 payload.get("skills_enabled")
+            )
+        if "brains_enabled" in payload:
+            payload = dict(payload)
+            payload["brains_enabled"] = _sanitize_avatar_brains_enabled(
+                payload.get("brains_enabled")
             )
         updated = avatar_registry.update_avatar(avatar_id, payload)
         if updated is None:
@@ -3146,6 +3808,9 @@ def create_studio_app() -> FastAPI:
         avatar_id = str(payload.get("avatar_id", "")).strip() or None
         session_name = str(payload.get("name", "")).strip() or None
         inherit_from = str(payload.get("inherit_from_session_id", "")).strip() or None
+        from agenticx.runtime.session_mode import normalize_session_mode
+
+        session_mode = normalize_session_mode(str(payload.get("session_mode", "")))
         avatar_cfg = avatar_registry.get_avatar(avatar_id) if avatar_id else None
         provider_override = str(payload.get("provider", "") or "").strip() or None
         model_override = str(payload.get("model", "") or "").strip() or None
@@ -3174,6 +3839,15 @@ def create_studio_app() -> FastAPI:
                 }
 
         managed = manager.create(provider=provider, model=model)
+        managed.studio_session.session_mode = session_mode
+        if session_mode == "code_dev":
+            from agenticx.runtime.session_mode import PHASE_EXPLORE, PHASE_SCRATCH_KEY
+            from agenticx.runtime.prompts.code_mode import ensure_code_dev_workflow_skill
+
+            scratch = managed.studio_session.scratchpad
+            if isinstance(scratch, dict) and PHASE_SCRATCH_KEY not in scratch:
+                scratch[PHASE_SCRATCH_KEY] = PHASE_EXPLORE
+            ensure_code_dev_workflow_skill(managed.studio_session)
         if avatar_cfg and avatar_cfg.workspace_dir:
             managed.studio_session.workspace_dir = avatar_cfg.workspace_dir
         else:
@@ -3196,16 +3870,7 @@ def create_studio_app() -> FastAPI:
         if inherited_scratchpad:
             managed.studio_session.scratchpad.update(inherited_scratchpad)
 
-        try:
-            managed.studio_session.mcp_configs = load_available_servers()
-        except Exception:
-            managed.studio_session.mcp_configs = {}
-        auto_connect_names = _resolve_mcp_auto_connect_setting()
-        scoped_auto_connect_names = _effective_auto_connect_names_for_session(
-            auto_connect_names,
-            mcp_configs=managed.studio_session.mcp_configs,
-        )
-        _schedule_mcp_autoconnect_for_new_session(managed, scoped_auto_connect_names)
+        # MCP state is now process-level; new sessions do not trigger MCP auto-connect.
         return {
             "ok": True,
             "session_id": managed.session_id,
@@ -3213,6 +3878,7 @@ def create_studio_app() -> FastAPI:
             "session_name": session_name,
             "created_at": managed.created_at,
             "inherited": bool(inherited_summary),
+            "session_mode": session_mode,
         }
 
     @app.put("/api/sessions/{session_id}")
@@ -3934,6 +4600,142 @@ def create_studio_app() -> FastAPI:
             logger.warning("put_skill_settings error: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    # -- Usage dashboard ---------------------------------------------------------
+
+    def _usage_parse_range_ms(
+        range_key: str,
+        from_s: str | None,
+        to_s: str | None,
+    ) -> tuple[int, int]:
+        now_ms = int(time.time() * 1000)
+        rk = (range_key or "month").strip().lower()
+        if rk == "day":
+            return now_ms - 86400000, now_ms
+        if rk == "week":
+            return now_ms - 7 * 86400000, now_ms
+        if rk == "month":
+            return now_ms - 30 * 86400000, now_ms
+        if rk == "total":
+            return 0, now_ms
+        if rk == "custom":
+            fs = (from_s or "").strip()
+            ts = (to_s or "").strip()
+            if not fs or not ts:
+                raise HTTPException(
+                    status_code=400,
+                    detail="custom range requires from and to (YYYY-MM-DD)",
+                )
+            try:
+                d0 = datetime.strptime(fs, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                d1 = datetime.strptime(ts, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="invalid date format, use YYYY-MM-DD",
+                ) from exc
+            start_ms = int(d0.timestamp() * 1000)
+            end_ms = int(d1.timestamp() * 1000) + 86400000 - 1
+            if start_ms > end_ms:
+                raise HTTPException(status_code=400, detail="from must be <= to")
+            if end_ms - start_ms > 366 * 86400000:
+                raise HTTPException(status_code=400, detail="range too large (max 366 days)")
+            return start_ms, end_ms
+        raise HTTPException(status_code=400, detail="invalid range")
+
+    @app.get("/api/usage/summary")
+    async def usage_summary(
+        range_key: str = Query("month", alias="range"),
+        from_date: str | None = Query(None, alias="from"),
+        to_date: str | None = Query(None, alias="to"),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _check_token(x_agx_desktop_token)
+        from agenticx.runtime.usage_store import get_usage_store
+
+        start_ms, end_ms = _usage_parse_range_ms(range_key, from_date, to_date)
+        return get_usage_store().summary_sync(start_ms, end_ms)
+
+    @app.get("/api/usage/breakdown")
+    async def usage_breakdown(
+        range_key: str = Query("month", alias="range"),
+        from_date: str | None = Query(None, alias="from"),
+        to_date: str | None = Query(None, alias="to"),
+        dimension: str = Query("provider"),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _check_token(x_agx_desktop_token)
+        from agenticx.runtime.usage_store import get_usage_store
+
+        start_ms, end_ms = _usage_parse_range_ms(range_key, from_date, to_date)
+        dim = (dimension or "provider").strip().lower()
+        if dim not in {"provider", "model"}:
+            raise HTTPException(status_code=400, detail="dimension must be provider or model")
+        rows = get_usage_store().breakdown_sync(start_ms, end_ms, dimension=dim)
+        return {"dimension": dim, "items": rows}
+
+    @app.get("/api/usage/daily")
+    async def usage_daily(
+        range_key: str = Query("month", alias="range"),
+        from_date: str | None = Query(None, alias="from"),
+        to_date: str | None = Query(None, alias="to"),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _check_token(x_agx_desktop_token)
+        from agenticx.runtime.usage_store import get_usage_store
+
+        start_ms, end_ms = _usage_parse_range_ms(range_key, from_date, to_date)
+        rows = get_usage_store().daily_sync(start_ms, end_ms)
+        return {"items": rows}
+
+    @app.get("/api/usage/heatmap")
+    async def usage_heatmap(
+        range_key: str = Query("month", alias="range"),
+        from_date: str | None = Query(None, alias="from"),
+        to_date: str | None = Query(None, alias="to"),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _check_token(x_agx_desktop_token)
+        from agenticx.runtime.usage_store import get_usage_store
+
+        start_ms, end_ms = _usage_parse_range_ms(range_key, from_date, to_date)
+        rows = get_usage_store().heatmap_sync(start_ms, end_ms)
+        return {"items": rows}
+
+    @app.get("/api/usage/top-models")
+    async def usage_top_models(
+        range_key: str = Query("month", alias="range"),
+        from_date: str | None = Query(None, alias="from"),
+        to_date: str | None = Query(None, alias="to"),
+        limit: int = Query(3, ge=1, le=20),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _check_token(x_agx_desktop_token)
+        from agenticx.runtime.usage_store import get_usage_store
+
+        start_ms, end_ms = _usage_parse_range_ms(range_key, from_date, to_date)
+        rows = get_usage_store().top_models_sync(start_ms, end_ms, limit=limit)
+        return {"items": rows}
+
+    @app.get("/api/usage/meta")
+    async def usage_meta(
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        _check_token(x_agx_desktop_token)
+        from agenticx.runtime.usage_store import get_usage_store
+
+        store = get_usage_store()
+        now_ms = int(time.time() * 1000)
+        started = store.started_at_sync()
+        active_30 = store.active_days_sync(now_ms - 30 * 86400000, now_ms)
+        now = datetime.now(timezone.utc)
+        month_start_ms = int(datetime(now.year, now.month, 1, tzinfo=timezone.utc).timestamp() * 1000)
+        month_convs = store.month_conversations_sync(month_start_ms, now_ms)
+        return {
+            "started_at": started,
+            "active_days_30d": active_30,
+            "month_conversations": month_convs,
+        }
+
     # -- Health Probe & Recovery ------------------------------------------------
 
     _health_probe: Optional[Any] = None
@@ -4625,5 +5427,10 @@ def create_studio_app() -> FastAPI:
 
     # Machi knowledge base — Stage-1 MVP (Plan-Id: machi-kb-stage1-local-mvp)
     register_kb_routes(app)
+    register_brain_routes(app)
+    register_code_index_routes(app)
+    from agenticx.studio.web_search.routes import register_web_search_routes
+
+    register_web_search_routes(app)
 
     return app

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { requireAdminSession } from "../../../../../../../lib/admin-auth";
+import { requireAdminScope } from "../../../../../../../lib/admin-auth";
 import {
   deleteProviderModel,
   updateProviderModel,
@@ -10,7 +10,7 @@ export async function PATCH(
   request: Request,
   context: { params: Promise<{ id: string; modelName: string }> }
 ) {
-  const auth = await requireAdminSession();
+  const auth = await requireAdminScope(["provider:update"]);
   if (!auth.ok) return auth.response;
   const { id, modelName } = await context.params;
   try {
@@ -24,7 +24,7 @@ export async function PATCH(
     ) {
       patch.capabilities = body.capabilities as string[];
     }
-    const updated = updateProviderModel(id, decodeURIComponent(modelName), patch);
+    const updated = await updateProviderModel(id, decodeURIComponent(modelName), patch);
     return NextResponse.json({ code: "00000", message: "ok", data: { provider: updated } });
   } catch (error) {
     const message = error instanceof Error ? error.message : "invalid request";
@@ -40,11 +40,11 @@ export async function DELETE(
   _req: Request,
   context: { params: Promise<{ id: string; modelName: string }> }
 ) {
-  const auth = await requireAdminSession();
+  const auth = await requireAdminScope(["provider:update"]);
   if (!auth.ok) return auth.response;
   const { id, modelName } = await context.params;
   try {
-    const updated = deleteProviderModel(id, decodeURIComponent(modelName));
+    const updated = await deleteProviderModel(id, decodeURIComponent(modelName));
     return NextResponse.json({ code: "00000", message: "ok", data: { provider: updated } });
   } catch (error) {
     const message = error instanceof Error ? error.message : "invalid request";

@@ -14,6 +14,7 @@ from typing import Any
 from agenticx.cli.studio import StudioSession
 from agenticx.cli.studio_skill import get_all_skill_summaries
 from agenticx.skills.meta_skill import MetaSkillInjector
+from agenticx.runtime.prompts.code_mode import build_code_dev_prompt_blocks
 from agenticx.workspace.loader import load_workspace_context
 
 
@@ -479,6 +480,52 @@ def _build_kb_retrieval_policy_block() -> str:
     )
 
 
+def _build_web_search_capability_block() -> str:
+    """Describe built-in web_search when enabled in config."""
+    try:
+        from agenticx.cli.config_manager import ConfigManager
+
+        raw = ConfigManager.get_value("web_search") or {}
+        if not isinstance(raw, dict):
+            raw = {}
+        enabled = raw.get("enabled", True)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
+        if not bool(enabled):
+            return (
+                "## 联网搜索\n"
+                "- 内置 `web_search` 已由用户在设置中关闭：不要调用该工具；若用户需要联网，请引导其在「设置 → 通用 → 联网搜索」中开启。\n\n"
+            )
+    except Exception:
+        pass
+    return (
+        "## 联网搜索\n"
+        "- 你 **内置** `web_search` 工具，可检索公开网页，获取最新资讯、实时数据、以及超出你知识截止日期的信息。\n"
+        "- 当用户问题明显依赖时效性、当前事实或外部网页时，应 **主动** 调用 `web_search`，无需用户额外开启开关。\n"
+        "- 需要登录态、复杂页面交互或深度正文提取时，仍可依据 MCP 章节使用已连接的 browser-use / firecrawl 等能力。\n\n"
+    )
+
+
+def _build_followup_questions_block() -> str:
+    """Ask the model for <followups> lines consumed by Desktop chips."""
+    try:
+        from agenticx.runtime.followup_stream import suggested_questions_enabled_from_config
+
+        if not suggested_questions_enabled_from_config():
+            return ""
+    except Exception:
+        return ""
+    return (
+        "## 推荐追问（客户端渲染）\n"
+        "- 在每次对用户可见正文之后，**必须**追加且仅追加一个 `<followups>...</followups>` 块：块内**恰好三行**，"
+        "每行一条用户最可能继续追问的短句；不要编号、不要前缀词、不要在块内使用 Markdown。\n"
+        "- **重要：** 追问内容必须严格从**用户视角（第一人称）**出发，代表用户发给你的指令或提问（例如：“帮我查看系统资源”、“有哪些分身可用？”），绝对不能是你（智能体）反问用户的话（禁止出现“你需要我帮你查看吗？”之类的话）。\n"
+        "- 格式严格如下（示例仅供展示结构，你需按当轮对话替换为真实内容）：\n"
+        "<followups>问题1\n问题2\n问题3</followups>\n"
+        "- 该块仅用于客户端按钮；正文叙述中不要重复这三条。\n\n"
+    )
+
+
 def build_meta_agent_system_prompt(
     session: StudioSession,
     *,
@@ -582,7 +629,20 @@ def build_meta_agent_system_prompt(
         "5) 若某子智能体失控或偏航，调用 `cancel_subagent` 并重新规划。\n\n"
         "6) 当用户反馈明确 bug 且希望上报团队时，先询问是否发送邮件；用户同意后调用 `send_bug_report_email` 发送上下文。\n\n"
         "## 调度策略\n"
+        "- **何时不该调用 todo_write（重要，避免空清单刷屏）**：\n"
+        "  - 用户只是让你**输出一份文档/计划/分析/对比/解释**（如『给我一份实现计划』『分析下这段代码』『对比 A vs B』『讲讲这个架构』），本轮只产出 markdown 正文、并不会真的动手执行多步任务时——**禁止**调用 `todo_write`。\n"
+        "  - 文档里如果要列里程碑/checklist/步骤清单，**直接写在正文里**（markdown 列表即可），由用户后续决定是否真的开干；不要再额外灌进 `todo_write`，否则 UI 会出现『任务进度 0/N、agent 已结束』的鬼卡片。\n"
+        "  - 单工具/单轮就能答完的问答、闲聊、状态查询，同样不调 `todo_write`。\n"
+        "- **何时该调用 todo_write**：本轮你确实会进入**多步执行**（调度子智能体、跑多个工具、写代码并验证、跨多轮持续推进），且每项 todo 在本轮或紧接的几轮内会被你**真的标成 in_progress 并推进**时，才调用。\n"
         "- 拆解任务前优先通过 todo_write 记录任务清单，保持单个 in_progress。\n"
+        "- **todo 拆解粒度（重要，避免批量打钩）**：每项 todo 必须是**用户能独立感知的里程碑**，对应一个可交付物或一个独立分析阶段。\n"
+        "  - **禁止**把『读 X 文件』『调 Y 工具』这类秒级动作单独立项 — 模型实际会一轮 tool_calls 同时读多个文件，UI 上只会看到一坨同时打钩。\n"
+        "  - 经验法则：单项工作量应≥1 分钟、跨多个工具调用、有可独立产出的中间结果。整个任务通常只需要 3–7 项 todo。\n"
+        "  - ✅ 好例子：`['阅读并理解核心模块源码', '分析架构瓶颈并选定 PyO3 候选点', '撰写架构草案文档']`。\n"
+        "  - ❌ 坏例子：`['读 graph.py', '读 executor.py', '读 scheduler.py', '读 token_budget.py', ..., '写文档']`（细同质项会一次性批量打钩，违反『一项一项推进』的视觉预期）。\n"
+        "- **todo_write 实时同步规则**：完成一个里程碑后必须立即调 `todo_write`，把该项设为 `completed`、下一项设为 `in_progress`；**禁止**所有 todo 都做完后才批量更新。\n"
+        "  - 反例：3 项 todo 全程只调用了一次 todo_write，任务卡始终 0/3 转圈圈。\n"
+        "  - 正例：每完成一个里程碑（已读完一组源码 / 已写完一份草案）紧跟一次 todo_write，让进度卡 1/3 → 2/3 → 3/3 推进。\n"
         "- 简单任务：优先单子智能体，避免过度调度。\n"
         "- 中等任务：建议 2 个子智能体（并行或流水线），并明确分工。\n"
         "- 复杂任务：先拆解里程碑，再分批启动，避免同时过多并行。\n"
@@ -621,7 +681,9 @@ def build_meta_agent_system_prompt(
         "- 只有在“执行任务前的资源评估”场景才调用 `check_resources`，信息类问答不调用。\n\n"
         "- 工具调用语法必须是裸函数形式（如 `check_resources()`），禁止包裹在 `print(...)`、`<tool_code>...</tool_code>` 或其他文本模板中。\n\n"
         "- 工具执行授权禁止使用 A/B/C 文本确认；必须直接调用目标工具，由系统发出 `confirm_required` 事件。\n"
-        "- Desktop 服务模式下禁止调用不存在的 `confirm_*` 工具；`A/B/C` 不得替代工具授权确认。\n\n"
+        "- Desktop 服务模式下禁止调用不存在的 `confirm_*` 工具；`A/B/C` 不得替代工具授权确认。\n"
+        "- **方括号标签纪律**：上下文中所有形如 `[xxx]` / `[/xxx]` 的标记（如 `[compacted]`、`[session_memory]`、`[user-pending-question]`、`[user-goal-anchor]`）都是系统注入的**只读**元数据标签；**禁止你在回复正文或工具参数里模仿造一个**，更**禁止用 `[/xxx]` 形式生成闭合标签**——否则会污染后续上下文，导致整段任务被判失败。\n"
+        "- **任务主线自检（每轮必做）**：本会话每轮 LLM 请求都会注入一条 `[user-goal-anchor]` 系统消息，包含用户当前原始问题与执行纪律。你必须在调用工具或输出最终回复前，对照该 anchor 自检本轮工作是否仍直接服务原始问题；若已偏离（如重复上一轮已完成的对比/分析、或开始回答用户未问的相关问题），立即停止信息收集并直接产出最终方案。禁止以\"已经收集了大量信息\"为由输出与原始问题不对应的内容。\n\n"
         "## Skill 学习协议\n"
         "- 完成复杂任务（5+ 工具调用）后，考虑将成功方法保存为 skill（`skill_manage` action='create'）。\n"
         "- 使用 skill 过程中发现不完整/过时/错误，**立即** `skill_manage` action='patch' 更新，不要等用户要求。\n"
@@ -650,6 +712,8 @@ def build_meta_agent_system_prompt(
         "- 会话结束前，若本轮产生了重要结论或用户偏好变更，主动调用 `memory_append(target='daily', content='...')` 记录。\n"
         "- 需要回忆历史信息时，调用 `memory_search(query='...')` 查询。\n\n"
         f"{kb_retrieval_block}"
+        f"{_build_web_search_capability_block()}"
+        f"{_build_followup_questions_block()}"
         "## 子智能体完成后的主动汇报（关键）\n"
         "- 当「当前子智能体状态」或「历史子智能体结果」中出现 completed 或 failed 的子智能体，你 **必须在本轮回复中主动汇报**，包括：\n"
         "  1) 子智能体名称和任务概述。\n"
@@ -680,6 +744,7 @@ def build_meta_agent_system_prompt(
         f"{memory_recall}"
         f"{session_summary}"
         f"{taskspaces_context}"
+        f"{build_code_dev_prompt_blocks(session)}"
         "## 当前会话上下文\n"
         f"- provider: {session.provider_name or 'default'}\n"
         f"- model: {session.model_name or 'default'}\n"

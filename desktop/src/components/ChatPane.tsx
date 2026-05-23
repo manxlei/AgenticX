@@ -1,6 +1,33 @@
 import { Component, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, memo } from "react";
-import type { ErrorInfo, ReactNode, MouseEvent as ReactMouseEvent } from "react";
-import { GitBranch, GripVertical, Expand, Sparkles } from "lucide-react";
+import { createPortal } from "react-dom";
+import type { ErrorInfo, ReactNode, MouseEvent as ReactMouseEvent, CSSProperties } from "react";
+import {
+  Bookmark,
+  Check,
+  ChevronDown,
+  Copy,
+  Database,
+  GitBranch,
+  GripVertical,
+  Layers,
+  LayoutList,
+  Quote,
+  Search,
+  Share2,
+  Sparkles,
+  Radar,
+  SquarePen,
+  Wand2,
+  Wrench,
+  Users,
+  FolderOpen,
+  PhoneCall,
+  Bot,
+  History,
+  X,
+  PanelRightClose,
+  ArrowRight,
+} from "lucide-react";
 import {
   useAppStore,
   type Avatar,
@@ -12,15 +39,20 @@ import {
 } from "../store";
 import { startRecording, stopRecording } from "../voice/stt";
 import { SessionHistoryPanel } from "./SessionHistoryPanel";
+import { StickyTaskBar } from "./StickyTaskBar";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SpawnsColumn } from "./SpawnsColumn";
-import { MessageRenderer } from "./messages/MessageRenderer";
+import { MessageRenderer, renderToolMessageExtras } from "./messages/MessageRenderer";
+import { groupConsecutiveToolMessages, type GroupedChatRow } from "./messages/group-tool-messages";
+import { expandMessagesToTopLevelRows } from "./messages/react-blocks";
+import { TurnToolGroupCard } from "./messages/TurnToolGroupCard";
 import { WorkingIndicator } from "./messages/WorkingIndicator";
-import { ImBubble } from "./messages/ImBubble";
+import { ChatImAvatar, ImBubble } from "./messages/ImBubble";
+import { getAssistantActionStyle } from "./messages/im-layout";
 import { TerminalLine } from "./messages/TerminalLine";
+import { ProviderIcon } from "./ProviderIcon";
 import { CleanBlock } from "./messages/CleanBlock";
-import { QueuedMessageBubble } from "./messages/QueuedMessageBubble";
-import { ToolOutputStream } from "./messages/ToolOutputStream";
+import { MessageQueuePanel } from "./messages/MessageQueuePanel";
 import { StallRecoveryCard } from "./messages/StallRecoveryCard";
 import { ForwardPicker, type ForwardConfirmPayload } from "./ForwardPicker";
 import { HoverTip } from "./ds/HoverTip";
@@ -30,13 +62,34 @@ import { clipboardPlainTextForPaste } from "../utils/clipboard-plain-text";
 import { isKnownNonVisionChatModel } from "../utils/model-vision";
 import {
   canStopCurrentRun,
+  isDoubleEnterWithinWindow,
+  shouldEnqueueOnResend,
   shouldInterruptOnResend,
+  shouldShowSessionWorkInProgress,
+  shouldShowStopButton,
+  type SessionExecutionState,
 } from "../utils/streaming-stop-policy";
+import {
+  CHANNEL_C_GRACE_MS,
+  stallDetectSilenceMs,
+  messageLooksLikeAssistantFinal,
+  shouldAllowStallAutoNudge,
+  shouldSuppressStallDetection,
+  shouldTriggerIncompleteEndStall,
+} from "../utils/task-stall-policy";
+import {
+  continueSessionUrl,
+  inferContinueReason,
+  type ContinueReason,
+  type ContinueSource,
+} from "../utils/session-continue";
+import { mergeSessionMessagesTail } from "../utils/session-message-merge";
 import {
   attachmentsFromSessionRow,
   mapLoadedSessionMessage,
   type LoadedSessionMessage,
 } from "../utils/session-message-map";
+import { filterPersistedMessagesForDeletion } from "../utils/retry-trim-policy";
 import { favoriteStorageMessageId } from "../utils/favorite-selection";
 import { createResizeRafScheduler } from "../utils/resize-raf";
 import { avatarTintBg } from "../utils/avatar-color";
@@ -50,6 +103,7 @@ import {
 import type { AutomationTask } from "./automation/types";
 import { parseReasoningContent } from "./messages/reasoning-parser";
 import { messagePlainTextForClipboard } from "../utils/markdown-copy-format";
+import { buildCompactionNoticeText } from "../utils/context-notice";
 import { usePaneSortableHandle } from "./pane-sortable-context";
 import { FeishuBadge } from "./FeishuBadge";
 import machiEmptyState from "../assets/machi-logo-transparent.png";
@@ -57,8 +111,16 @@ import { DEFAULT_META_AVATAR_URL } from "../constants/meta-avatar";
 import { createKbApi } from "./settings/knowledge/api";
 import {
   clearPaneAwaitingFreshSession,
+  clearPaneLazyInheritParent,
+  clearPanePendingSessionMode,
   markPaneAwaitingFreshSession,
+  peekPaneLazyInheritParent,
+  peekPanePendingSessionMode,
+  setPaneLazyInheritParent,
+  setPanePendingSessionMode,
+  type PaneSessionMode,
 } from "../utils/pane-fresh-session";
+import { getRememberedSessionForAvatar } from "../utils/avatar-last-session";
 
 /** Shown in the user bubble and sent as user_input when sending attachments without typed text (API min_length=1). */
 const ATTACHMENT_ONLY_USER_PROMPT = "（见附件，请结合附件回答。）";
@@ -92,10 +154,37 @@ const KB_RETRIEVAL_MODE_OPTIONS: { value: "auto" | "always"; label: string }[] =
   { value: "auto", label: "智能检索" },
   { value: "always", label: "始终检索" },
 ];
-const CHAT_PICKER_BUTTON_CLASS =
-  "flex h-7 items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-text-subtle transition hover:bg-surface-hover hover:text-text-strong";
-const CHAT_PICKER_PANEL_CLASS =
-  "absolute bottom-full left-0 z-40 mb-1 max-h-[220px] min-w-[170px] overflow-y-auto rounded-lg border border-border bg-surface-panel shadow-2xl backdrop-blur-xl";
+
+/** 多分窗下仅看窗口宽度不可靠：按单窗格可视宽度切换到「侧栏抽屉」模式（对齐左侧主导航 overlay，不并排挤压会话区）。 */
+const CHATPANE_SIDE_OVERLAY_BREAK = 760;
+
+/** 程序化展开工作区：窄窗格时与其它侧栏互斥，避免并排挤压。 */
+function openWorkspaceSidebarForPane(
+  paneId: string,
+  paneOuterWidthPx: number,
+  openSidePanel: (paneId: string, tab: "workspace" | "members") => void,
+) {
+  const compact =
+    paneOuterWidthPx > 0 && paneOuterWidthPx < CHATPANE_SIDE_OVERLAY_BREAK;
+  if (!compact) {
+    openSidePanel(paneId, "workspace");
+    return;
+  }
+  useAppStore.setState((s) => ({
+    panes: s.panes.map((row) =>
+      row.id !== paneId
+        ? row
+        : {
+            ...row,
+            taskspacePanelOpen: true,
+            sidePanelTab: "workspace",
+            historyOpen: false,
+            membersPanelOpen: false,
+            spawnsColumnOpen: false,
+          },
+    ),
+  }));
+}
 
 const FALLBACK_PANE: ChatPaneState = {
   id: "fallback-pane",
@@ -120,32 +209,325 @@ const FALLBACK_PANE: ChatPaneState = {
   historySearchTerms: [],
 };
 
-function NewTopicIconButtons({ onNewTopic }: { onNewTopic: (inherit: boolean) => void }) {
-  const iconBtn =
-    "flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-text-faint transition hover:bg-surface-hover hover:text-text-muted";
+/** Compose-style primary action (豆包式「撰写」语义) + 下拉切换「全新对话」/「继承上下文」，默认前者。 */
+function NewTopicSplitControl({
+  onNewTopic,
+}: {
+  onNewTopic: (inherit: boolean, sessionMode?: PaneSessionMode) => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [inheritMode, setInheritMode] = useState(false);
+  const [menuPos, setMenuPos] = useState<{ bottom: number; left: number } | null>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const chevronRef = useRef<HTMLButtonElement>(null);
+
+  const openMenu = () => {
+    if (rootRef.current) {
+      const rect = rootRef.current.getBoundingClientRect();
+      setMenuPos({
+        bottom: window.innerHeight - rect.top + 4,
+        left: rect.left,
+      });
+    }
+    setMenuOpen(true);
+  };
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (rootRef.current?.contains(t)) return;
+      if (menuRef.current?.contains(t)) return;
+      setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
+
+  const panel =
+    menuOpen && menuPos
+      ? createPortal(
+          <div
+            ref={menuRef}
+            style={{ bottom: menuPos.bottom, left: menuPos.left }}
+            className="fixed z-[9999] w-[160px] overflow-hidden rounded-xl border border-border bg-surface-panel p-1.5 shadow-xl backdrop-blur-xl"
+            role="listbox"
+            aria-label="新建对话方式"
+          >
+            <button
+              type="button"
+              role="option"
+              aria-selected={!inheritMode}
+              className={`group flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors ${
+                !inheritMode ? "bg-surface-hover" : "hover:bg-surface-hover"
+              }`}
+              onClick={() => {
+                setInheritMode(false);
+                setMenuOpen(false);
+              }}
+            >
+              <SquarePen
+                className={`h-[15px] w-[15px] shrink-0 ${
+                  !inheritMode ? "text-text-strong" : "text-text-muted group-hover:text-text-standard"
+                }`}
+                strokeWidth={2}
+              />
+              <span className="flex flex-1 flex-col gap-0.5">
+                <span
+                  className={`text-[13px] font-medium leading-none ${
+                    !inheritMode ? "text-text-strong" : "text-text-standard"
+                  }`}
+                >
+                  全新对话
+                </span>
+                <span className="text-[11px] leading-none text-text-faint">不继承上下文</span>
+              </span>
+              <span className="flex w-4 shrink-0 justify-end">
+                {!inheritMode && <Check className="h-3.5 w-3.5 text-text-strong" strokeWidth={2.5} />}
+              </span>
+            </button>
+            <button
+              type="button"
+              role="option"
+              aria-selected={inheritMode}
+              className={`group mt-0.5 flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left transition-colors ${
+                inheritMode ? "bg-surface-hover" : "hover:bg-surface-hover"
+              }`}
+              onClick={() => {
+                setInheritMode(true);
+                setMenuOpen(false);
+              }}
+            >
+              <GitBranch
+                className={`h-[15px] w-[15px] shrink-0 ${
+                  inheritMode ? "text-text-strong" : "text-text-muted group-hover:text-text-standard"
+                }`}
+                strokeWidth={2}
+              />
+              <span className="flex flex-1 flex-col gap-0.5">
+                <span
+                  className={`text-[13px] font-medium leading-none ${
+                    inheritMode ? "text-text-strong" : "text-text-standard"
+                  }`}
+                >
+                  继承上下文
+                </span>
+                <span className="text-[11px] leading-none text-text-faint">携带摘要接续</span>
+              </span>
+              <span className="flex w-4 shrink-0 justify-end">
+                {inheritMode && <Check className="h-3.5 w-3.5 text-text-strong" strokeWidth={2.5} />}
+              </span>
+            </button>
+          </div>,
+          document.body
+        )
+      : null;
+
+  const baseTip = inheritMode ? "新对话 · 继承上下文（当前选项）" : "全新对话 · 不继承上下文（当前选项）";
+
   return (
-    <div className="flex shrink-0 items-center gap-0.5">
-      <HoverTip label="全新对话 · 不继承上下文">
+    <>
+      <div ref={rootRef} className="flex h-[26px] shrink-0 items-stretch overflow-hidden rounded-md bg-transparent transition-colors hover:bg-surface-hover">
+        <HoverTip label={baseTip}>
+          <button
+            type="button"
+            className="flex h-full w-7 shrink-0 items-center justify-center text-text-muted transition-colors hover:text-text-strong"
+            aria-label={inheritMode ? "新建对话：继承上下文" : "新建对话：全新对话"}
+            onClick={() => onNewTopic(inheritMode, inheritMode ? "daily_office" : "daily_office")}
+          >
+            {inheritMode ? (
+              <GitBranch className="h-[14px] w-[14px]" strokeWidth={2} aria-hidden />
+            ) : (
+              <SquarePen className="h-[14px] w-[14px]" strokeWidth={2} aria-hidden />
+            )}
+          </button>
+        </HoverTip>
+        <div className="my-1.5 w-[1px] shrink-0 self-stretch bg-border" aria-hidden />
+        <HoverTip label="切换新建方式">
+          <button
+            ref={chevronRef}
+            type="button"
+            className="flex h-full w-[18px] shrink-0 items-center justify-center text-text-muted transition-colors hover:text-text-strong"
+            aria-label="展开新建对话选项"
+            aria-expanded={menuOpen}
+            onClick={() => (menuOpen ? setMenuOpen(false) : openMenu())}
+          >
+            <ChevronDown className={`h-3 w-3 transition-transform ${menuOpen ? "rotate-180" : ""}`} strokeWidth={2.5} aria-hidden />
+          </button>
+        </HoverTip>
+      </div>
+      {panel}
+    </>
+  );
+}
+
+interface SkillItem {
+  name: string;
+  description: string;
+  icon?: string;
+  source?: string;
+  globally_disabled?: boolean;
+}
+
+interface SkillPickerButtonProps {
+  apiBase: string;
+  apiToken: string;
+  onSelect: (skill: SkillItem) => void;
+}
+
+const SKILL_DROPDOWN_WIDTH = 288; // w-72
+
+function SkillPickerButton({ apiBase, apiToken, onSelect }: SkillPickerButtonProps) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [dropdownPos, setDropdownPos] = useState<{ bottom: number; left: number } | null>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const iconBtn =
+    "flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-text-muted transition hover:bg-surface-hover hover:text-text-strong";
+
+  const fetchSkills = async () => {
+    if (!apiBase) return;
+    setLoading(true);
+    try {
+      const resp = await fetch(`${apiBase}/api/skills`, {
+        headers: { "x-agx-desktop-token": apiToken },
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as { items?: SkillItem[] };
+        const items: SkillItem[] = (data.items ?? []).filter((s) => !s.globally_disabled);
+        setSkills(items);
+      }
+    } catch {
+      // silently fail
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleOpen = async () => {
+    if (btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect();
+      // Left-align the dropdown to the button so it opens rightward, staying within the chat pane.
+      // Clamp: don't let right edge go off screen (8px margin).
+      const left = Math.min(rect.left, window.innerWidth - SKILL_DROPDOWN_WIDTH - 8);
+      setDropdownPos({
+        bottom: window.innerHeight - rect.top + 6,
+        left: Math.max(8, left),
+      });
+    }
+    setOpen(true);
+    setQuery("");
+    if (skills.length === 0) await fetchSkills();
+    setTimeout(() => searchRef.current?.focus(), 60);
+  };
+
+  const handleClose = () => {
+    setOpen(false);
+    setQuery("");
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      const target = e.target as Node;
+      const btn = btnRef.current;
+      const dropdown = document.getElementById("agx-skill-picker-dropdown");
+      if (btn && btn.contains(target)) return;
+      if (dropdown && dropdown.contains(target)) return;
+      handleClose();
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [open]);
+
+  const filtered = query.trim()
+    ? skills.filter(
+        (s) =>
+          s.name.toLowerCase().includes(query.toLowerCase()) ||
+          s.description?.toLowerCase().includes(query.toLowerCase())
+      )
+    : skills;
+
+  const dropdown =
+    open && dropdownPos
+      ? createPortal(
+          <div
+            id="agx-skill-picker-dropdown"
+            style={{ bottom: dropdownPos.bottom, left: dropdownPos.left }}
+            className="fixed z-[9999] w-72 rounded-xl border border-border bg-surface-panel shadow-xl backdrop-blur-md"
+          >
+            <div className="border-b border-border p-2">
+              <input
+                ref={searchRef}
+                type="text"
+                className="w-full rounded-lg border border-border bg-surface-card px-2.5 py-1.5 text-[12px] text-text-strong outline-none placeholder:text-text-faint focus:border-[rgba(var(--theme-color-rgb,59,130,246),0.55)]"
+                placeholder="搜索技能…"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") handleClose();
+                }}
+              />
+            </div>
+            <div className="max-h-60 overflow-y-auto p-1">
+              {loading ? (
+                <div className="px-3 py-4 text-center text-[11px] text-text-faint">加载中…</div>
+              ) : filtered.length === 0 ? (
+                <div className="px-3 py-4 text-center text-[11px] text-text-faint">
+                  {query ? `未找到"${query}"相关技能` : "暂无可用技能"}
+                </div>
+              ) : (
+                filtered.map((skill) => (
+                  <button
+                    key={skill.name}
+                    type="button"
+                    className="flex w-full items-start gap-2 rounded-lg px-2.5 py-2 text-left transition hover:bg-surface-hover"
+                    onClick={() => {
+                      onSelect(skill);
+                      handleClose();
+                    }}
+                  >
+                    <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-[rgba(var(--theme-color-rgb,59,130,246),0.22)] text-[rgb(var(--theme-color-rgb,59,130,246))]">
+                      <Wand2 className="h-3 w-3" aria-hidden />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-[12px] font-medium leading-tight text-text-strong">
+                        {skill.name}
+                      </div>
+                      {skill.description ? (
+                        <div className="mt-0.5 line-clamp-2 text-[11px] leading-snug text-text-faint">
+                          {skill.description}
+                        </div>
+                      ) : null}
+                    </div>
+                  </button>
+                ))
+              )}
+            </div>
+          </div>,
+          document.body
+        )
+      : null;
+
+  return (
+    <>
+      <HoverTip label="引用技能 · 注入 Skill 上下文">
         <button
+          ref={btnRef}
           type="button"
           className={iconBtn}
-          aria-label="全新对话，不继承上下文"
-          onClick={() => onNewTopic(false)}
+          aria-label="引用技能"
+          onClick={open ? handleClose : handleOpen}
         >
-          <Sparkles className="h-[15px] w-[15px]" strokeWidth={1.8} aria-hidden />
+          <Layers className="h-[15px] w-[15px]" strokeWidth={2} aria-hidden />
         </button>
       </HoverTip>
-      <HoverTip label="新对话 · 继承上下文（携带摘要）">
-        <button
-          type="button"
-          className={iconBtn}
-          aria-label="新对话，继承上下文"
-          onClick={() => onNewTopic(true)}
-        >
-          <GitBranch className="h-[15px] w-[15px]" strokeWidth={1.8} aria-hidden />
-        </button>
-      </HoverTip>
-    </div>
+      {dropdown}
+    </>
   );
 }
 
@@ -191,11 +573,59 @@ class HistoryPanelBoundary extends Component<
   }
 }
 
+/** Viewport-safe fixed positioning for pane bottom model pill dropdown (portal). */
+const PANE_MODEL_PICKER_MARGIN = 8;
+const PANE_MODEL_PICKER_GAP = 4;
+const PANE_MODEL_PICKER_MIN_MAX_HEIGHT = 64;
+const PANE_MODEL_PICKER_PANEL_WIDTH = 240;
+
+function paneModelPickerPanelStyle(anchor: DOMRect): CSSProperties {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const panelWidth = Math.min(PANE_MODEL_PICKER_PANEL_WIDTH, vw - PANE_MODEL_PICKER_MARGIN * 2);
+
+  let left = anchor.left;
+  if (left + panelWidth > vw - PANE_MODEL_PICKER_MARGIN) {
+    left = vw - PANE_MODEL_PICKER_MARGIN - panelWidth;
+  }
+  if (left < PANE_MODEL_PICKER_MARGIN) {
+    left = PANE_MODEL_PICKER_MARGIN;
+  }
+
+  const spaceAbove = anchor.top - PANE_MODEL_PICKER_MARGIN - PANE_MODEL_PICKER_GAP;
+  const spaceBelow = vh - anchor.bottom - PANE_MODEL_PICKER_MARGIN - PANE_MODEL_PICKER_GAP;
+  const preferAbove = spaceAbove >= 120 || spaceAbove >= spaceBelow;
+
+  if (preferAbove) {
+    const maxHeight = Math.max(PANE_MODEL_PICKER_MIN_MAX_HEIGHT, Math.floor(spaceAbove));
+    return {
+      left,
+      width: panelWidth,
+      maxHeight,
+      bottom: vh - anchor.top + PANE_MODEL_PICKER_GAP,
+      top: "auto",
+      right: "auto",
+    };
+  }
+
+  const maxHeight = Math.max(PANE_MODEL_PICKER_MIN_MAX_HEIGHT, Math.floor(spaceBelow));
+  return {
+    left,
+    width: panelWidth,
+    maxHeight,
+    top: anchor.bottom + PANE_MODEL_PICKER_GAP,
+    bottom: "auto",
+    right: "auto",
+  };
+}
+
 function PaneModelPicker({ paneId }: { paneId: string }) {
   const settings = useAppStore((s) => s.settings);
   const setPaneModel = useAppStore((s) => s.setPaneModel);
   const paneModel = useAppStore((s) => s.panes.find((pane) => pane.id === paneId));
   const [open, setOpen] = useState(false);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const [panelStyle, setPanelStyle] = useState<CSSProperties>({});
 
   const handleSelect = (provider: string, model: string) => {
     setPaneModel(paneId, provider, model);
@@ -235,51 +665,74 @@ function PaneModelPicker({ paneId }: { paneId: string }) {
     return `${provLabel}/${currentModel}`;
   }, [currentModel, currentProvider, settings.providers]);
 
+  const syncPanelPosition = useCallback(() => {
+    const el = anchorRef.current;
+    if (!el) return;
+    setPanelStyle(paneModelPickerPanelStyle(el.getBoundingClientRect()));
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) return;
+    syncPanelPosition();
+    const onReflow = () => syncPanelPosition();
+    window.addEventListener("resize", onReflow);
+    window.addEventListener("scroll", onReflow, true);
+    return () => {
+      window.removeEventListener("resize", onReflow);
+      window.removeEventListener("scroll", onReflow, true);
+    };
+  }, [open, syncPanelPosition, options.length]);
+
   return (
-    <div className="relative">
+    <div className="relative" ref={anchorRef}>
       <button
-        className={CHAT_PICKER_BUTTON_CLASS}
+        className="flex h-8 min-h-8 items-center gap-1.5 rounded px-1.5 py-0.5 text-[13px] font-normal leading-relaxed text-[color:var(--chat-im-assistant-text)] transition hover:bg-surface-hover"
         onClick={() => setOpen((v) => !v)}
         title="切换模型"
       >
+        <ProviderIcon provider={currentProvider} className="h-[13px] w-[13px] shrink-0" />
         <span className="max-w-[180px] truncate">{currentLabel}</span>
-        <span className="text-[9px]">{open ? "▴" : "▾"}</span>
+        <ChevronDown className={`h-4 w-4 shrink-0 transition-transform ${open ? "rotate-180" : ""}`} strokeWidth={2} aria-hidden />
       </button>
-      {open && (
-        <>
-          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
-          <div
-            className={`${CHAT_PICKER_PANEL_CLASS} w-[240px]`}
-          >
-            {options.length === 0 ? (
-              <div className="px-3 py-3 text-center text-xs text-text-faint">
-                请先在设置中配置模型
-              </div>
-            ) : (
-              options.map((opt) => {
-                const isActive = opt.provider === currentProvider && opt.model === currentModel;
-                return (
-                  <button
-                    key={`${opt.provider}:${opt.model}`}
-                    type="button"
-                    className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition hover:font-bold ${
-                      isActive ? "text-text-strong" : "text-text-muted"
-                    }`}
-                    onClick={() => handleSelect(opt.provider, opt.model)}
-                  >
-                    <span
-                      className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                        isActive ? "bg-emerald-500" : "bg-surface-hover"
+      {open &&
+        createPortal(
+          <>
+            <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+            <div
+              className="fixed z-40 overflow-y-auto rounded-xl border border-border bg-surface-panel p-1.5 shadow-xl backdrop-blur-xl"
+              style={panelStyle}
+            >
+              {options.length === 0 ? (
+                <div className="px-3 py-3 text-center text-[13px] font-normal leading-relaxed text-[color:var(--chat-im-assistant-text)]">
+                  请先在设置中配置模型
+                </div>
+              ) : (
+                options.map((opt) => {
+                  const isActive = opt.provider === currentProvider && opt.model === currentModel;
+                  return (
+                    <button
+                      key={`${opt.provider}:${opt.model}`}
+                      type="button"
+                      className={`group flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[13px] font-normal leading-relaxed text-[color:var(--chat-im-assistant-text)] transition-colors ${
+                        isActive ? "bg-surface-hover" : "hover:bg-surface-hover"
                       }`}
-                    />
-                    <span className="truncate">{opt.label}</span>
-                  </button>
-                );
-              })
-            )}
-          </div>
-        </>
-      )}
+                      onClick={() => handleSelect(opt.provider, opt.model)}
+                    >
+                      <span className="flex flex-1 items-center gap-2">
+                        <ProviderIcon provider={opt.provider} className="h-[13px] w-[13px] shrink-0" />
+                        <span className="min-w-0 flex-1 truncate">{opt.label}</span>
+                      </span>
+                      <span className="flex w-4 shrink-0 justify-end">
+                        {isActive && <Check className="h-[13px] w-[13px] text-[color:var(--chat-im-assistant-text)]" strokeWidth={2} />}
+                      </span>
+                    </button>
+                  );
+                })
+              )}
+            </div>
+          </>,
+          document.body,
+        )}
     </div>
   );
 }
@@ -346,22 +799,25 @@ function PaneKnowledgeRetrievalModeSwitch({
 
   return (
     <div className="relative">
-      <button
-        type="button"
-        className={CHAT_PICKER_BUTTON_CLASS}
-        disabled={saving}
-        onClick={() => setOpen((v) => !v)}
-        title="知识库检索模式"
-      >
-        <span>{KB_RETRIEVAL_MODE_OPTIONS.find((opt) => opt.value === mode)?.label ?? "智能检索"}</span>
-        <span className="text-[9px]">{open ? "▴" : "▾"}</span>
-      </button>
+      <HoverTip label={`知识库检索模式：${KB_RETRIEVAL_MODE_OPTIONS.find((opt) => opt.value === mode)?.label ?? "智能检索"}`}>
+        <button
+          type="button"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-text-muted transition hover:bg-surface-hover hover:text-text-strong"
+          disabled={saving}
+          onClick={() => setOpen((v) => !v)}
+          aria-label="知识库检索模式"
+        >
+          {mode === "auto" ? (
+            <Sparkles className="h-[15px] w-[15px]" strokeWidth={2} aria-hidden />
+          ) : (
+            <Radar className="h-[15px] w-[15px]" strokeWidth={2} aria-hidden />
+          )}
+        </button>
+      </HoverTip>
       {open && (
         <>
           <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
-          <div
-            className={CHAT_PICKER_PANEL_CLASS}
-          >
+          <div className="absolute bottom-full left-0 z-40 mb-1 w-[120px] overflow-hidden rounded-xl border border-border bg-surface-panel p-1.5 shadow-xl backdrop-blur-xl">
             {KB_RETRIEVAL_MODE_OPTIONS.map((opt) => {
               const isActive = mode === opt.value;
               return (
@@ -369,20 +825,43 @@ function PaneKnowledgeRetrievalModeSwitch({
                   key={opt.value}
                   type="button"
                   disabled={saving}
-                  className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition hover:font-bold ${
-                    isActive ? "text-text-strong" : "text-text-muted"
-                  }`}
+                  className={`group flex w-full items-center justify-between rounded-lg px-2 py-2 text-left transition-colors ${
+                    isActive ? "bg-surface-hover" : "hover:bg-surface-hover"
+                  } ${opt.value === "always" ? "mt-0.5" : ""}`}
                   onClick={() => {
                     setOpen(false);
                     void saveMode(opt.value);
                   }}
                 >
-                  <span
-                    className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                      isActive ? "bg-emerald-500" : "bg-surface-hover"
-                    }`}
-                  />
-                  <span className="truncate">{opt.label}</span>
+                  <div className="flex items-center gap-2">
+                    {opt.value === "auto" ? (
+                      <Sparkles
+                        className={`h-[15px] w-[15px] shrink-0 ${
+                          isActive ? "text-text-strong" : "text-text-muted group-hover:text-text-standard"
+                        }`}
+                        strokeWidth={2}
+                      />
+                    ) : (
+                      <Radar
+                        className={`h-[15px] w-[15px] shrink-0 ${
+                          isActive ? "text-text-strong" : "text-text-muted group-hover:text-text-standard"
+                        }`}
+                        strokeWidth={2}
+                      />
+                    )}
+                    <span
+                      className={`whitespace-nowrap text-[13px] font-medium leading-none ${
+                        isActive ? "text-text-strong" : "text-text-standard"
+                      }`}
+                    >
+                      {opt.label}
+                    </span>
+                  </div>
+                  {isActive ? (
+                    <Check className="h-3.5 w-3.5 shrink-0 text-text-strong" strokeWidth={2.5} />
+                  ) : (
+                    <div className="h-3.5 w-3.5 shrink-0" />
+                  )}
                 </button>
               );
             })}
@@ -480,7 +959,7 @@ function ActionCircleButton({ hasInput, streaming, recording, onSend, onMic, onS
   return (
     <button
       className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-full transition-all duration-150 active:scale-95 ${
-        filled ? "" : "text-text-faint hover:text-text-muted"
+        filled ? "" : "text-text-muted hover:text-text-strong"
       }`}
       style={
         filled
@@ -500,41 +979,54 @@ function AttachmentChip({ file, onRemove }: { file: AttachedFile; onRemove: () =
   const isReferenceToken = !!file.referenceToken;
   return (
     <div
-      className={`inline-flex max-w-[360px] items-center gap-2 rounded-lg border px-2 py-1 text-xs ${
+      className={`group relative inline-flex items-center gap-3 rounded-xl border px-3 py-2 text-sm transition-colors ${
         isReferenceToken
-          ? "border-sky-500/40 bg-sky-500/15 text-sky-100"
-          : "border-border bg-surface-panel text-text-muted"
+          ? "border-sky-500/40 bg-sky-500/10 text-sky-100"
+          : "border-border bg-surface-card hover:bg-surface-hover"
       }`}
+      style={{ maxWidth: "240px" }}
     >
       {isImage && file.dataUrl ? (
-        <img src={file.dataUrl} alt={file.name} className="h-8 w-8 shrink-0 rounded object-cover" />
+        <img src={file.dataUrl} alt={file.name} className="h-10 w-10 shrink-0 rounded-lg object-cover" />
       ) : isReferenceToken ? (
-        <span className="text-sm">↘</span>
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-sky-500/20 text-sky-400">
+          <span className="text-lg">↘</span>
+        </div>
       ) : (
-        <span className="text-sm text-text-faint">{file.status === "error" ? "⚠️" : "📄"}</span>
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-[#3b82f6] text-white">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="h-5 w-5">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4" />
+          </svg>
+        </div>
       )}
-      <div className="min-w-0">
-        <div className={`truncate ${isReferenceToken ? "text-sky-100" : "text-text-muted"}`}>{file.name}</div>
+      <div className="flex min-w-0 flex-col justify-center">
+        <div className={`truncate font-medium leading-tight ${isReferenceToken ? "text-sky-100" : "text-text-primary"}`}>
+          {file.name}
+        </div>
         {isReferenceToken ? (
-          <div className="text-[10px] text-sky-200/80">@ 文件引用</div>
+          <div className="text-xs text-sky-200/80 mt-0.5">@ 文件引用</div>
         ) : file.status === "parsing" ? (
-          <div className="text-[10px] text-text-faint animate-pulse">解析中...</div>
+          <div className="text-xs text-text-faint animate-pulse mt-0.5">解析中...</div>
         ) : file.status === "error" ? (
-          <div className="text-[10px] text-status-error">{file.errorText || "解析失败"}</div>
+          <div className="truncate text-xs text-status-error mt-0.5">{file.errorText || "解析失败"}</div>
         ) : (
-          <div className="text-[10px] text-text-faint">{formatFileSize(file.size)}</div>
+          <div className="text-xs text-text-faint mt-0.5">
+            {file.name.includes('.') ? file.name.split('.').pop()?.toUpperCase() : '文件'} · {formatFileSize(file.size)}
+          </div>
         )}
       </div>
       <button
-        className={`shrink-0 rounded px-1 transition ${
+        className={`absolute right-2 top-2 flex h-5 w-5 items-center justify-center rounded-full opacity-0 transition-opacity group-hover:opacity-100 ${
           isReferenceToken
-            ? "text-sky-200/80 hover:bg-sky-500/20 hover:text-sky-100"
-            : "text-text-faint hover:bg-surface-hover hover:text-text-muted"
+            ? "bg-sky-500/20 text-sky-200 hover:bg-sky-500/40 hover:text-sky-100"
+            : "bg-surface-panel text-text-muted hover:bg-surface-hover hover:text-text-primary"
         }`}
         onClick={onRemove}
         title="移除附件"
       >
-        ✕
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="h-3 w-3">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+        </svg>
       </button>
     </div>
   );
@@ -584,6 +1076,9 @@ function isNearBottom(el: HTMLDivElement, thresholdPx = 96): boolean {
 function formatToolResultMessage(toolNameRaw: unknown, resultRaw: unknown): { content: string; silent: boolean } {
   const toolName = String(toolNameRaw ?? "tool");
   const resultText = String(resultRaw ?? "");
+  if (toolName === "check_resources") {
+    return { content: "", silent: true };
+  }
   if (toolName === "delegate_to_avatar") {
     try {
       const parsed = JSON.parse(resultText) as Record<string, unknown>;
@@ -752,6 +1247,32 @@ function formatToolResultMessage(toolNameRaw: unknown, resultRaw: unknown): { co
   return { content: `✅ ${toolName} 结果: ${compact}`, silent: false };
 }
 
+function deriveToolStatusFromResult(resultRaw: unknown): "done" | "error" {
+  const t =
+    typeof resultRaw === "string"
+      ? resultRaw
+      : (() => {
+          try {
+            return JSON.stringify(resultRaw ?? "");
+          } catch {
+            return String(resultRaw ?? "");
+          }
+        })();
+  if (/^\s*ERROR:/i.test(t)) return "error";
+  const m = t.match(/exit_code=(\d+)/);
+  if (m && m[1] !== "0") return "error";
+  return "done";
+}
+
+function serializeToolResultRaw(resultRaw: unknown): string {
+  if (typeof resultRaw === "string") return resultRaw;
+  try {
+    return JSON.stringify(resultRaw ?? "", null, 2);
+  } catch {
+    return String(resultRaw ?? "");
+  }
+}
+
 function isSetTaskspaceToolSuccess(resultRaw: unknown): boolean {
   if (resultRaw && typeof resultRaw === "object") {
     return (resultRaw as { ok?: unknown }).ok === true;
@@ -803,6 +1324,8 @@ type AttachedFile = {
   errorText?: string;
   sourcePath?: string;
   referenceToken?: boolean;
+  /** @工作区别名：输入框 @提及文案与 chip 用短名，附件标题仍用 `name`（如 @dir:…） */
+  composerRefLabel?: string;
 };
 
 function isImageFile(file: File): boolean {
@@ -836,6 +1359,34 @@ function formatFileSize(size: number): string {
   if (size < 1024) return `${size}B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)}KB`;
   return `${(size / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+/** Match composer attachment to parsed contextFiles row for /api/chat context_files body. */
+function resolveReadyAttachment(
+  file: MessageAttachment,
+  readyTuples: [string, AttachedFile][]
+): AttachedFile | undefined {
+  const byAlias = new Map<string, AttachedFile>();
+  for (const [stateKey, rec] of readyTuples) {
+    byAlias.set(stateKey, rec);
+    const sp = String(rec.sourcePath || "").trim();
+    if (sp) byAlias.set(sp, rec);
+    const nm = String(rec.name || "").trim();
+    if (nm) byAlias.set(nm, rec);
+  }
+  const keys = [file.sourcePath, file.name].map((k) => String(k || "").trim()).filter(Boolean);
+  for (const k of keys) {
+    const hit = byAlias.get(k);
+    if (hit) return hit;
+  }
+  for (const [, rec] of readyTuples) {
+    if (file.sourcePath && rec.sourcePath === file.sourcePath) return rec;
+    if (file.name && rec.name === file.name && file.size === rec.size) return rec;
+  }
+  for (const [, rec] of readyTuples) {
+    if (file.name && rec.name === file.name) return rec;
+  }
+  return undefined;
 }
 
 type AtCandidate =
@@ -1052,13 +1603,11 @@ const GroupMembersSidePanel = memo(function GroupMembersSidePanel({
           {onClose && (
             <button
               type="button"
-              className="shrink-0 rounded px-1.5 py-1.5 text-text-faint transition hover:bg-surface-hover hover:text-text-strong"
+              className="shrink-0 rounded p-1 text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
               onClick={onClose}
               title="关闭成员面板"
             >
-              <svg width="10" height="10" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M3 8H13" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/>
-              </svg>
+              <PanelRightClose className="h-[18px] w-[18px]" strokeWidth={1.8} />
             </button>
           )}
         </div>
@@ -1344,16 +1893,26 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const setActivePaneId = useAppStore((s) => s.setActivePaneId);
   const togglePaneHistory = useAppStore((s) => s.togglePaneHistory);
   const cycleSidePanel = useAppStore((s) => s.cycleSidePanel);
+  const toggleFocusMode = useAppStore((s) => s.toggleFocusMode);
   const openSidePanel = useAppStore((s) => s.openSidePanel);
   const addPaneTerminalTab = useAppStore((s) => s.addPaneTerminalTab);
   const setActiveTaskspace = useAppStore((s) => s.setActiveTaskspace);
   const addPaneMessage = useAppStore((s) => s.addPaneMessage);
+  const updatePaneMessageByToolCallId = useAppStore((s) => s.updatePaneMessageByToolCallId);
   const clearPaneMessages = useAppStore((s) => s.clearPaneMessages);
   const setPaneSessionId = useAppStore((s) => s.setPaneSessionId);
+  const setPaneSessionMode = useAppStore((s) => s.setPaneSessionMode);
   const setPaneMessages = useAppStore((s) => s.setPaneMessages);
   const setActiveAvatarId = useAppStore((s) => s.setActiveAvatarId);
   const setPaneContextInherited = useAppStore((s) => s.setPaneContextInherited);
+  const toolRoundCount = useMemo(
+    () => (pane.messages ?? []).filter((m) => m.role === "tool" && (m.toolName ?? "").trim()).length,
+    [pane.messages]
+  );
+  const toolRoundBudget = 60;
   const queuedMessages = useAppStore((s) => s.pendingMessages[paneId] ?? EMPTY_QUEUE);
+  const enqueuePaneMessage = useAppStore((s) => s.enqueuePaneMessage);
+  const takePendingMessage = useAppStore((s) => s.takePendingMessage);
   const removePendingMessage = useAppStore((s) => s.removePendingMessage);
   const editPendingMessage = useAppStore((s) => s.editPendingMessage);
   const setSpawnsColumnOpen = useAppStore((s) => s.setSpawnsColumnOpen);
@@ -1363,19 +1922,15 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const apiToken = useAppStore((s) => s.apiToken);
   const storeActiveProvider = useAppStore((s) => s.activeProvider);
   const storeActiveModel = useAppStore((s) => s.activeModel);
+  const settings = useAppStore((s) => s.settings);
+  const setPaneModel = useAppStore((s) => s.setPaneModel);
+  const setForwardAutoReply = useAppStore((s) => s.setForwardAutoReply);
   const { chatProvider, chatModel } = useMemo(() => {
     const pp = (pane?.modelProvider ?? "").trim();
     const pm = (pane?.modelName ?? "").trim();
     if (pp && pm) return { chatProvider: pp, chatModel: pm };
     return { chatProvider: storeActiveProvider, chatModel: storeActiveModel };
   }, [pane?.modelProvider, pane?.modelName, storeActiveProvider, storeActiveModel]);
-  const providerEntryForModelChip = useAppStore((s) =>
-    chatProvider ? s.settings.providers[chatProvider] : undefined,
-  );
-  const chatProviderDisplay = useMemo(
-    () => getProviderDisplayName(chatProvider, providerEntryForModelChip),
-    [chatProvider, providerEntryForModelChip],
-  );
   const selectedSubAgent = useAppStore((s) => s.selectedSubAgent);
   const setSelectedSubAgent = useAppStore((s) => s.setSelectedSubAgent);
   const addSubAgent = useAppStore((s) => s.addSubAgent);
@@ -1389,11 +1944,15 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const chatStyle = useAppStore((s) => s.chatStyle);
   const userNickname = useAppStore((s) => s.userNickname);
   const userPreference = useAppStore((s) => s.userPreference);
-  const focusMode = useAppStore((s) => s.focusMode);
-  const exitFocusMode = useAppStore((s) => s.exitFocusMode);
   const userBubbleLabel = useMemo(() => userNickname.trim() || "我", [userNickname]);
   const isGroupPane = Boolean(pane?.avatarId?.startsWith("group:"));
+  /** 元智能体窗格：顶栏已展示当前模型，气泡内不再重复展示模型徽章 */
+  const isMachiMetaPane = pane.avatarId === null;
   const isAutomationTaskPane = isAutomationPaneAvatarId(pane?.avatarId);
+  /** 单聊分身：对话区不展示「厂商/模型」徽章（人设对话而非调试底层模型）；群聊与定时自动化保留 */
+  const isDedicatedAvatarPane =
+    Boolean(pane?.avatarId) && !isGroupPane && !isAutomationTaskPane;
+  const showInlineAssistantModelBadge = !isMachiMetaPane && !isDedicatedAvatarPane;
   const groupChatId = isGroupPane && pane?.avatarId ? pane.avatarId.slice("group:".length) : "";
   const activeGroup = useMemo(
     () => (isGroupPane ? groups.find((g) => g.id === groupChatId) : undefined),
@@ -1428,6 +1987,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const [recording, setRecording] = useState(false);
   const [streamedAssistantText, setStreamedAssistantText] = useState("");
   const [streamingSessionId, setStreamingSessionId] = useState("");
+  const [runGuardSessionId, setRunGuardSessionId] = useState("");
   const [streamingModel, setStreamingModel] = useState<{ provider: string; model: string } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const sessionAbortControllersRef = useRef<Record<string, AbortController>>({});
@@ -1438,14 +1998,40 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const streamCommittedRef = useRef(false);
   /** Text last committed at a tool_call boundary; avoids duplicating the same assistant bubble at stream end. */
   const lastMidStreamAssistantCommitRef = useRef<string | null>(null);
-  const [toolOutputLines, setToolOutputLines] = useState<string[]>([]);
   const [stallState, setStallState] = useState<"none" | "stall" | "exhausted">("none");
+  const [stoppingSessionId, setStoppingSessionId] = useState("");
   const [exhaustedRounds, setExhaustedRounds] = useState<{ rounds: number; maxRounds: number } | null>(null);
+  const [sessionExecutionState, setSessionExecutionState] = useState<SessionExecutionState>("idle");
+  const prevExecutionStateRef = useRef<SessionExecutionState>("idle");
+  const [stallTick, setStallTick] = useState(0);
+  const [bgCompleteToast, setBgCompleteToast] = useState(false);
+  const [stallHintToast, setStallHintToast] = useState("");
+  const [autoNudgeCount, setAutoNudgeCount] = useState(0);
+  const autoNudgeTriggeredRef = useRef<Record<string, number>>({});
+  const autoNudgeBucketRef = useRef<Record<string, number>>({});
+  /** User clicked stop — do not re-show stall card until the next send/continue. */
+  const userStoppedSessionRef = useRef<Record<string, boolean>>({});
+  const stopInFlightRef = useRef<Record<string, boolean>>({});
+  const interruptNoticeSentRef = useRef<Record<string, boolean>>({});
+  const [lastToolProgress, setLastToolProgress] = useState<{ name: string; sec: number } | null>(null);
+  const [stallRuntimeConfig, setStallRuntimeConfig] = useState({
+    stall_detect_silence_seconds: 90,
+    stall_auto_nudge_enabled: false,
+    stall_auto_nudge_after_seconds: 120,
+    stall_auto_nudge_max_per_session: 2,
+  });
+  const [unattendedGlobalEnabled, setUnattendedGlobalEnabled] = useState(false);
+  const [unattendedMaxContinuations, setUnattendedMaxContinuations] = useState(20);
+  const [sessionUnattended, setSessionUnattended] = useState(false);
   const lastSseEventAtRef = useRef(0);
+  const lastProgressAtRef = useRef(0);
+  const sessionEnteredAtRef = useRef<Record<string, number>>({});
   const deferredSessionMessagesRef = useRef<Record<string, Array<Parameters<typeof addPaneMessage>>>>({});
+  const lastComposerEnterAtRef = useRef(0);
   const streamRafRef = useRef<number | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const autoScrollPinnedRef = useRef(true);
+  const [showJumpToBottomFab, setShowJumpToBottomFab] = useState(false);
   const imeComposingRef = useRef(false);
   const [atOpen, setAtOpen] = useState(false);
   const [atQuery, setAtQuery] = useState("");
@@ -1469,8 +2055,6 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   /** Last resolved bridge session mode (cc_bridge_start), not global Settings radio. */
   const ccBridgeLastSessionModeRef = useRef<CcBridgeSessionModeHint>("");
   const [wechatDesktopBound, setWechatDesktopBound] = useState(false);
-  /** Meta/分身窗格「新对话 · 继承上下文」时，首条发送前再 createSession 并带上此 id。 */
-  const pendingInheritFromSessionIdRef = useRef<string | null>(null);
   const [automationTaskErrorHint, setAutomationTaskErrorHint] = useState<string | null>(null);
   const composerRef = useRef<HTMLDivElement | null>(null);
   const [composerExpanded, setComposerExpanded] = useState(false);
@@ -1504,6 +2088,16 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     }
     return 300;
   });
+  const [historyWidth, setHistoryWidth] = useState(() => {
+    try {
+      const raw = window.localStorage.getItem("agx-history-width-v1");
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    } catch {
+      // ignore
+    }
+    return 220;
+  });
   const paneRef = useRef<HTMLDivElement | null>(null);
   const [paneWidth, setPaneWidth] = useState(0);
 
@@ -1516,7 +2110,92 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       }),
     [isGroupPane, pane?.messages]
   );
-  const focusComposerOnly = focusMode && visibleMessages.length === 0;
+  const groupedVisibleMessages = useMemo(
+    () => groupConsecutiveToolMessages(visibleMessages),
+    [visibleMessages]
+  );
+  const isStreamingCurrentSession =
+    streaming &&
+    !isGroupPane &&
+    !!streamingSessionId &&
+    streamingSessionId === (pane.sessionId || "").trim();
+  const streamTextForCurrentSession = isStreamingCurrentSession ? (streamedAssistantText || "") : "";
+  /** Mid-turn commit can persist assistant text while SSE keeps streaming the same body — hide __stream__ so we don't show two identical bubbles (store still has correct count). */
+  const hideStreamOverlayAsDuplicate = useMemo(() => {
+    if (!isStreamingCurrentSession) return false;
+    const t = streamTextForCurrentSession.trim();
+    if (!t) return false;
+    for (let i = visibleMessages.length - 1; i >= 0; i--) {
+      const m = visibleMessages[i];
+      if (m.role === "user") break;
+      if (m.role === "assistant" && (!m.agentId || m.agentId === "meta")) {
+        return String(m.content ?? "").trim() === t;
+      }
+    }
+    return false;
+  }, [isStreamingCurrentSession, streamTextForCurrentSession, visibleMessages]);
+  const useReActImLayout = !isGroupPane && chatStyle === "im";
+  const visibleMessagesWithStream = useMemo(() => {
+    if (useReActImLayout && isStreamingCurrentSession && !hideStreamOverlayAsDuplicate) {
+      return [
+        ...visibleMessages,
+        {
+          id: "__stream__",
+          role: "assistant",
+          content: streamTextForCurrentSession,
+          provider: streamingModel?.provider,
+          model: streamingModel?.model,
+        } as Message,
+      ];
+    }
+    return visibleMessages;
+  }, [
+    useReActImLayout,
+    visibleMessages,
+    isStreamingCurrentSession,
+    hideStreamOverlayAsDuplicate,
+    streamTextForCurrentSession,
+    streamingModel,
+  ]);
+
+  const topLevelRowsIm = useMemo(
+    () => (useReActImLayout ? expandMessagesToTopLevelRows(visibleMessagesWithStream) : null),
+    [useReActImLayout, visibleMessagesWithStream]
+  );
+  const flushJumpToBottomFab = useCallback(() => {
+    const el = listRef.current;
+    if (!el) {
+      setShowJumpToBottomFab(false);
+      return;
+    }
+    autoScrollPinnedRef.current = isNearBottom(el);
+    const overflow = el.scrollHeight > el.clientHeight + 4;
+    setShowJumpToBottomFab(overflow && !isNearBottom(el));
+  }, []);
+
+  /** 灵巧模式退出后主界面 ChatPane remount，`flushJumpToBottomFab` 会在 scrollTop=0 时误判 unpinned；此处强制滚底一次。 */
+  const focusExitScrollTarget = useAppStore((s) =>
+    s.focusExitScrollBottomPaneId === paneId ? paneId : null
+  );
+  useLayoutEffect(() => {
+    if (!focusExitScrollTarget) return;
+    autoScrollPinnedRef.current = true;
+    const el = listRef.current;
+    if (el) {
+      el.scrollTop = el.scrollHeight;
+    }
+    useAppStore.getState().clearFocusExitScrollBottomPaneId();
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        autoScrollPinnedRef.current = true;
+        const inner = listRef.current;
+        if (inner) {
+          inner.scrollTop = inner.scrollHeight;
+        }
+        flushJumpToBottomFab();
+      });
+    });
+  }, [focusExitScrollTarget, flushJumpToBottomFab]);
 
   useEffect(() => {
     if (!isAutomationTaskPane || !pane?.avatarId?.startsWith("automation:")) {
@@ -1578,7 +2257,6 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     wechatDesktopBound && primaryPaneForSessionId === pane.id && !isAutomationTaskPane;
 
   useEffect(() => {
-    if (focusMode) return;
     if (paneSubAgents.length === 0) {
       if (pane.spawnsColumnOpen) setSpawnsColumnOpen(pane.id, false);
       return;
@@ -1602,7 +2280,6 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     pane.spawnsColumnBaselineIds,
     paneSubAgentIdsKey,
     paneSubAgents.length,
-    focusMode,
     clearSpawnsColumnSuppress,
     setSpawnsColumnOpen,
   ]);
@@ -1862,21 +2539,25 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   useEffect(() => {
     const el = listRef.current;
     if (!el) return;
-    const updatePinned = () => {
-      autoScrollPinnedRef.current = isNearBottom(el);
+    const onScrollOrResize = () => flushJumpToBottomFab();
+    flushJumpToBottomFab();
+    el.addEventListener("scroll", onScrollOrResize, { passive: true });
+    const ro = new ResizeObserver(onScrollOrResize);
+    ro.observe(el);
+    return () => {
+      el.removeEventListener("scroll", onScrollOrResize);
+      ro.disconnect();
     };
-    updatePinned();
-    el.addEventListener("scroll", updatePinned, { passive: true });
-    return () => el.removeEventListener("scroll", updatePinned);
-  }, [paneId]);
+  }, [paneId, flushJumpToBottomFab]);
 
   useEffect(() => {
     requestAnimationFrame(() => {
       if (listRef.current && autoScrollPinnedRef.current) {
         listRef.current.scrollTop = listRef.current.scrollHeight;
       }
+      flushJumpToBottomFab();
     });
-  }, [visibleMessages, streamedAssistantText]);
+  }, [visibleMessages, streamedAssistantText, flushJumpToBottomFab]);
 
   const highlightJumpKeyRef = useRef<string>("");
   useEffect(() => {
@@ -1969,6 +2650,22 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     }
   };
 
+  /** Studio taskspace APIs require an existing session_id; lazy new-topic clears pane.sessionId until first send.
+   * For read-only browsing (e.g. `@` mentions, file preview), fall back to the most recently
+   * remembered session for this avatar so the user can still browse the same content the
+   * WorkspacePanel keeps showing while awaiting a fresh session. */
+  const resolveTaskspaceApiSessionId = (): string => {
+    const sid = (pane.sessionId || "").trim();
+    if (sid) return sid;
+    if (!isGroupPane && !isAutomationTaskPane) {
+      const lazy = String(peekPaneLazyInheritParent(pane.id) ?? "").trim();
+      if (lazy) return lazy;
+      const remembered = String(getRememberedSessionForAvatar(pane.avatarId) ?? "").trim();
+      if (remembered) return remembered;
+    }
+    return "";
+  };
+
   const searchAtCandidates = async (queryText: string) => {
     const lowered = queryText.trim().toLowerCase();
     const avatarCandidates: AtCandidate[] = isGroupPane
@@ -1983,11 +2680,12 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           }))
       : [];
 
-    if (!pane.sessionId) {
+    const apiSessionId = resolveTaskspaceApiSessionId();
+    if (!apiSessionId) {
       setAtCandidates(avatarCandidates.slice(0, 24));
       return;
     }
-    const wsResp = await window.agenticxDesktop.listTaskspaces(pane.sessionId);
+    const wsResp = await window.agenticxDesktop.listTaskspaces(apiSessionId);
     if (!wsResp.ok || !Array.isArray(wsResp.workspaces) || wsResp.workspaces.length === 0) {
       setAtCandidates(avatarCandidates.slice(0, 24));
       return;
@@ -1997,7 +2695,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       : wsResp.workspaces[0].id;
     if (!pane.activeTaskspaceId) setActiveTaskspace(pane.id, activeId);
     const rootResp = await window.agenticxDesktop.listTaskspaceFiles({
-      sessionId: pane.sessionId,
+      sessionId: apiSessionId,
       taskspaceId: activeId,
       path: ".",
     });
@@ -2023,7 +2721,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         current === "."
           ? rootResp
           : await window.agenticxDesktop.listTaskspaceFiles({
-              sessionId: pane.sessionId,
+              sessionId: apiSessionId,
               taskspaceId: activeId,
               path: current,
             });
@@ -2055,7 +2753,6 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
 
   const triggerCcBridgeVisibleTerminal = useCallback(
     async (toolCallKey: string) => {
-      if (focusMode) return;
       if (!pane.sessionId) return;
       const now = Date.now();
       const last = ccBridgeVisibleLaunchGuardRef.current.get(toolCallKey) ?? 0;
@@ -2080,7 +2777,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         setActiveTaskspace(pane.id, activeWorkspace.id);
       }
 
-      openSidePanel(pane.id, "workspace");
+      openWorkspaceSidebarForPane(pane.id, paneRef.current?.clientWidth ?? paneWidth, openSidePanel);
       addPaneTerminalTab(pane.id, activeWorkspace.path, "cc-bridge");
 
       let bridgeUrl = "http://127.0.0.1:9742";
@@ -2139,16 +2836,15 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       pane.activeTaskspaceId,
       apiBase,
       apiToken,
-      focusMode,
       setActiveTaskspace,
       openSidePanel,
       addPaneTerminalTab,
+      paneWidth,
     ]
   );
 
   const triggerCcBridgeTailTerminal = useCallback(
     async (sessionId: string) => {
-      if (focusMode) return;
       const sid = sessionId.trim();
       if (!/^[0-9a-fA-F-]{36}$/.test(sid) || !pane.sessionId) return;
       const now = Date.now();
@@ -2163,7 +2859,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           ? wsResp.workspaces.find((item) => item.id === pane.activeTaskspaceId)
           : undefined) ?? wsResp.workspaces[0];
       if (!activeWorkspace?.path) return;
-      openSidePanel(pane.id, "workspace");
+      openWorkspaceSidebarForPane(pane.id, paneRef.current?.clientWidth ?? paneWidth, openSidePanel);
 
       let bridgeUrl = "http://127.0.0.1:9742";
       let bridgeToken = "";
@@ -2212,7 +2908,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         await sleep(180);
       }
     },
-    [pane.id, pane.sessionId, pane.activeTaskspaceId, apiBase, apiToken, focusMode, openSidePanel, addPaneTerminalTab]
+    [pane.id, pane.sessionId, pane.activeTaskspaceId, apiBase, apiToken, openSidePanel, addPaneTerminalTab, paneWidth]
   );
 
   const updateAtStateFromText = useCallback(
@@ -2241,6 +2937,12 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       const name = String(node.dataset.refName || node.textContent || "").trim();
       node.textContent = name ? `@${name}` : "";
     }
+    // Serialize skill tokens as "@skill://name"
+    const skillNodes = clone.querySelectorAll<HTMLElement>("[data-skill-token='1']");
+    for (const node of skillNodes) {
+      const name = String(node.dataset.skillName || "").trim();
+      node.textContent = name ? `@skill://${name}` : "";
+    }
     return (clone.innerText || "").replace(/\u00a0/g, " ");
   }, []);
 
@@ -2263,8 +2965,34 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     token.setAttribute("data-ref-token", "1");
     token.setAttribute("data-ref-name", name);
     token.className =
-      "mx-0.5 inline-flex items-center rounded-md border border-[#6a9dff90] bg-[#244766cc] px-1.5 py-0.5 align-baseline text-[12px] font-medium leading-[1.2] text-[#e6f0ff]";
-    token.textContent = name;
+      "agx-composer-inline-chip mx-0.5 inline-flex max-w-[min(100%,280px)] items-center gap-1 rounded-md px-1.5 py-0.5 align-baseline text-[12px] font-medium leading-[1.2]";
+    const icon = document.createElement("span");
+    icon.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:12px;height:12px;display:inline-block;vertical-align:middle;opacity:0.8"><path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/></svg>';
+    token.appendChild(icon);
+    const label = document.createElement("span");
+    label.className = "min-w-0 truncate";
+    label.textContent = name;
+    token.appendChild(label);
+    return token;
+  }, []);
+
+  const createSkillRefToken = useCallback((name: string) => {
+    const token = document.createElement("span");
+    token.setAttribute("contenteditable", "false");
+    token.setAttribute("data-skill-token", "1");
+    token.setAttribute("data-skill-name", name);
+    token.className =
+      "agx-composer-inline-chip mx-0.5 inline-flex max-w-[min(100%,280px)] items-center gap-1 rounded-md px-1.5 py-0.5 align-baseline text-[12px] font-medium leading-[1.2]";
+    // wrench SVG icon + name
+    const icon = document.createElement("span");
+    icon.innerHTML =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px;display:inline-block;vertical-align:middle;opacity:0.8"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>';
+    token.appendChild(icon);
+    const label = document.createElement("span");
+    label.className = "min-w-0 truncate";
+    label.textContent = name;
+    token.appendChild(label);
     return token;
   }, []);
 
@@ -2279,6 +3007,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       const tokenNames = new Set<string>();
       for (const [, file] of Object.entries(contextFiles)) {
         if (file.referenceToken && file.name) tokenNames.add(file.name);
+        if (file.composerRefLabel) tokenNames.add(file.composerRefLabel);
       }
       for (const name of options?.tokenNames ?? []) {
         if (name) tokenNames.add(name);
@@ -2294,6 +3023,21 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           continue;
         }
         const rest = value.slice(cursor + 1);
+        // 与 extractComposerText 序列化一致：重建 skill 胶囊，避免仅重建 @file 时把 skill 降级成纯文本
+        if (rest.startsWith("skill://")) {
+          const afterPrefix = rest.slice("skill://".length);
+          const skillMatch = afterPrefix.match(/^([^\s@,，。！？\n]+)/);
+          if (skillMatch) {
+            const slug = skillMatch[1];
+            if (textBuffer) {
+              el.appendChild(document.createTextNode(textBuffer));
+              textBuffer = "";
+            }
+            el.appendChild(createSkillRefToken(slug));
+            cursor += 1 + "skill://".length + slug.length;
+            continue;
+          }
+        }
         const matched = tokenNamesByLength.find((name) => {
           if (!rest.startsWith(name)) return false;
           const tail = rest.slice(name.length, name.length + 1);
@@ -2318,7 +3062,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       updateAtStateFromText(value);
       focusComposerEnd();
     },
-    [contextFiles, createFileRefToken, focusComposerEnd, updateAtStateFromText]
+    [contextFiles, createFileRefToken, createSkillRefToken, focusComposerEnd, updateAtStateFromText]
   );
 
   const addContextFile = async (
@@ -2326,9 +3070,10 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     relPath: string,
     options?: { referenceToken?: boolean }
   ): Promise<string | null> => {
-    if (!pane.sessionId || !relPath) return null;
+    const apiSessionId = resolveTaskspaceApiSessionId();
+    if (!apiSessionId || !relPath) return null;
     const fileResp = await window.agenticxDesktop.readTaskspaceFile({
-      sessionId: pane.sessionId,
+      sessionId: apiSessionId,
       taskspaceId,
       path: relPath,
     });
@@ -2351,7 +3096,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   };
 
   const addTaskspaceAliasReference = async (taskspaceId: string, alias: string, absolutePath: string) => {
-    if (!pane.sessionId) return;
+    const apiSessionId = resolveTaskspaceApiSessionId();
+    if (!apiSessionId) return;
     const queue: string[] = ["."];
     const visited = new Set<string>();
     const lines: string[] = [];
@@ -2362,7 +3108,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       if (visited.has(current)) continue;
       visited.add(current);
       const listResp = await window.agenticxDesktop.listTaskspaceFiles({
-        sessionId: pane.sessionId,
+        sessionId: apiSessionId,
         taskspaceId,
         path: current,
       });
@@ -2397,6 +3143,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         mimeType: "text/plain",
         status: "ready",
         content,
+        composerRefLabel: alias,
+        referenceToken: true,
       },
     }));
   };
@@ -2413,9 +3161,18 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     });
     if (result.ok && result.workspace?.id) {
       setActiveTaskspace(pane.id, result.workspace.id);
-      if (!pane.taskspacePanelOpen) openSidePanel(pane.id, "workspace");
+      if (!pane.taskspacePanelOpen) {
+        openWorkspaceSidebarForPane(pane.id, paneRef.current?.clientWidth ?? paneWidth, openSidePanel);
+      }
     }
-  }, [pane.id, pane.sessionId, pane.taskspacePanelOpen, setActiveTaskspace, openSidePanel]);
+  }, [
+    pane.id,
+    pane.sessionId,
+    pane.taskspacePanelOpen,
+    setActiveTaskspace,
+    openSidePanel,
+    paneWidth,
+  ]);
 
   const copyMessage = useCallback(async (message: Message) => {
     const textToCopy = messagePlainTextForClipboard(message);
@@ -2438,6 +3195,33 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         ]);
         return;
       }
+      await navigator.clipboard.writeText(textToCopy);
+    } catch {
+      // ignore clipboard failures
+    }
+  }, []);
+
+  /** Copy the full content of a ReAct block: assistant text, reasoning, and tool call results. */
+  const copyReActBlock = useCallback(async (messages: Message[]) => {
+    const parts: string[] = [];
+    for (const msg of messages) {
+      if (msg.id === "__stream__") continue;
+      if (msg.role === "assistant") {
+        const text = messagePlainTextForClipboard(msg);
+        if (text.trim()) parts.push(text.trim());
+      } else if (msg.role === "tool") {
+        const name = msg.toolName || "tool";
+        const result = (msg.content || "").trim();
+        if (result) {
+          parts.push(`[${name}]\n${result}`);
+        } else if (name !== "tool") {
+          parts.push(`[${name}]`);
+        }
+      }
+    }
+    const textToCopy = parts.join("\n\n");
+    if (!textToCopy) return;
+    try {
       await navigator.clipboard.writeText(textToCopy);
     } catch {
       // ignore clipboard failures
@@ -2477,8 +3261,41 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const toggleSelectMessage = useCallback((message: Message) => {
     setSelectedMessageIds((prev) => {
       const next = new Set(prev);
-      if (next.has(message.id)) next.delete(message.id);
-      else next.add(message.id);
+      const linkedIds = new Set<string>([message.id]);
+      // In IM ReAct layout, selecting a user message should also toggle its following assistant/tool block.
+      if (useReActImLayout && topLevelRowsIm && message.role === "user") {
+        for (let i = 0; i < topLevelRowsIm.length; i++) {
+          const row = topLevelRowsIm[i];
+          if (row.kind === "user" && row.message.id === message.id) {
+            const nextRow = topLevelRowsIm[i + 1];
+            if (nextRow && nextRow.kind === "react") {
+              for (const m of nextRow.block.workMessages) linkedIds.add(m.id);
+              if (nextRow.block.finalAssistant) linkedIds.add(nextRow.block.finalAssistant.id);
+            }
+            break;
+          }
+        }
+      }
+      const allSelected = Array.from(linkedIds).every((id) => next.has(id));
+      if (allSelected) {
+        for (const id of linkedIds) next.delete(id);
+      } else {
+        for (const id of linkedIds) next.add(id);
+      }
+      return next;
+    });
+  }, [topLevelRowsIm, useReActImLayout]);
+
+  /** Toggle the entire ReAct block: if any message in the block is selected, deselect all; otherwise select all. */
+  const toggleSelectBlock = useCallback((messages: Message[]) => {
+    setSelectedMessageIds((prev) => {
+      const anySelected = messages.some((m) => prev.has(m.id));
+      const next = new Set(prev);
+      if (anySelected) {
+        for (const m of messages) next.delete(m.id);
+      } else {
+        for (const m of messages) next.add(m.id);
+      }
       return next;
     });
   }, []);
@@ -2756,40 +3573,218 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     }
   }, [apiBase, apiToken, pane.id, pane.messages, pane.sessionId, selectedMessages, setPaneMessages]);
 
-  const retryUserMessage = useCallback((msg: Message) => {
-    if (msg.role !== "user") return;
-    void sendChatRef.current(msg.content, { retryAttachments: msg.attachments ?? [] });
-  }, []);
+  const retryUserMessage = useCallback(
+    async (msg: Message) => {
+      if (msg.role !== "user") return;
+      const sid = (pane.sessionId || "").trim();
+      if (!sid || !apiBase) return;
+      const msgs = pane.messages ?? [];
+      const idx = msgs.findIndex((m) => m.id === msg.id);
+      if (idx < 0) return;
+      let end = idx + 1;
+      while (end < msgs.length && msgs[end].role !== "user") {
+        end++;
+      }
+      const toRemove = msgs.slice(idx + 1, end);
+      if (toRemove.length > 0) {
+        try {
+          let deletable: Array<Pick<Message, "role" | "content" | "timestamp" | "agentId">> = toRemove;
+          const persisted = await window.agenticxDesktop.loadSessionMessages(sid);
+          if (persisted.ok && Array.isArray(persisted.messages)) {
+            deletable = filterPersistedMessagesForDeletion(
+              toRemove,
+              persisted.messages as LoadedSessionMessage[]
+            );
+          }
+          if (deletable.length > 0) {
+            const resp = await fetch(`${apiBase}/api/session/messages/delete`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+              body: JSON.stringify({
+                session_id: sid,
+                messages: deletable.map((m) => ({
+                  role: m.role,
+                  content: m.content,
+                  timestamp: m.timestamp,
+                  agent_id: m.agentId,
+                })),
+              }),
+            });
+            const data = (await resp.json()) as { ok?: boolean; removed?: number; requested?: number };
+            const removed = typeof data.removed === "number" ? data.removed : 0;
+            const requested = typeof data.requested === "number" ? data.requested : deletable.length;
+            if (!resp.ok || !data.ok || removed < requested) {
+              const result = await window.agenticxDesktop.loadSessionMessages(sid);
+              if (result.ok && Array.isArray(result.messages)) {
+                const mapped = result.messages.map((item, midx) =>
+                  mapLoadedSessionMessage(item as LoadedSessionMessage, sid, midx)
+                );
+                setPaneMessages(pane.id, mapped);
+              }
+              return;
+            }
+          }
+          setPaneMessages(pane.id, msgs.slice(0, idx + 1));
+        } catch (err) {
+          console.error("[ChatPane] retry trim messages failed:", err);
+          return;
+        }
+      }
+      await sendChatRef.current(msg.content, {
+        retryAttachments: msg.attachments ?? [],
+        suppressUserEcho: true,
+        skipUserHistory: true,
+      });
+    },
+    [apiBase, apiToken, pane.id, pane.messages, pane.sessionId, setPaneMessages]
+  );
 
-  const isStreamingCurrentSession =
-    streaming &&
-    !isGroupPane &&
-    !!streamingSessionId &&
-    streamingSessionId === (pane.sessionId || "").trim();
+  const editUserMessage = useCallback(
+    async (msg: Message, newContent: string) => {
+      if (msg.role !== "user") return;
+      const sid = (pane.sessionId || "").trim();
+      if (!sid || !apiBase) return;
+      const msgs = pane.messages ?? [];
+      const idx = msgs.findIndex((m) => m.id === msg.id);
+      if (idx < 0) return;
+      const toRemove = msgs.slice(idx);
+      if (toRemove.length > 0) {
+        try {
+          let deletable: Array<Pick<Message, "role" | "content" | "timestamp" | "agentId">> = toRemove;
+          const persisted = await window.agenticxDesktop.loadSessionMessages(sid);
+          if (persisted.ok && Array.isArray(persisted.messages)) {
+            deletable = filterPersistedMessagesForDeletion(
+              toRemove,
+              persisted.messages as LoadedSessionMessage[]
+            );
+          }
+          if (deletable.length > 0) {
+            const resp = await fetch(`${apiBase}/api/session/messages/delete`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+              body: JSON.stringify({
+                session_id: sid,
+                messages: deletable.map((m) => ({
+                  role: m.role,
+                  content: m.content,
+                  timestamp: m.timestamp,
+                  agent_id: m.agentId,
+                })),
+              }),
+            });
+            const data = (await resp.json()) as { ok?: boolean; removed?: number; requested?: number };
+            const removed = typeof data.removed === "number" ? data.removed : 0;
+            const requested = typeof data.requested === "number" ? data.requested : deletable.length;
+            if (!resp.ok || !data.ok || removed < requested) {
+              const result = await window.agenticxDesktop.loadSessionMessages(sid);
+              if (result.ok && Array.isArray(result.messages)) {
+                const mapped = result.messages.map((item, midx) =>
+                  mapLoadedSessionMessage(item as LoadedSessionMessage, sid, midx)
+                );
+                setPaneMessages(pane.id, mapped);
+              }
+              return;
+            }
+          }
+          setPaneMessages(pane.id, msgs.slice(0, idx));
+        } catch (err) {
+          console.error("[ChatPane] edit trim messages failed:", err);
+          return;
+        }
+      }
+      await sendChatRef.current(newContent, {
+        retryAttachments: msg.attachments ?? [],
+      });
+    },
+    [apiBase, apiToken, pane.id, pane.messages, pane.sessionId, setPaneMessages]
+  );
+
   // Group chats also have a real streaming run in flight; only the
   // assistant-text overlay is gated by !isGroupPane (group chats render
-  // per-member typing bubbles instead). The stop button + barge-in resend
+  // per-member typing bubbles instead). The stop button + queued follow-ups
   // judgment must work in both modes.
   const canInterruptCurrentSession = canStopCurrentRun({
     streaming,
     streamingSessionId,
     currentSessionId: pane.sessionId || "",
   });
-  const streamTextForCurrentSession = isStreamingCurrentSession ? (streamedAssistantText || "") : "";
-  /** Mid-turn commit can persist assistant text while SSE keeps streaming the same body — hide __stream__ so we don't show two identical bubbles (store still has correct count). */
-  const hideStreamOverlayAsDuplicate = useMemo(() => {
-    if (!isStreamingCurrentSession) return false;
-    const t = streamTextForCurrentSession.trim();
-    if (!t) return false;
-    for (let i = visibleMessages.length - 1; i >= 0; i--) {
-      const m = visibleMessages[i];
-      if (m.role === "user") break;
-      if (m.role === "assistant" && (!m.agentId || m.agentId === "meta")) {
-        return String(m.content ?? "").trim() === t;
+  const isRunGuardCurrentSession =
+    !canInterruptCurrentSession &&
+    !!pane.sessionId &&
+    runGuardSessionId === (pane.sessionId || "").trim();
+
+  const sessionWorkInProgress = useMemo(() => {
+    const sid = (pane.sessionId || "").trim();
+    return shouldShowSessionWorkInProgress({
+      isStreamingCurrentSession,
+      executionState: sessionExecutionState,
+      stallState,
+      sessionUnattended,
+      unattendedGlobalEnabled,
+      userStopped: sid ? Boolean(userStoppedSessionRef.current[sid]) : false,
+      messages: pane.messages ?? [],
+      isGroupPane,
+    });
+  }, [
+    isGroupPane,
+    isStreamingCurrentSession,
+    pane.messages,
+    pane.sessionId,
+    sessionExecutionState,
+    sessionUnattended,
+    stallState,
+    stallTick,
+    unattendedGlobalEnabled,
+  ]);
+
+  const showStopButton = shouldShowStopButton({
+    streaming,
+    streamingSessionId,
+    currentSessionId: pane.sessionId || "",
+    executionState: sessionExecutionState,
+    runGuardSessionId,
+    hasDelegation,
+    isGroupPane,
+    sessionWorkInProgress,
+  });
+
+  const stallModelOptions = useMemo(() => {
+    const result: { provider: string; model: string; label: string }[] = [];
+    for (const [provName, entry] of Object.entries(settings.providers)) {
+      if (entry.enabled === false) continue;
+      if (!entry.apiKey) continue;
+      const provLabel = getProviderDisplayName(provName, entry);
+      if (entry.models.length > 0) {
+        for (const m of entry.models) {
+          result.push({ provider: provName, model: m, label: `${provLabel}/${m}` });
+        }
+      } else if (entry.model) {
+        result.push({ provider: provName, model: entry.model, label: `${provLabel}/${entry.model}` });
       }
     }
-    return false;
-  }, [isStreamingCurrentSession, streamTextForCurrentSession, visibleMessages]);
+    return result;
+  }, [settings.providers]);
+
+  const currentModelLabel = useMemo(() => {
+    if (!chatModel) return "未选模型";
+    if (!chatProvider) return chatModel;
+    const entry = settings.providers[chatProvider];
+    return `${getProviderDisplayName(chatProvider, entry)}/${chatModel}`;
+  }, [chatModel, chatProvider, settings.providers]);
+
+  const silentSeconds = useMemo(() => {
+    void stallTick;
+    const t = lastProgressAtRef.current;
+    if (!t) return 0;
+    return Math.floor((Date.now() - t) / 1000);
+  }, [stallTick, stallState, sessionExecutionState]);
+
+  const taskLiveness = useMemo((): "active" | "stalled" | "idle" => {
+    if (stallState === "stall") return "stalled";
+    if (sessionWorkInProgress) return "active";
+    if (sessionExecutionState === "running") return "active";
+    return "idle";
+  }, [sessionWorkInProgress, stallState, sessionExecutionState]);
 
   const syncStreamingUiForCurrentSession = useCallback(() => {
     const sid = (pane.sessionId || "").trim();
@@ -2826,82 +3821,417 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     syncStreamingUiForCurrentSession();
   }, [syncStreamingUiForCurrentSession]);
 
-  const stopCurrentRun = useCallback(() => {
+  const recordProgressActivity = useCallback(() => {
+    const now = Date.now();
+    lastProgressAtRef.current = now;
+    lastSseEventAtRef.current = now;
+    setStallState((prev) => (prev === "stall" ? "none" : prev));
+  }, []);
+
+  /** 任一 SSE 帧视为仍有响应：刷新计时并在曾误判 stall 时立即收起提示 */
+  const recordSseActivity = useCallback(() => {
+    recordProgressActivity();
+  }, [recordProgressActivity]);
+
+  useEffect(() => {
+    void window.agenticxDesktop.loadRuntimeConfig().then((r) => {
+      if (!r?.ok) return;
+      const cfg = r as {
+        stall_detect_silence_seconds?: number;
+        stall_auto_nudge_enabled?: boolean;
+        stall_auto_nudge_after_seconds?: number;
+        stall_auto_nudge_max_per_session?: number;
+        unattended_enabled?: boolean;
+        unattended_max_continuations_per_session?: number;
+      };
+      const detectSec = Math.max(
+        30,
+        Math.min(300, Number(cfg.stall_detect_silence_seconds ?? 90) || 90),
+      );
+      setStallRuntimeConfig({
+        stall_detect_silence_seconds: detectSec,
+        stall_auto_nudge_enabled: Boolean(cfg.stall_auto_nudge_enabled),
+        stall_auto_nudge_after_seconds: Math.max(
+          60,
+          Math.min(300, Number(cfg.stall_auto_nudge_after_seconds ?? 120) || 120)
+        ),
+        stall_auto_nudge_max_per_session: Math.max(
+          1,
+          Math.min(5, Number(cfg.stall_auto_nudge_max_per_session ?? 2) || 2)
+        ),
+      });
+      setUnattendedGlobalEnabled(Boolean(cfg.unattended_enabled));
+      setUnattendedMaxContinuations(
+        Math.max(1, Math.min(100, Number(cfg.unattended_max_continuations_per_session ?? 20) || 20))
+      );
+    });
+  }, []);
+
+  useEffect(() => {
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) {
+      setSessionUnattended(false);
+      return;
+    }
+    try {
+      const raw = localStorage.getItem("agx-session-unattended-v1");
+      const map = raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+      setSessionUnattended(Boolean(map[sid]));
+    } catch {
+      setSessionUnattended(false);
+    }
+  }, [pane.sessionId]);
+
+  const toggleSessionUnattended = useCallback(async () => {
+    const sid = (pane.sessionId || "").trim();
+    if (!sid || !apiBase) return;
+    const next = !sessionUnattended;
+    try {
+      await fetch(`${apiBase.replace(/\/$/, "")}/api/sessions/${encodeURIComponent(sid)}/unattended`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+        body: JSON.stringify({ enabled: next }),
+      });
+      const raw = localStorage.getItem("agx-session-unattended-v1");
+      const map = raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+      if (next) map[sid] = true;
+      else delete map[sid];
+      localStorage.setItem("agx-session-unattended-v1", JSON.stringify(map));
+      setSessionUnattended(next);
+    } catch {
+      setStallHintToast("无人值守开关保存失败");
+    }
+  }, [apiBase, apiToken, pane.sessionId, sessionUnattended]);
+
+  useEffect(() => {
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) return;
+    sessionEnteredAtRef.current[sid] = Date.now();
+    setAutoNudgeCount(autoNudgeTriggeredRef.current[sid] ?? 0);
+    void window.agenticxDesktop.listSessions(pane.avatarId ?? undefined).then((r) => {
+      if (!r.ok) return;
+      const row = (r.sessions ?? []).find((s) => s.session_id === sid);
+      const st = (row?.execution_state ?? "idle") as SessionExecutionState;
+      setSessionExecutionState(st);
+      prevExecutionStateRef.current = st;
+    });
+  }, [pane.sessionId, pane.avatarId]);
+
+  useEffect(() => {
+    if ((pane.messages ?? []).length > 0) {
+      recordProgressActivity();
+    }
+  }, [pane.messages?.length, recordProgressActivity]);
+
+  const mergeTailFromDisk = useCallback(
+    async (sid: string) => {
+      try {
+        const msgs = await window.agenticxDesktop.loadSessionMessages(sid);
+        if (!msgs.ok || !Array.isArray(msgs.messages)) return;
+        const current = useAppStore.getState().panes.find((p) => p.id === pane.id)?.messages ?? [];
+        const merged = mergeSessionMessagesTail(
+          current,
+          msgs.messages as LoadedSessionMessage[],
+          sid
+        );
+        setPaneMessages(pane.id, merged);
+        recordProgressActivity();
+      } catch {
+        /* best effort */
+      }
+    },
+    [pane.id, recordProgressActivity, setPaneMessages]
+  );
+
+  const stopCurrentRun = useCallback(async () => {
     const sid = (streamingSessionId || pane.sessionId || "").trim();
     if (!sid) return;
-    void window.agenticxDesktop.interruptSession?.(sid);
+    if (stopInFlightRef.current[sid]) return;
+
+    stopInFlightRef.current[sid] = true;
+    setStoppingSessionId(sid);
+    userStoppedSessionRef.current[sid] = true;
+    setRunGuardSessionId(sid);
+    setStallState("none");
+
     const st = sessionStreamStateRef.current[sid];
     if (st) {
       st.text = "⏹ 正在中断...";
+      st.active = false;
       sessionStreamStateRef.current[sid] = st;
     }
     abortRef.current?.abort();
     if ((pane.sessionId || "").trim() === sid) {
       setStreamedAssistantText("⏹ 正在中断...");
+      setStreaming(false);
+      setStreamingSessionId("");
     }
-    addPaneMessage(pane.id, "tool", "已发送中断请求", "meta");
-    setStallState("none");
+
+    try {
+      const r = await window.agenticxDesktop.interruptSession?.(sid);
+      if (r?.ok) {
+        setSessionExecutionState("interrupted");
+        setStallState("none");
+        if (!interruptNoticeSentRef.current[sid]) {
+          interruptNoticeSentRef.current[sid] = true;
+          addPaneMessage(pane.id, "tool", "已中断任务", "meta");
+        }
+      } else {
+        userStoppedSessionRef.current[sid] = false;
+        setRunGuardSessionId("");
+        addPaneMessage(
+          pane.id,
+          "tool",
+          `⚠️ 中断失败：${r?.error ?? "未知错误"}`,
+          "meta"
+        );
+      }
+    } catch (err) {
+      userStoppedSessionRef.current[sid] = false;
+      setRunGuardSessionId("");
+      addPaneMessage(pane.id, "tool", `⚠️ 中断失败：${String(err)}`, "meta");
+    } finally {
+      stopInFlightRef.current[sid] = false;
+      setStoppingSessionId((current) => (current === sid ? "" : current));
+    }
   }, [addPaneMessage, pane.id, pane.sessionId, streamingSessionId]);
 
   useEffect(() => {
-    if (!isStreamingCurrentSession) {
-      setStallState((prev) => prev === "stall" ? "stall" : "none");
-      return;
-    }
-    const STALL_THRESHOLD_MS = 20_000;
-    const timer = window.setInterval(() => {
-      const lastAt = lastSseEventAtRef.current;
-      if (lastAt > 0 && Date.now() - lastAt > STALL_THRESHOLD_MS) {
-        setStallState("stall");
-      }
-    }, 3000);
-    return () => window.clearInterval(timer);
-  }, [isStreamingCurrentSession]);
-
-  useEffect(() => {
-    if (isStreamingCurrentSession || !pane.sessionId) return;
-    if (stallState !== "stall" && stallState !== "exhausted") return;
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) return;
     let cancelled = false;
-    const poll = async () => {
+
+    const evaluate = async () => {
+      if (stallState === "exhausted") return;
+      const sseActive = Boolean(sessionStreamStateRef.current[sid]?.active);
+      const lastProgress = lastProgressAtRef.current;
+      const now = Date.now();
+      const silentMs = lastProgress > 0 ? now - lastProgress : 0;
+
+      let execState: SessionExecutionState = sessionExecutionState;
       try {
         const r = await window.agenticxDesktop.listSessions(pane.avatarId ?? undefined);
         if (cancelled || !r.ok) return;
-        const row = (r.sessions ?? []).find((s) => s.session_id === pane.sessionId);
-        if (row && row.execution_state === "idle") {
-          setStallState("none");
-          addPaneMessage(pane.id, "tool", "后台任务已完成", "meta");
-          try {
-            const msgs = await window.agenticxDesktop.loadSessionMessages(pane.sessionId);
-            if (!cancelled && msgs.ok && Array.isArray(msgs.messages)) {
-              // Do not overwrite - messages already in memory are richer than disk
-            }
-          } catch { /* best effort */ }
+        const row = (r.sessions ?? []).find((s) => s.session_id === sid);
+        if (row?.execution_state) {
+          execState = row.execution_state as SessionExecutionState;
+          const prev = prevExecutionStateRef.current;
+          if (prev === "running" && execState === "idle" && runGuardSessionId !== sid) {
+            setBgCompleteToast(true);
+            addPaneMessage(pane.id, "tool", "后台任务已完成", "meta");
+            await mergeTailFromDisk(sid);
+          }
+          prevExecutionStateRef.current = execState;
+          setSessionExecutionState(execState);
+          if (execState === "idle" && runGuardSessionId === sid) {
+            setRunGuardSessionId("");
+          }
         }
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
+
+      const msgs = useAppStore.getState().panes.find((p) => p.id === pane.id)?.messages ?? [];
+      const lastMsg = msgs[msgs.length - 1];
+      const enteredAt = sessionEnteredAtRef.current[sid] ?? now;
+      const graceMs = now - enteredAt;
+
+      const userStopped = Boolean(userStoppedSessionRef.current[sid]);
+      if (shouldSuppressStallDetection(runGuardSessionId, sid, userStopped)) {
+        setStallState("none");
+        if (execState === "interrupted" || execState === "idle") {
+          setRunGuardSessionId("");
+        }
+        return;
+      }
+
+      const stallSilenceMs = stallDetectSilenceMs(stallRuntimeConfig.stall_detect_silence_seconds);
+      const channelA = sseActive && lastProgress > 0 && silentMs >= stallSilenceMs;
+      const channelB =
+        !sseActive &&
+        execState === "running" &&
+        lastProgress > 0 &&
+        silentMs >= stallSilenceMs;
+      const channelC =
+        graceMs >= CHANNEL_C_GRACE_MS &&
+        shouldTriggerIncompleteEndStall(execState, sseActive, lastMsg, CHANNEL_C_GRACE_MS);
+
+      if (channelA || channelB || channelC) {
+        setStallState("stall");
+        return;
+      }
+
+      if (stallState === "stall") {
+        const recovered =
+          execState === "idle" && messageLooksLikeAssistantFinal(lastMsg);
+        const progressOk = silentMs < stallSilenceMs;
+        if (recovered || (progressOk && (sseActive || execState !== "running"))) {
+          setStallState("none");
+        }
+      }
     };
-    void poll();
-    const timer = window.setInterval(poll, 3000);
-    return () => { cancelled = true; window.clearInterval(timer); };
-  }, [isStreamingCurrentSession, stallState, pane.sessionId, pane.avatarId, pane.id, addPaneMessage]);
 
-  const resumeCurrentTask = useCallback(() => {
+    void evaluate();
+    const shouldPollFast =
+      sessionExecutionState === "running" ||
+      stallState === "stall" ||
+      stallState === "exhausted" ||
+      runGuardSessionId === sid;
+    const intervalMs = shouldPollFast ? 2000 : 8000;
+    const timer = window.setInterval(() => {
+      setStallTick((t) => t + 1);
+      void evaluate();
+    }, intervalMs);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [
+    addPaneMessage,
+    mergeTailFromDisk,
+    pane.avatarId,
+    pane.id,
+    pane.sessionId,
+    runGuardSessionId,
+    sessionExecutionState,
+    stallRuntimeConfig.stall_detect_silence_seconds,
+    stallState,
+  ]);
+
+  useEffect(() => {
+    if (!stallRuntimeConfig.stall_auto_nudge_enabled) return;
+    if (!shouldAllowStallAutoNudge(stallState, sessionExecutionState)) return;
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) return;
+    if (silentSeconds < stallRuntimeConfig.stall_auto_nudge_after_seconds) return;
+    const count = autoNudgeTriggeredRef.current[sid] ?? 0;
+    if (count >= stallRuntimeConfig.stall_auto_nudge_max_per_session) return;
+    const bucket = Math.floor(
+      silentSeconds / Math.max(1, stallRuntimeConfig.stall_auto_nudge_after_seconds)
+    );
+    if ((autoNudgeBucketRef.current[sid] ?? -1) >= bucket) return;
+    autoNudgeBucketRef.current[sid] = bucket;
+    autoNudgeTriggeredRef.current[sid] = count + 1;
+    setAutoNudgeCount(count + 1);
+    const reason: ContinueReason =
+      sessionExecutionState === "interrupted"
+        ? "interrupted"
+        : stallState === "exhausted"
+          ? "exhausted"
+          : "stall";
+    void sendChatRef.current("", {
+      continuation: { reason, source: "desktop_auto_nudge" },
+    });
+  }, [
+    pane.id,
+    pane.sessionId,
+    sessionExecutionState,
+    silentSeconds,
+    stallRuntimeConfig,
+    stallState,
+  ]);
+
+  useEffect(() => {
+    if (!bgCompleteToast) return;
+    const t = window.setTimeout(() => setBgCompleteToast(false), 3000);
+    return () => window.clearTimeout(t);
+  }, [bgCompleteToast]);
+
+  useEffect(() => {
+    if (!stallHintToast) return;
+    const t = window.setTimeout(() => setStallHintToast(""), 2800);
+    return () => window.clearTimeout(t);
+  }, [stallHintToast]);
+
+  const resumeCurrentTask = useCallback(async () => {
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) return;
+    delete userStoppedSessionRef.current[sid];
+    let state: SessionExecutionState = sessionExecutionState;
+    try {
+      const r = await window.agenticxDesktop.listSessions(pane.avatarId ?? undefined);
+      if (r.ok) {
+        const row = (r.sessions ?? []).find((s) => s.session_id === sid);
+        state = (row?.execution_state ?? "idle") as SessionExecutionState;
+        setSessionExecutionState(state);
+      }
+    } catch {
+      /* ignore */
+    }
+
+    if (state === "running") {
+      setStallHintToast("任务仍在后台执行中，可继续等待或主动中断");
+      return;
+    }
+
     setStallState("none");
-    const prompt = stallState === "exhausted"
-      ? "继续执行，从上次停止的地方接续。"
-      : "请汇报之前任务的执行结果，如果任务未完成请继续执行。";
-    void sendChatRef.current(prompt);
-  }, [stallState]);
+    const reason = inferContinueReason({
+      stallState,
+      executionState: state,
+    });
+    void sendChatRef.current("", {
+      continuation: { reason, source: "desktop_manual" },
+    });
+  }, [pane.avatarId, pane.sessionId, sessionExecutionState, stallState]);
 
-  const renderedMessages = useMemo(() => (
-    <>
-      {visibleMessages.map((message) => {
+  const resumeWithModel = useCallback(
+    async (provider: string, model: string) => {
+      setPaneModel(pane.id, provider, model);
+      void window.agenticxDesktop.saveConfig({ activeProvider: provider, activeModel: model });
+      const sid = (pane.sessionId || "").trim();
+      if (sid) {
+        void window.agenticxDesktop.setSessionModel({ sessionId: sid, provider, model });
+      }
+      await resumeCurrentTask();
+    },
+    [pane.id, pane.sessionId, resumeCurrentTask, setPaneModel]
+  );
+
+  const sendFollowupChip = useCallback((text: string) => {
+    const t = String(text || "").trim();
+    if (!t) return;
+    void sendChatRef.current(t);
+  }, []);
+
+  const sendQueuedMessageNow = useCallback(
+    (msgId: string) => {
+      const item = takePendingMessage(paneId, msgId);
+      if (!item) return;
+      void sendChatRef.current(item.text, {
+        retryAttachments: item.attachments,
+        forceSend: true,
+      });
+    },
+    [paneId, takePendingMessage]
+  );
+
+  const renderedMessages = useMemo(() => {
+    const reactActionStyle = getAssistantActionStyle({ inReActRow: true });
+    const renderGroupedRow = (
+      row: GroupedChatRow,
+      rowIdx: number,
+      opts: {
+        reactWorkColumn?: boolean;
+        reactFlat?: boolean;
+        reactHideBadge?: boolean;
+        reactShowActions?: boolean;
+        omitSuggestedQuestions?: boolean;
+      }
+    ) => {
+      const reactCol = opts.reactWorkColumn ?? false;
+      const reactFlat = opts.reactFlat ?? false;
+      const reactHideBadge = opts.reactHideBadge ?? false;
+      const reactShowActions = opts.reactShowActions ?? false;
+      const omitSuggestedQuestions = opts.omitSuggestedQuestions ?? false;
+      if (row.kind === "message") {
+        const message = row.message;
         const canRetryThisUserMessage = message.role === "user" && !isStreamingCurrentSession;
         const isSelecting = selectedMessageIds.size > 0;
+        const rowSelectable = isSelecting && !reactCol;
         const isSelected = selectedMessageIds.has(message.id);
         return (
           <div key={message.id} className="group/sel relative">
-            {/* 「↓ 选择到这里」按钮：多选模式 + 未选中时显示 */}
-            {isSelecting && !isSelected && (
+            {rowSelectable && !isSelected && (
               <button
                 type="button"
                 className="absolute -top-1 left-0 z-10 flex items-center gap-1 rounded-full border border-border bg-surface-card px-2 py-0.5 text-[10px] text-text-muted shadow-sm opacity-0 transition-opacity group-hover/sel:opacity-100 hover:!opacity-100 hover:bg-surface-hover hover:text-text-strong"
@@ -2913,7 +4243,18 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             <MessageRenderer
               message={message}
               highlightTerms={pane.historySearchTerms}
-              assistantBadge={message.role === "assistant" ? <ModelBadge provider={message.provider} model={message.model} /> : undefined}
+              assistantBadge={
+                message.role === "assistant" && !reactHideBadge && showInlineAssistantModelBadge ? (
+                  <ModelBadge provider={message.provider} model={message.model} />
+                ) : undefined
+              }
+              imAssistantVisual={
+                message.role === "assistant" && reactCol
+                  ? reactShowActions ? "compact-inline-with-actions" : "compact-inline"
+                  : "default"
+              }
+              noBubbleBorder={reactFlat}
+              toolCardOmitLeadingSpacer={message.role === "tool" && reactCol}
               onRevealPath={(path) => void revealFileInTaskspace(path)}
               assistantName={paneAvatarMeta.name}
               assistantAvatarUrl={paneAvatarMeta.url}
@@ -2926,14 +4267,258 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               onFavoriteMessage={favoriteMessage}
               onForwardMessage={forwardOneMessage}
               onRetryMessage={canRetryThisUserMessage ? retryUserMessage : undefined}
+              onEditMessage={canRetryThisUserMessage ? editUserMessage : undefined}
               onToggleSelectMessage={toggleSelectMessage}
               onResolveInlineConfirm={(confirm, approved) => void resolveGroupInlineConfirm(confirm, approved)}
-              selectable={isSelecting}
-              selected={isSelected}
+              selectable={rowSelectable}
+              selected={rowSelectable && isSelected}
+              onFollowupClick={sendFollowupChip}
+              omitSuggestedQuestions={omitSuggestedQuestions}
             />
           </div>
         );
-      })}
+      }
+      const groupKey = `tg-${row.messages[0]?.id ?? rowIdx}`;
+      const isSelecting = selectedMessageIds.size > 0;
+      const groupSelectable = isSelecting && !reactCol;
+      const anySelected = row.messages.some((m) => selectedMessageIds.has(m.id));
+      const anchorMessage = row.messages[row.messages.length - 1];
+      return (
+        <div key={groupKey} className="group/sel relative">
+          {groupSelectable && !anySelected && (
+            <button
+              type="button"
+              className="absolute -top-1 left-0 z-10 flex items-center gap-1 rounded-full border border-border bg-surface-card px-2 py-0.5 text-[10px] text-text-muted shadow-sm opacity-0 transition-opacity group-hover/sel:opacity-100 hover:!opacity-100 hover:bg-surface-hover hover:text-text-strong"
+              onClick={() => selectUpTo(anchorMessage)}
+            >
+              ↓ 选择到这里
+            </button>
+          )}
+          <TurnToolGroupCard
+            messages={row.messages}
+            highlightTerms={pane.historySearchTerms}
+            renderExtras={(m) =>
+              renderToolMessageExtras(m, {
+                onRevealPath: (p) => void revealFileInTaskspace(p),
+                onResolveInlineConfirm: (c, a) => void resolveGroupInlineConfirm(c, a),
+              })
+            }
+            selectable={groupSelectable}
+            selectedIds={selectedMessageIds}
+            onToggleSelectMessage={toggleSelectMessage}
+            omitLeadingSpacer={reactCol}
+            flat={reactFlat}
+          />
+        </div>
+      );
+    };
+
+    const mainRows =
+      topLevelRowsIm !== null
+        ? topLevelRowsIm.map((seg, segIdx) => {
+            if (seg.kind === "user") {
+              return renderGroupedRow({ kind: "message", message: seg.message }, segIdx, {});
+            }
+            const { workMessages, finalAssistant } = seg.block;
+            const groupedWork = groupConsecutiveToolMessages(workMessages);
+            const blockKey = `react-${workMessages[0]?.id ?? segIdx}-${finalAssistant?.id ?? ""}`;
+            const hasTools = groupedWork.some(
+              (r) => r.kind === "tool_group" || (r.kind === "message" && r.message.role === "tool")
+            );
+            const hasStreamingRow = groupedWork.some(
+              (r) => r.kind === "message" && r.message.role === "assistant" && r.message.id === "__stream__"
+            );
+            const useUnifiedReActCard = hasTools || hasStreamingRow;
+            const isSelecting = selectedMessageIds.size > 0;
+            const blockAnySelected = workMessages.some((m) => selectedMessageIds.has(m.id));
+            const lastAssistantInBlock = [...workMessages].reverse().find(
+              (m) => m.role === "assistant" && m.id !== "__stream__"
+            ) ?? null;
+            let peeledFollowupAssistant: Message | null = null;
+            if (useUnifiedReActCard) {
+              for (const m of workMessages) {
+                if (
+                  m.role === "assistant" &&
+                  m.id !== "__stream__" &&
+                  m.suggestedQuestions &&
+                  m.suggestedQuestions.length > 0
+                ) {
+                  peeledFollowupAssistant = m;
+                }
+              }
+            }
+            return (
+              <div key={blockKey} className="space-y-2">
+                <div className="flex min-w-0 items-start gap-2">
+                  {isSelecting ? (
+                    <button
+                      type="button"
+                      className={`mt-2 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition ${
+                        blockAnySelected
+                          ? "border-[rgb(var(--theme-color-rgb,6,182,212))] bg-[rgb(var(--theme-color-rgb,6,182,212))] text-white"
+                          : "border-text-faint bg-transparent text-transparent"
+                      }`}
+                      onClick={() => toggleSelectBlock(workMessages)}
+                      aria-label={blockAnySelected ? "取消选择回复块" : "选择回复块"}
+                    >
+                      <svg viewBox="0 0 16 16" className="h-3 w-3" fill="none" stroke="currentColor" strokeWidth="2">
+                        <path d="M3.5 8.5L6.5 11.5L12.5 4.5" />
+                      </svg>
+                    </button>
+                  ) : null}
+                  {useUnifiedReActCard ? (
+                    <div
+                      className="min-w-0 flex-1 overflow-hidden"
+                    >
+                      {groupedWork.map((r, i) => {
+                        const omitSq =
+                          Boolean(
+                            peeledFollowupAssistant &&
+                              r.kind === "message" &&
+                              r.message.role === "assistant" &&
+                              r.message.id === peeledFollowupAssistant.id
+                          );
+                        return renderGroupedRow(r, i, {
+                          reactWorkColumn: true,
+                          reactFlat: true,
+                          reactHideBadge: i > 0,
+                          omitSuggestedQuestions: omitSq,
+                        });
+                      })}
+                    </div>
+                  ) : (
+                    <div className="flex min-w-0 flex-1 flex-col gap-2">
+                      {groupedWork.map((r, i) => renderGroupedRow(r, i, { reactWorkColumn: true, reactShowActions: true }))}
+                    </div>
+                  )}
+                </div>
+                {useUnifiedReActCard &&
+                hasStreamingRow &&
+                peeledFollowupAssistant?.suggestedQuestions &&
+                peeledFollowupAssistant.suggestedQuestions.length > 0 ? (
+                  <div className="mb-4 flex min-w-0 items-start gap-2">
+                    {isSelecting ? <div className="h-5 w-5 shrink-0" aria-hidden /> : null}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 flex-col items-start gap-1.5" style={reactActionStyle}>
+                        {peeledFollowupAssistant.suggestedQuestions.slice(0, 3).map((q, qi) => (
+                          <button
+                            key={`${qi}-${q}`}
+                            type="button"
+                            className="group flex max-w-full w-fit items-center gap-2 rounded-full border border-border bg-surface-hover/80 px-3.5 py-1.5 text-left text-[14px] text-text-subtle transition hover:bg-surface-hover hover:text-text-strong whitespace-normal"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={() => sendFollowupChip(q)}
+                          >
+                            <span>{q}</span>
+                            <ArrowRight className="h-3.5 w-3.5 shrink-0 opacity-60 transition group-hover:opacity-100" />
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+                {finalAssistant
+                  ? renderGroupedRow({ kind: "message", message: finalAssistant }, segIdx + 1000, {})
+                  : null}
+                {/* Block-level actions; peeled follow-ups on the next line below icons */}
+                {!hasStreamingRow && workMessages.length > 0 && useUnifiedReActCard ? (
+                  <div
+                    className={`!-mt-0.5 flex min-w-0 items-start gap-2 mb-6`}
+                  >
+                    {isSelecting ? <div className="h-5 w-5 shrink-0" aria-hidden /> : null}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 flex-col gap-2">
+                        <div className="flex w-fit flex-wrap items-center gap-0.5 text-text-faint" style={reactActionStyle}>
+                          <HoverTip label="复制">
+                            <button
+                              type="button"
+                              className="rounded p-1 hover:bg-surface-hover hover:text-text-strong"
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => void copyReActBlock(workMessages)}
+                            >
+                              <Copy size={13} />
+                            </button>
+                          </HoverTip>
+                          {lastAssistantInBlock ? (
+                            <>
+                              <HoverTip label="引用">
+                                <button
+                                  type="button"
+                                  className="rounded p-1 hover:bg-surface-hover hover:text-text-strong"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() =>
+                                    setQuoteTarget({
+                                      message: lastAssistantInBlock,
+                                      body: resolveQuoteBody(lastAssistantInBlock, undefined),
+                                    })
+                                  }
+                                >
+                                  <Quote size={13} />
+                                </button>
+                              </HoverTip>
+                              <HoverTip label="收藏">
+                                <button
+                                  type="button"
+                                  className="rounded p-1 hover:bg-surface-hover hover:text-text-strong"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => void favoriteMessage(lastAssistantInBlock, undefined)}
+                                >
+                                  <Bookmark size={13} />
+                                </button>
+                              </HoverTip>
+                              <HoverTip label="转发">
+                                <button
+                                  type="button"
+                                  className="rounded p-1 hover:bg-surface-hover hover:text-text-strong"
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => forwardOneMessage(lastAssistantInBlock, undefined)}
+                                >
+                                  <Share2 size={13} />
+                                </button>
+                              </HoverTip>
+                            </>
+                          ) : null}
+                          <HoverTip label="多选">
+                            <button
+                              type="button"
+                              className={`rounded p-1 hover:bg-surface-hover ${
+                                blockAnySelected ? "text-cyan-400 hover:text-cyan-300" : "hover:text-text-strong"
+                              }`}
+                              onMouseDown={(e) => e.preventDefault()}
+                              onClick={() => toggleSelectBlock(workMessages)}
+                            >
+                              <LayoutList size={13} />
+                            </button>
+                          </HoverTip>
+                        </div>
+                        {peeledFollowupAssistant?.suggestedQuestions &&
+                        peeledFollowupAssistant.suggestedQuestions.length > 0 ? (
+                          <div className="flex min-w-0 flex-col items-start gap-1.5" style={reactActionStyle}>
+                            {peeledFollowupAssistant.suggestedQuestions.slice(0, 3).map((q, qi) => (
+                              <button
+                                key={`${qi}-${q}`}
+                                type="button"
+                                className="group flex max-w-full w-fit items-center gap-2 rounded-full border border-border bg-surface-hover/80 px-3.5 py-1.5 text-left text-[14px] text-text-subtle transition hover:bg-surface-hover hover:text-text-strong whitespace-normal"
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => sendFollowupChip(q)}
+                              >
+                                <span>{q}</span>
+                                <ArrowRight className="h-3.5 w-3.5 shrink-0 opacity-60 transition group-hover:opacity-100" />
+                              </button>
+                            ))}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            );
+          })
+        : groupedVisibleMessages.map((row, rowIdx) => renderGroupedRow(row, rowIdx, {}));
+
+    return (
+    <>
+      {mainRows}
       {Object.entries(groupTyping).map(([agentId, name]) => (
         <ImBubble
           key={`typing-${agentId}`}
@@ -2941,47 +4526,58 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           assistantName={name}
         />
       ))}
-      {isStreamingCurrentSession && !hideStreamOverlayAsDuplicate ? (
+      {sessionWorkInProgress && !isStreamingCurrentSession && !isGroupPane ? (
+        <ImBubble
+          key="typing-meta"
+          message={{ id: "typing-meta", role: "assistant", content: "" }}
+          assistantName={paneAvatarMeta.name}
+          assistantAvatarUrl={paneAvatarMeta.url}
+        />
+      ) : null}
+      {isStreamingCurrentSession && !hideStreamOverlayAsDuplicate && !useReActImLayout ? (
         chatStyle === "terminal" ? (
           <TerminalLine
             message={{ id: "__stream__", role: "assistant", content: streamTextForCurrentSession }}
-            badge={streamingModel ? <ModelBadge provider={streamingModel.provider} model={streamingModel.model} /> : undefined}
+            badge={
+              showInlineAssistantModelBadge && streamingModel ? (
+                <ModelBadge provider={streamingModel.provider} model={streamingModel.model} />
+              ) : undefined
+            }
           />
         ) : chatStyle === "clean" ? (
           <CleanBlock
             message={{ id: "__stream__", role: "assistant", content: streamTextForCurrentSession }}
-            badge={streamingModel ? <ModelBadge provider={streamingModel.provider} model={streamingModel.model} /> : undefined}
+            badge={
+              showInlineAssistantModelBadge && streamingModel ? (
+                <ModelBadge provider={streamingModel.provider} model={streamingModel.model} />
+              ) : undefined
+            }
           />
         ) : (
           <ImBubble
             message={{ id: "__stream__", role: "assistant", content: streamTextForCurrentSession }}
             highlightTerms={pane.historySearchTerms}
-            badge={streamingModel ? <ModelBadge provider={streamingModel.provider} model={streamingModel.model} /> : undefined}
+            badge={
+              showInlineAssistantModelBadge && streamingModel ? (
+                <ModelBadge provider={streamingModel.provider} model={streamingModel.model} />
+              ) : undefined
+            }
             assistantName={paneAvatarMeta.name}
             assistantAvatarUrl={paneAvatarMeta.url}
           />
         )
       ) : null}
-      {isStreamingCurrentSession && toolOutputLines.length > 0 && (
-        <div className="ml-10">
-          <ToolOutputStream lines={toolOutputLines} />
-        </div>
-      )}
-      {queuedMessages.length > 0 && queuedMessages.map((qm, qi) => (
-        <QueuedMessageBubble
-          key={qm.id}
-          msg={qm}
-          index={qi}
-          total={queuedMessages.length}
-          onEdit={(id, newText) => editPendingMessage(paneId, id, newText)}
-          onRemove={(id) => removePendingMessage(paneId, id)}
-        />
-      ))}
       {stallState === "stall" && (
         <StallRecoveryCard
           kind="stall"
-          onResume={resumeCurrentTask}
-          onStop={stopCurrentRun}
+          currentModelLabel={currentModelLabel}
+          modelOptions={stallModelOptions}
+          autoNudgeCount={autoNudgeCount}
+          autoNudgeMax={stallRuntimeConfig.stall_auto_nudge_max_per_session}
+          onResume={() => void resumeCurrentTask()}
+          onResumeWithModel={(provider, model) => void resumeWithModel(provider, model)}
+          onStop={() => void stopCurrentRun()}
+          stopInFlight={stoppingSessionId === (pane.sessionId || "").trim()}
         />
       )}
       {stallState === "exhausted" && (
@@ -2989,13 +4585,18 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           kind="exhausted"
           rounds={exhaustedRounds?.rounds}
           maxRounds={exhaustedRounds?.maxRounds}
-          onResume={resumeCurrentTask}
-          onStop={stopCurrentRun}
+          currentModelLabel={currentModelLabel}
+          modelOptions={stallModelOptions}
+          onResume={() => void resumeCurrentTask()}
+          onResumeWithModel={(provider, model) => void resumeWithModel(provider, model)}
+          onStop={() => void stopCurrentRun()}
+          stopInFlight={stoppingSessionId === (pane.sessionId || "").trim()}
           onOpenSettings={() => useAppStore.getState().openSettings()}
         />
       )}
     </>
-  ), [chatStyle, copyMessage, editPendingMessage, exhaustedRounds, favoriteMessage, forwardOneMessage, groupTyping, hideStreamOverlayAsDuplicate, isGroupPane, isStreamingCurrentSession, pane.historySearchTerms, paneAvatarMeta, paneId, queuedMessages, removePendingMessage, resolveGroupInlineConfirm, resumeCurrentTask, revealFileInTaskspace, retryUserMessage, selectUpTo, selectedMessageIds, stallState, stopCurrentRun, streamTextForCurrentSession, streamingModel, toggleSelectMessage, toolOutputLines, userAvatarUrl, userBubbleLabel, visibleMessages]);
+    );
+  }, [autoNudgeCount, chatStyle, copyMessage, copyReActBlock, currentModelLabel, exhaustedRounds, favoriteMessage, forwardOneMessage, groupTyping, groupedVisibleMessages, hideStreamOverlayAsDuplicate, input, isGroupPane, isRunGuardCurrentSession, isStreamingCurrentSession, pane.historySearchTerms, pane.sessionId, paneAvatarMeta, paneId, readyAttachments.length, resolveGroupInlineConfirm, resolveQuoteBody, resumeCurrentTask, resumeWithModel, revealFileInTaskspace, retryUserMessage, selectUpTo, selectedMessageIds, sendFollowupChip, sessionWorkInProgress, setQuoteTarget, showInlineAssistantModelBadge, stallModelOptions, stallRuntimeConfig.stall_auto_nudge_max_per_session, stallState, stopCurrentRun, streamTextForCurrentSession, streamingModel, toggleSelectBlock, toggleSelectMessage, topLevelRowsIm, userAvatarUrl, userBubbleLabel]);
 
   const removeAttachment = useCallback((key: string) => {
     setContextFiles((prev) => {
@@ -3127,6 +4728,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       retryAttachments?: MessageAttachment[];
       suppressUserEcho?: boolean;
       skipUserHistory?: boolean;
+      forceSend?: boolean;
+      continuation?: { reason: ContinueReason; source: ContinueSource };
     }
   ) => Promise<void>>(
     async () => {}
@@ -3153,33 +4756,18 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       retryAttachments?: MessageAttachment[];
       suppressUserEcho?: boolean;
       skipUserHistory?: boolean;
+      forceSend?: boolean;
+      continuation?: { reason: ContinueReason; source: ContinueSource };
     }
   ) => {
-    if (focusMode) {
-      try {
-        const expandFn = window.agenticxDesktop?.focusModeExpand;
-        if (expandFn) {
-          const res = await expandFn();
-          if (res?.ok) {
-            useAppStore.getState().setFocusModeTall(true);
-          } else {
-            useAppStore.getState().exitFocusMode();
-          }
-        } else {
-          // Fallback if main process hasn't been restarted and IPC is missing
-          useAppStore.getState().exitFocusMode();
-        }
-      } catch {
-        useAppStore.getState().exitFocusMode();
-      }
-    }
+    const continuation = options?.continuation;
+    const isContinuation = !!continuation;
     const text = userText.trim();
-    const messageText = text || ATTACHMENT_ONLY_USER_PROMPT;
+    const messageText = isContinuation ? " " : text || ATTACHMENT_ONLY_USER_PROMPT;
     const retryAttachments = options?.retryAttachments;
-    const suppressUserEcho = !!options?.suppressUserEcho;
-    const skipUserHistory = !!options?.skipUserHistory;
+    const suppressUserEcho = isContinuation || !!options?.suppressUserEcho;
+    const skipUserHistory = isContinuation || !!options?.skipUserHistory;
     const readyEntries = attachmentEntries.filter(([, file]) => file.status === "ready");
-    const readyEntryMap = new Map(readyEntries);
     const composerAttachments: MessageAttachment[] = readyAttachments.map((file) => ({
       name: file.name,
       mimeType: file.mimeType,
@@ -3187,33 +4775,41 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       dataUrl: file.dataUrl,
       sourcePath: file.sourcePath,
       referenceToken: file.referenceToken,
+      composerRefLabel: file.composerRefLabel,
     }));
     const rawUserAttachments: MessageAttachment[] =
       retryAttachments && retryAttachments.length > 0
         ? retryAttachments.map((item) => ({ ...item }))
         : composerAttachments;
-    const userAttachments: MessageAttachment[] = rawUserAttachments.filter((item) => {
-      if (!item.referenceToken) return true;
-      const name = String(item.name || "").trim();
-      if (!name) return true;
-      return messageText.includes(`@${name}`);
-    });
+    // Do not drop reference/workspace attachments when the user asks a short follow-up without @文件名;
+    // otherwise context_files never reaches the model and the file looks "invisible".
+    const userAttachments: MessageAttachment[] = rawUserAttachments;
     const hasReadyAttachments = userAttachments.length > 0;
-    if ((!text && !hasReadyAttachments) || !apiBase) return;
+    if (!isContinuation && !text && !hasReadyAttachments) return;
+    if (!apiBase) return;
 
     const useLazySession = !isGroupPane && !isAutomationTaskPane;
     let requestSessionId = (pane.sessionId || "").trim();
+    const clearStopSuppressForSession = (sessionKey: string) => {
+      const key = sessionKey.trim();
+      if (!key) return;
+      delete userStoppedSessionRef.current[key];
+      delete interruptNoticeSentRef.current[key];
+      delete stopInFlightRef.current[key];
+    };
 
     if (!requestSessionId) {
       if (!useLazySession) return;
       try {
         const avatarId =
           pane.avatarId && pane.avatarId.startsWith("group:") ? undefined : pane.avatarId ?? undefined;
-        const inheritFrom = pendingInheritFromSessionIdRef.current;
-        pendingInheritFromSessionIdRef.current = null;
+        const inheritFrom = peekPaneLazyInheritParent(pane.id);
+        const pendingMode = peekPanePendingSessionMode(pane.id) ?? pane.sessionMode ?? "daily_office";
         const created = await window.agenticxDesktop.createSession({
           avatar_id: avatarId,
+          session_mode: pendingMode,
           ...(inheritFrom ? { inherit_from_session_id: inheritFrom } : {}),
+          ...(chatProvider && chatModel ? { provider: chatProvider, model: chatModel } : {}),
         });
         if (!created.ok || !created.session_id) {
           addPaneMessage(
@@ -3225,6 +4821,12 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           return;
         }
         requestSessionId = created.session_id;
+        clearPaneLazyInheritParent(pane.id);
+        clearPanePendingSessionMode(pane.id);
+        setPaneSessionMode(pane.id, created.session_mode ?? pendingMode);
+        if (created.inherited) {
+          setPaneContextInherited(pane.id, true);
+        }
         // Defensive reset: a brand-new lazy session must never display any
         // residual messages from the previously-running session (which may
         // have been racily restored by poll/sync effects while sessionId
@@ -3232,11 +4834,11 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         useAppStore.getState().setPaneMessages(pane.id, []);
         lastPollCountRef.current = 0;
         pollSessionSidRef.current = requestSessionId;
-        setPaneSessionId(pane.id, requestSessionId);
+        setPaneSessionId(pane.id, requestSessionId, {
+          provider: chatProvider || undefined,
+          model: chatModel || undefined,
+        });
         clearPaneAwaitingFreshSession(pane.id);
-        if (created.inherited) {
-          setPaneContextInherited(pane.id, true);
-        }
         useAppStore.getState().bumpSessionCatalogRevision();
         window.setTimeout(() => useAppStore.getState().bumpSessionCatalogRevision(), 450);
       } catch (err) {
@@ -3244,16 +4846,38 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         return;
       }
     }
+    const isStreamRunActive = !!sessionStreamStateRef.current[requestSessionId]?.active;
+    const canQueueFollowUp =
+      !isContinuation && !options?.suppressUserEcho && !options?.skipUserHistory;
+
     if (
-      shouldInterruptOnResend({
-        isStreamRunActive: !!sessionStreamStateRef.current[requestSessionId]?.active,
+      canQueueFollowUp &&
+      shouldEnqueueOnResend({
+        isStreamRunActive,
+        forceSend: options?.forceSend,
       })
     ) {
-      // Barge-in semantics (Cursor / ChatGPT style): when the user sends a
-      // follow-up while the previous round is still streaming, abort the
-      // current run and start a new round. The natural chat history (Q1 +
-      // partial assistant + Q2) is preserved by the SSE finally block which
-      // commits any non-empty partial text before resolving.
+      enqueuePaneMessage(pane.id, {
+        id: crypto.randomUUID(),
+        text: messageText,
+        attachments: userAttachments,
+        contextFiles: [],
+        timestamp: Date.now(),
+      });
+      setComposerText("");
+      setQuoteTarget(null);
+      setContextFiles({});
+      return;
+    }
+
+    if (
+      shouldInterruptOnResend({
+        isStreamRunActive,
+        forceSend: options?.forceSend,
+      })
+    ) {
+      // Force-send while streaming: abort the current run, then start the new round.
+      // Partial assistant text is preserved by commitCurrentStreamIfNeeded in finally.
       try {
         await window.agenticxDesktop.interruptSession?.(requestSessionId);
       } catch (err) {
@@ -3278,6 +4902,41 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         setStreamedAssistantText("");
       }
       setStallState("none");
+
+      // Brief wait for the aborted SSE finally block to commit any partial
+      // assistant text via commitCurrentStreamIfNeeded. Then close the prior
+      // turn with an "(已中断)" placeholder if no assistant turn was written —
+      // otherwise the next request would feed the model two unanswered user
+      // questions and it would answer both.
+      await new Promise((r) => setTimeout(r, 60));
+      const tailMsgs = (useAppStore.getState().panes.find((p) => p.id === pane.id)?.messages ?? [])
+        .filter((m) => m.role !== "tool");
+      const lastNonTool = tailMsgs[tailMsgs.length - 1];
+      if (!lastNonTool || lastNonTool.role === "user") {
+        const interruptedNote = "（已中断）";
+        addPaneMessage(pane.id, "assistant", interruptedNote, "meta", chatProvider, chatModel);
+        try {
+          await fetch(`${apiBase}/api/session/messages/append`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-agx-desktop-token": apiToken,
+            },
+            body: JSON.stringify({
+              session_id: requestSessionId,
+              messages: [
+                {
+                  role: "assistant",
+                  content: interruptedNote,
+                  metadata: { source: "barge-in" },
+                },
+              ],
+            }),
+          });
+        } catch (err) {
+          console.warn("[ChatPane] append interrupted placeholder failed:", err);
+        }
+      }
       // Fall through: proceed with a normal send below.
     }
 
@@ -3358,7 +5017,11 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       provider: chatProvider,
       model: chatModel,
     };
-    lastSseEventAtRef.current = Date.now();
+    clearStopSuppressForSession(requestSessionId);
+    setRunGuardSessionId(requestSessionId);
+    setSessionExecutionState("running");
+    prevExecutionStateRef.current = "running";
+    recordSseActivity();
     setStallState("none");
     setExhaustedRounds(null);
     if ((pane.sessionId || "").trim() === requestSessionId) {
@@ -3388,9 +5051,12 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       addPaneMessage(...args);
     };
     const commitCurrentStreamIfNeeded = () => {
-      const partial = streamTextRef.current.trim();
+      const raw = streamTextRef.current.trim();
+      // Trim trailing colon ("：" or ":") that model writes just before calling a tool
+      // — prevents orphaned "检查文件：" bubbles before a ToolCallCard.
+      const partial = raw.replace(/[：:]\s*$/, "").trimEnd();
       if (!partial || isThinkingPlaceholderText(partial) || streamCommittedRef.current) return false;
-      addPaneMessageIfSessionActive(pane.id, "assistant", streamTextRef.current, "meta", chatProvider, chatModel);
+      addPaneMessageIfSessionActive(pane.id, "assistant", partial, "meta", chatProvider, chatModel);
       streamCommittedRef.current = true;
       lastMidStreamAssistantCommitRef.current = partial;
       return true;
@@ -3432,6 +5098,12 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       }
       if (userBubbleLabel && userBubbleLabel !== "我") body.user_nickname = userBubbleLabel;
       if (userPreference.trim()) body.user_preference = userPreference.trim();
+      // Extract @skill:// references from message text
+      const skillSlugMatches = messageText.match(/@skill:\/\/([^\s@,，。！？\n]+)/g);
+      if (skillSlugMatches && skillSlugMatches.length > 0) {
+        const skillSlugs = [...new Set(skillSlugMatches.map((m) => m.replace("@skill://", "")))];
+        if (skillSlugs.length > 0) body.skill_slugs = skillSlugs;
+      }
       if (userAttachments.length > 0) {
         const imageInputs = userAttachments
           .filter((file) => !!file.dataUrl && file.mimeType.startsWith("image/"))
@@ -3449,7 +5121,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         for (const file of userAttachments) {
           const key = String(file.sourcePath || file.name || "").trim();
           if (!key) continue;
-          const ready = readyEntryMap.get(key);
+          const ready = resolveReadyAttachment(file, readyEntries);
           const isImage = !!file.dataUrl || file.mimeType.startsWith("image/") || !!ready?.dataUrl || ready?.mimeType.startsWith("image/");
           if (isImage) {
             contextFilePayload[key] = "[图片文件]";
@@ -3464,6 +5136,18 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         }
       }
       const sendChatRequest = (sessionId: string) => {
+        if (isContinuation && continuation) {
+          return fetch(continueSessionUrl(apiBase, sessionId), {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+            body: JSON.stringify({
+              reason: continuation.reason,
+              source: continuation.source,
+              suppress_user_echo: true,
+            }),
+            signal: abortController.signal,
+          });
+        }
         body.session_id = sessionId;
         return fetch(`${apiBase}/api/chat`, {
           method: "POST",
@@ -3521,6 +5205,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
 
       let full = "";
       let cumulativeFull = "";
+      let pendingSuggestedQuestions: string[] = [];
       let buffer = "";
       while (true) {
         const { value: chunk, done } = await reader.read();
@@ -3533,8 +5218,20 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           if (!line) continue;
           try {
             const payload = JSON.parse(line.slice(6));
-            lastSseEventAtRef.current = Date.now();
+            recordSseActivity();
             const eventAgentId = payload.data?.agent_id ?? "meta";
+            if (payload.type === "continuation_notice") {
+              const noticeText = String(payload.data?.text ?? "").trim();
+              if (noticeText) {
+                addPaneMessageIfSessionActive(pane.id, "tool", noticeText, "meta");
+              }
+              continue;
+            }
+            if (payload.type === "continuation_rejected") {
+              const rejectText = String(payload.data?.text ?? "").trim();
+              if (rejectText) setStallHintToast(rejectText);
+              continue;
+            }
             if (payload.type === "group_typing") {
               const avatarName = String(payload.data?.avatar_name ?? eventAgentId);
               setGroupTyping((prev) => ({ ...prev, [eventAgentId]: avatarName }));
@@ -3767,26 +5464,34 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               continue;
             }
             if (payload.type === "tool_progress") {
+              recordProgressActivity();
               const name = String(payload.data?.name ?? "tool");
               const sec = Number(payload.data?.elapsed_seconds ?? 0);
+              if (eventAgentId === "meta") {
+                setLastToolProgress({ name, sec: Number.isFinite(sec) ? sec : 0 });
+              }
               const outputLine = payload.data?.line as string | undefined;
-              if (outputLine !== undefined && eventAgentId === "meta") {
-                setToolOutputLines((prev) => [...prev.slice(-200), outputLine]);
-                const streamLabel = payload.data?.stream === "stderr" ? "stderr" : "stdout";
-                const waitLabel = `⏳ ${name} 执行中…（${streamLabel}）`;
-                scheduleStreamTextUpdate(waitLabel);
+              const progressCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (eventAgentId === "meta" && progressCallId) {
+                const patch: Parameters<typeof updatePaneMessageByToolCallId>[2] = {
+                  toolStatus: "running",
+                };
+                if (Number.isFinite(sec)) patch.toolElapsedSec = sec;
+                if (outputLine !== undefined) patch.appendStreamLine = String(outputLine);
+                updatePaneMessageByToolCallId(pane.id, progressCallId, patch);
                 continue;
               }
-              const waitLabel = (() => {
-                if (name === "cc_bridge_send") {
-                  return ccBridgeSendToolProgressLabel(sec, ccBridgeLastSessionModeRef.current);
-                }
-                return Number.isFinite(sec)
-                  ? `⏳ ${name} 执行中…（已等待 ${sec}s）`
-                  : `⏳ ${name} 执行中…`;
-              })();
+              if (outputLine !== undefined && eventAgentId === "meta" && !progressCallId) {
+                // Legacy events without tool_call_id: keep liveness on stream (no merged card).
+                continue;
+              }
               if (eventAgentId === "meta") {
-                scheduleStreamTextUpdate(waitLabel);
+                continue;
+              }
+              if (name === "cc_bridge_send") {
+                updateSubAgent(eventAgentId, {
+                  currentAction: ccBridgeSendToolProgressLabel(sec, ccBridgeLastSessionModeRef.current),
+                });
               } else {
                 updateSubAgent(eventAgentId, {
                   currentAction: Number.isFinite(sec) ? `${name} 执行中… (${sec}s)` : `${name} 执行中…`,
@@ -3796,9 +5501,13 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             }
             if (payload.type === "token") {
               if (eventAgentId === "meta") {
-                const tokenText = String(payload.data?.text ?? "");
+                const rawToken = String(payload.data?.text ?? "");
+                // Strip backend-emitted ⏳ waiting placeholder — prevents it from appearing
+                // in Thought blocks or committed assistant messages.
+                const tokenText = rawToken.replace(/⏳\s*/g, "");
+                if (!tokenText) continue;
                 if (isThinkingPlaceholderText(tokenText) && !full.trim()) {
-                  // Ignore waiting placeholder tokens to prevent ghost "⏳" answers.
+                  // Ignore other placeholder tokens to prevent ghost answers.
                   continue;
                 }
                 full += tokenText;
@@ -3815,11 +5524,10 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               }
             }
             if (payload.type === "tool_call") {
-              setToolOutputLines([]);
-              const toolName = payload.data?.name ?? "tool";
+              const toolNameStr = String(payload.data?.name ?? "tool");
               const toolArgs = (payload.data?.arguments ?? payload.data?.args ?? {}) as Record<string, unknown>;
-              if (eventAgentId === "meta" && toolName === "cc_bridge_start") {
-                const toolCallId = String(payload.data?.id ?? "").trim();
+              const toolCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (eventAgentId === "meta" && toolNameStr === "cc_bridge_start") {
                 const callKey = toolCallId || `${requestSessionId || "session"}:cc_bridge_start`;
                 const modeHint = parseCcBridgeModeFromPayload(toolArgs);
                 if (modeHint === "headless") {
@@ -3833,10 +5541,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               }
               // Filter out internal housekeeping tools that add no user-visible signal
               const SILENT_TOOLS = new Set(["check_resources"]);
-              if (!SILENT_TOOLS.has(toolName)) {
-                const content = `🔧 ${toolName}: ${JSON.stringify(
-                  toolArgs
-                ).slice(0, 120)}`;
+              if (!SILENT_TOOLS.has(toolNameStr)) {
                 if (eventAgentId === "meta") {
                   commitCurrentStreamIfNeeded();
                   full = "";
@@ -3844,10 +5549,31 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                   cancelStreamRenderFrame();
                   scheduleStreamTextUpdate("");
                   streamCommittedRef.current = false;
-                  addPaneMessageIfSessionActive(pane.id, "tool", content, "meta");
+                  const pan = useAppStore.getState().panes.find((p) => p.id === pane.id);
+                  const lastMsg = pan?.messages.length ? pan.messages[pan.messages.length - 1] : undefined;
+                  const toolGroupId =
+                    lastMsg?.role === "tool" && lastMsg.toolGroupId
+                      ? lastMsg.toolGroupId
+                      : crypto.randomUUID();
+                  const rawArgs = JSON.stringify(toolArgs);
+                  const content =
+                    rawArgs.length > 80_000 ? `${rawArgs.slice(0, 80_000)}\n… (truncated)` : rawArgs;
+                  if (toolCallId) {
+                    addPaneMessageIfSessionActive(pane.id, "tool", content, "meta", undefined, undefined, undefined, {
+                      toolCallId,
+                      toolName: toolNameStr,
+                      toolArgs,
+                      toolStatus: "running",
+                      toolGroupId,
+                    });
+                  } else {
+                    const legacy = `\u{1F527} ${toolNameStr}: ${JSON.stringify(toolArgs).slice(0, 120)}`;
+                    addPaneMessageIfSessionActive(pane.id, "tool", legacy, "meta");
+                  }
                 } else {
-                  addSubAgentEvent(eventAgentId, { type: "tool_call", content });
-                  const livePreview = buildToolCallLivePreview(toolName, toolArgs);
+                  const legacy = `\u{1F527} ${toolNameStr}: ${JSON.stringify(toolArgs).slice(0, 120)}`;
+                  addSubAgentEvent(eventAgentId, { type: "tool_call", content: legacy });
+                  const livePreview = buildToolCallLivePreview(toolNameStr, toolArgs);
                   if (livePreview) {
                     const sub = useAppStore.getState().subAgents.find((item) => item.id === eventAgentId);
                     const prev = sub?.liveOutput ?? "";
@@ -3861,8 +5587,23 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               const toolName = String(payload.data?.name ?? "");
               const formatted = formatToolResultMessage(toolName, payload.data?.result);
               if (formatted.silent) continue;
-              if (eventAgentId === "meta") addPaneMessageIfSessionActive(pane.id, "tool", formatted.content, "meta");
-              else {
+              const resultCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              const rawContent = serializeToolResultRaw(payload.data?.result);
+              const preview = formatted.content.replace(/\s+/g, " ").trim().slice(0, 160);
+              const mergedStatus = deriveToolStatusFromResult(payload.data?.result);
+              if (eventAgentId === "meta" && resultCallId) {
+                const merged = updatePaneMessageByToolCallId(pane.id, resultCallId, {
+                  content: rawContent,
+                  toolStatus: mergedStatus,
+                  toolResultPreview: preview,
+                  toolStreamLines: [],
+                });
+                if (!merged) {
+                  addPaneMessageIfSessionActive(pane.id, "tool", formatted.content, "meta");
+                }
+              } else if (eventAgentId === "meta") {
+                addPaneMessageIfSessionActive(pane.id, "tool", formatted.content, "meta");
+              } else {
                 addSubAgentEvent(eventAgentId, { type: "tool_result", content: formatted.content });
                 if (toolName === "file_write" || toolName === "file_edit") {
                   const sub = useAppStore.getState().subAgents.find((item) => item.id === eventAgentId);
@@ -4051,11 +5792,38 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               }
             }
             if (payload.type === "subagent_paused") {
+              // FR-2: tool-rounds saturation must surface as an explicit "paused"
+              // state (not "running" or "completed") so the user knows the task
+              // halted at a hard limit rather than finishing naturally.
               const subId = payload.data?.agent_id;
               if (subId) {
-                const text = payload.data?.text ?? "已暂停，等待指令";
-                updateSubAgent(subId, { status: "running", currentAction: text });
-                addSubAgentEvent(subId, { type: "paused", content: text });
+                const round = Number(payload.data?.round ?? 0) || 0;
+                const maxRounds = Number(payload.data?.max_rounds ?? 0) || 0;
+                const baseText = String(payload.data?.text ?? "已暂停").trim();
+                const roundLabel = round && maxRounds ? `（触顶 ${round}/${maxRounds} 轮）` : "";
+                const tools = Array.isArray(payload.data?.executed_tools)
+                  ? (payload.data.executed_tools as unknown[]).map((t) => String(t)).filter(Boolean)
+                  : [];
+                const toolsLabel = tools.length ? ` · 最近工具：${tools.slice(-5).join(", ")}` : "";
+                const display = `${baseText}${roundLabel}${toolsLabel}`;
+                updateSubAgent(subId, {
+                  status: "paused",
+                  currentAction: display,
+                  resultSummary:
+                    typeof payload.data?.summary === "string" ? payload.data.summary : undefined,
+                  sessionId:
+                    (typeof payload.data?.avatar_session_id === "string" && payload.data.avatar_session_id.trim())
+                      || undefined,
+                });
+                addSubAgentEvent(subId, { type: "paused", content: display });
+                // Also drop a visible note into the avatar pane so the user does
+                // not need to expand the subagent panel to see why work stopped.
+                addPaneMessageIfSessionActive(
+                  pane.id,
+                  "tool",
+                  `⏸ 任务已暂停${roundLabel}。${baseText}${toolsLabel}`,
+                  eventAgentId || "meta",
+                );
               }
             }
             if (payload.type === "subagent_completed") {
@@ -4095,6 +5863,10 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             if (payload.type === "final") {
               if (eventAgentId === "meta") {
                 const finalText = String(payload.data?.text ?? "");
+                const sqRaw = payload.data?.suggested_questions;
+                pendingSuggestedQuestions = Array.isArray(sqRaw)
+                  ? sqRaw.map((x: unknown) => String(x).trim()).filter(Boolean).slice(0, 3)
+                  : [];
                 // Final payload is authoritative. Replacing (instead of merging) avoids
                 // duplicate concatenation when token stream shape differs from final text.
                 if (finalText.trim() && !isThinkingPlaceholderText(finalText)) {
@@ -4114,9 +5886,28 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                 useAppStore.getState().accumulatePaneTokens(pane.id, inp, out);
               }
             }
+            if (payload.type === "compaction") {
+              // FR-3: surface context compaction so users do not learn about it
+              // only when the model later "explains" it as a failure cause.
+              const count = Number(payload.data?.compacted_count ?? 0) || 0;
+              const reactive = Boolean(payload.data?.reactive);
+              const text = buildCompactionNoticeText(count, reactive);
+              addPaneMessageIfSessionActive(pane.id, "tool", text, eventAgentId || "meta", undefined, undefined, undefined, {
+                noticeKind: reactive ? "compaction_reactive" : "compaction_proactive",
+              });
+            }
             if (payload.type === "error") {
               const errText = String(payload.data?.text ?? "未知错误");
-              if (errText.includes("已达到最大工具调用轮数")) {
+              const severity = String(payload.data?.severity ?? "").trim();
+              const detector = String(payload.data?.detector ?? "").trim();
+              if (severity === "warning" || detector === "token_budget_compress" || detector === "compactor_circuit_breaker") {
+                // FR-4 / FR-5: non-fatal warnings render as flat context notices, not tool cards.
+                const noticeKind =
+                  detector === "compactor_circuit_breaker" ? "compactor_cb" : "budget_compress";
+                addPaneMessageIfSessionActive(pane.id, "tool", errText, eventAgentId || "meta", undefined, undefined, undefined, {
+                  noticeKind,
+                });
+              } else if (errText.includes("已达到最大工具调用轮数")) {
                 const maxRounds = Number(payload.data?.max_rounds ?? 0) || 30;
                 const rounds = Number(payload.data?.round ?? maxRounds);
                 setExhaustedRounds({ rounds, maxRounds });
@@ -4133,12 +5924,28 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       }
 
       const trimmedFull = full.trim();
+      const sugExtras =
+        pendingSuggestedQuestions.length > 0
+          ? { suggestedQuestions: pendingSuggestedQuestions.slice(0, 3) }
+          : undefined;
       if (trimmedFull && !isThinkingPlaceholderText(full) && !streamCommittedRef.current) {
         const mid = lastMidStreamAssistantCommitRef.current;
         if (mid !== null && trimmedFull === mid) {
           streamCommittedRef.current = true;
+          if (sugExtras) {
+            useAppStore.getState().mergeLastPaneMessageByRole(pane.id, "assistant", sugExtras);
+          }
         } else {
-          addPaneMessageIfSessionActive(pane.id, "assistant", full, "meta", chatProvider, chatModel);
+          addPaneMessageIfSessionActive(
+            pane.id,
+            "assistant",
+            full,
+            "meta",
+            chatProvider,
+            chatModel,
+            undefined,
+            sugExtras,
+          );
           streamCommittedRef.current = true;
         }
       }
@@ -4162,7 +5969,6 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       streamTextRef.current = "";
       streamCommittedRef.current = false;
       setGroupTyping({});
-      setToolOutputLines([]);
       setContextFiles({});
       useAppStore.getState().bumpSessionCatalogRevision();
       window.setTimeout(() => useAppStore.getState().bumpSessionCatalogRevision(), 500);
@@ -4187,21 +5993,29 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     if ((pane.sessionId || "").trim() !== forwardAutoReply.sessionId.trim()) return;
     useAppStore.getState().setForwardAutoReply(null);
     void sendChatRef.current(forwardAutoReply.text, {
-      suppressUserEcho: true,
-      skipUserHistory: true,
+      suppressUserEcho: forwardAutoReply.suppressUserEcho ?? true,
+      skipUserHistory: forwardAutoReply.skipUserHistory ?? true,
     });
   }, [forwardAutoReply, paneId, pane.sessionId]);
 
   const initSession = async (inherit = false, prevSessionId?: string) => {
     const avatarId =
       pane.avatarId && pane.avatarId.startsWith("group:") ? undefined : pane.avatarId ?? undefined;
+    const pendingMode = peekPanePendingSessionMode(pane.id) ?? pane.sessionMode ?? "daily_office";
     try {
       const result = await window.agenticxDesktop.createSession({
         avatar_id: avatarId,
+        session_mode: pendingMode,
         ...(inherit && prevSessionId ? { inherit_from_session_id: prevSessionId } : {}),
+        ...(chatProvider && chatModel ? { provider: chatProvider, model: chatModel } : {}),
       });
       if (result.ok && result.session_id) {
-        setPaneSessionId(pane.id, result.session_id);
+        setPaneSessionId(pane.id, result.session_id, {
+          provider: chatProvider || undefined,
+          model: chatModel || undefined,
+        });
+        setPaneSessionMode(pane.id, result.session_mode ?? pendingMode);
+        clearPanePendingSessionMode(pane.id);
         clearPaneAwaitingFreshSession(pane.id);
         if (result.inherited) {
           setPaneContextInherited(pane.id, true);
@@ -4222,28 +6036,38 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     addPaneMessage(pane.id, "tool", "⚠️ 会话创建失败，已恢复上一会话。请检查后端服务是否正常。", "meta");
   };
 
-  const createNewTopic = (inherit = true) => {
+  const createNewTopic = (inherit = true, sessionMode: PaneSessionMode = "daily_office") => {
     const prevSessionId = (pane.sessionId || "").trim();
     clearPaneMessages(pane.id);
     setPaneContextInherited(pane.id, false);
+    setPanePendingSessionMode(pane.id, sessionMode);
+    setPaneSessionMode(pane.id, sessionMode);
     // Mark this pane as explicitly awaiting a brand-new session, so
     // WorkspacePanel's auto-restore effect will not snap it back to the
     // previously-running session (which would trap new messages in the
     // running session's queue).
     markPaneAwaitingFreshSession(pane.id);
-    if (isGroupPane || isAutomationTaskPane) {
-      setPaneSessionId(pane.id, "");
-      void initSession(inherit, prevSessionId || undefined);
-      return;
-    }
-    pendingInheritFromSessionIdRef.current = inherit && prevSessionId ? prevSessionId : null;
     setPaneSessionId(pane.id, "");
+    setPaneLazyInheritParent(pane.id, inherit && prevSessionId ? prevSessionId : undefined);
+    // Defer server createSession until the user sends the first message so an
+    // empty session never appears in the history sidebar with an id-only title.
   };
 
   const maxTaskspaceWidth = paneWidth > 0 ? Math.max(240, Math.floor(paneWidth * 0.4)) : 480;
   const minTaskspaceWidth = 220;
   const maxSpawnsWidth = paneWidth > 0 ? Math.max(240, Math.floor(paneWidth * 0.42)) : 420;
   const minSpawnsWidth = 220;
+  const maxHistoryWidth = paneWidth > 0 ? Math.max(220, Math.floor(paneWidth * 0.35)) : 360;
+  const minHistoryWidth = 200;
+
+  const compactSidePanels = paneWidth > 0 && paneWidth < CHATPANE_SIDE_OVERLAY_BREAK;
+  const clampOverlayAside = (preferred: number, minPx: number) =>
+    paneWidth > 0
+      ? Math.min(Math.max(preferred, minPx), Math.max(Math.floor(paneWidth * 0.94), minPx))
+      : preferred;
+  const overlayTaskspaceWidth = clampOverlayAside(taskspaceWidth, minTaskspaceWidth);
+  const overlayHistoryWidth = clampOverlayAside(historyWidth, minHistoryWidth);
+  const overlaySpawnsWidth = clampOverlayAside(spawnsWidth, minSpawnsWidth);
 
   useEffect(() => {
     setTaskspaceWidth((prev) => Math.min(maxTaskspaceWidth, Math.max(minTaskspaceWidth, prev)));
@@ -4253,6 +6077,9 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     setSpawnsWidth((prev) => Math.min(maxSpawnsWidth, Math.max(minSpawnsWidth, prev)));
   }, [maxSpawnsWidth]);
 
+  useEffect(() => {
+    setHistoryWidth((prev) => Math.min(maxHistoryWidth, Math.max(minHistoryWidth, prev)));
+  }, [maxHistoryWidth]);
 
   useEffect(() => {
     try {
@@ -4269,6 +6096,31 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       // ignore storage access failures
     }
   }, [spawnsWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem("agx-history-width-v1", String(historyWidth));
+    } catch {
+      // ignore
+    }
+  }, [historyWidth]);
+
+  const startResizeHistory = (event: ReactMouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = historyWidth;
+    const onMove = (moveEvent: MouseEvent) => {
+      const delta = startX - moveEvent.clientX;
+      const next = Math.max(minHistoryWidth, Math.min(maxHistoryWidth, startWidth + delta));
+      setHistoryWidth(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
 
 
   const startResizeTaskspace = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -4430,20 +6282,184 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     return avatarTintBg(pane.avatarId);
   })();
 
+  useEffect(() => {
+    if (!compactSidePanels) return;
+    const p = pane;
+    const stacked =
+      Number(!!p.taskspacePanelOpen) +
+      Number(!!p.historyOpen) +
+      Number(!!p.membersPanelOpen) +
+      Number(!!p.spawnsColumnOpen);
+    if (stacked <= 1) return;
+    let keep: "workspace" | "history" | "members" | "spawns" = "workspace";
+    if (p.taskspacePanelOpen) keep = "workspace";
+    else if (p.historyOpen) keep = "history";
+    else if (p.membersPanelOpen) keep = "members";
+    else keep = "spawns";
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((row) =>
+        row.id !== p.id
+          ? row
+          : {
+              ...row,
+              taskspacePanelOpen: keep === "workspace",
+              historyOpen: keep === "history",
+              membersPanelOpen: keep === "members",
+              spawnsColumnOpen: keep === "spawns",
+            }
+      ),
+    }));
+  }, [
+    compactSidePanels,
+    pane.id,
+    pane.taskspacePanelOpen,
+    pane.historyOpen,
+    pane.membersPanelOpen,
+    pane.spawnsColumnOpen,
+  ]);
+
+  const dismissAuxiliaryOverlays = () => {
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((row) =>
+        row.id !== pane.id
+          ? row
+          : {
+              ...row,
+              taskspacePanelOpen: false,
+              historyOpen: false,
+              membersPanelOpen: false,
+              spawnsColumnOpen: false,
+            }
+      ),
+    }));
+  };
+
+  const closeWorkspacePanelOnly = () => {
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((row) => (row.id !== pane.id ? row : { ...row, taskspacePanelOpen: false })),
+    }));
+  };
+
+  const closeMembersPanelOnly = () => {
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((row) => (row.id !== pane.id ? row : { ...row, membersPanelOpen: false })),
+    }));
+  };
+
+  const closeHistoryPanelOnly = () => {
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((row) => (row.id !== pane.id ? row : { ...row, historyOpen: false })),
+    }));
+  };
+
+  const toggleWorkspaceSidePanel = () => {
+    if (!compactSidePanels) {
+      cycleSidePanel(pane.id, "workspace");
+      return;
+    }
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((p) => {
+        if (p.id !== pane.id) return p;
+        const opening = !p.taskspacePanelOpen;
+        return opening
+          ? {
+              ...p,
+              taskspacePanelOpen: true,
+              sidePanelTab: "workspace",
+              historyOpen: false,
+              membersPanelOpen: false,
+              spawnsColumnOpen: false,
+            }
+          : { ...p, taskspacePanelOpen: false };
+      }),
+    }));
+  };
+
+  const toggleHistorySidePanel = () => {
+    if (!compactSidePanels) {
+      togglePaneHistory(pane.id);
+      return;
+    }
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((p) => {
+        if (p.id !== pane.id) return p;
+        const opening = !p.historyOpen;
+        return opening
+          ? {
+              ...p,
+              historyOpen: true,
+              taskspacePanelOpen: false,
+              membersPanelOpen: false,
+              spawnsColumnOpen: false,
+            }
+          : { ...p, historyOpen: false };
+      }),
+    }));
+  };
+
+  const toggleMembersSidePanel = () => {
+    if (!compactSidePanels) {
+      cycleSidePanel(pane.id, "members");
+      return;
+    }
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((p) => {
+        if (p.id !== pane.id) return p;
+        const opening = !p.membersPanelOpen;
+        return opening
+          ? {
+              ...p,
+              membersPanelOpen: true,
+              sidePanelTab: "members",
+              taskspacePanelOpen: false,
+              historyOpen: false,
+              spawnsColumnOpen: false,
+            }
+          : { ...p, membersPanelOpen: false };
+      }),
+    }));
+  };
+
+  const toggleSpawnsSideColumn = () => {
+    if (pane.spawnsColumnOpen) {
+      dismissSpawnsColumn(
+        pane.id,
+        paneSubAgents.map((s) => s.id)
+      );
+      return;
+    }
+    if (!compactSidePanels) {
+      setSpawnsColumnOpen(pane.id, true);
+      return;
+    }
+    useAppStore.setState((s) => ({
+      panes: s.panes.map((p) => {
+        if (p.id !== pane.id) return p;
+        return {
+          ...p,
+          spawnsColumnOpen: true,
+          spawnsColumnSuppressAuto: false,
+          spawnsColumnBaselineIds: [],
+          taskspacePanelOpen: false,
+          historyOpen: false,
+          membersPanelOpen: false,
+        };
+      }),
+    }));
+  };
+
   return (
     <div
       ref={paneRef}
-      className={`agx-chatpane flex h-full min-w-0 flex-1 ${focusMode ? "agx-chatpane--focus" : ""}`}
-      style={!focusMode && paneTint ? { backgroundColor: paneTint } : undefined}
+      className="relative agx-chatpane flex h-full min-w-0 flex-1"
+      style={paneTint ? { backgroundColor: paneTint } : undefined}
       onMouseDown={onFocus}
     >
       <div
-        className={`agx-chatpane-main-column flex h-full min-w-0 flex-1 flex-col ${
-          focusComposerOnly ? "agx-chatpane-main-column--focus-empty" : ""
-        }`}
+        className="agx-chatpane-main-column flex h-full min-w-0 flex-1 flex-col"
         style={{ minWidth: 280 }}
       >
-        <div className="agx-pane-toolbar flex h-10 shrink-0 items-center justify-between border-b border-border px-4">
+        <div className="agx-pane-toolbar flex h-10 shrink-0 items-center justify-between px-4">
           <div
             className={`flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden ${
               paneSortableListeners ? "cursor-grab touch-none active:cursor-grabbing" : ""
@@ -4473,116 +6489,80 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                   </span>
                 )}
               </div>
-              <div className="flex items-center gap-1.5 truncate text-[10px] text-text-faint">
-                <span>
-                  session:{" "}
-                  {pane.sessionId
-                    ? pane.sessionId.slice(0, 8) + "…"
-                    : !isGroupPane && !isAutomationTaskPane
-                      ? "未创建（发送首条消息后建立）"
-                      : "-"}
-                </span>
-                {visibleMessages.length > 0 && (
-                  <span className="rounded bg-surface-card px-1 text-text-subtle">{visibleMessages.length} 条</span>
-                )}
-                {pane.contextInherited && (
-                  <span className="rounded bg-emerald-500/20 px-1 text-emerald-400">已继承</span>
-                )}
-              </div>
+              {visibleMessages.length > 0 || pane.contextInherited ? (
+                <div className="flex items-center gap-1.5 truncate text-[10px] text-text-faint">
+                  {visibleMessages.length > 0 && (
+                    <span className="rounded bg-surface-card px-1 text-text-subtle">
+                      {visibleMessages.length} 条
+                    </span>
+                  )}
+                  {pane.contextInherited && (
+                    <span className="rounded bg-emerald-500/20 px-1 text-emerald-400">已继承</span>
+                  )}
+                </div>
+              ) : null}
             </div>
           </div>
           <div className="no-drag flex shrink-0 items-center gap-1">
             {isGroupPane && (
               <button
-                className={`rounded px-2 py-0.5 text-[11px] transition ${
-                  pane.membersPanelOpen
-                    ? "bg-surface-card-strong text-text-strong"
-                    : "text-text-faint hover:bg-surface-hover hover:text-text-strong"
-                }`}
-                onClick={() => cycleSidePanel(pane.id, "members")}
+                className={`agx-topbar-btn !px-[5px] ${pane.membersPanelOpen ? "agx-topbar-btn--active" : ""}`}
+                onClick={toggleMembersSidePanel}
                 title="切换群成员面板"
               >
-                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <circle cx="6" cy="5" r="2.2" stroke="currentColor" strokeWidth="1.3"/>
-                  <path d="M2 13c0-2.21 1.79-4 4-4s4 1.79 4 4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-                  <circle cx="11.5" cy="5.5" r="1.7" stroke="currentColor" strokeWidth="1.2"/>
-                  <path d="M13.5 13c0-1.66-1-3-2.5-3.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
-                </svg>
+                <Users className="h-[18px] w-[18px]" strokeWidth={1.8} />
+              </button>
+            )}
+            {!isGroupPane && (
+              <button
+                type="button"
+                className="agx-topbar-btn !px-[5px]"
+                onClick={() => toggleFocusMode(pane.id)}
+                title="灵巧模式 · 实时语音 (⇧⌘F)"
+                aria-label="进入灵巧模式"
+              >
+                <PhoneCall className="h-[18px] w-[18px]" strokeWidth={1.8} />
               </button>
             )}
             <button
-              className={`rounded px-2 py-0.5 text-[11px] transition ${
-                workspacePanelOpen
-                  ? "bg-surface-card-strong text-text-strong"
-                  : "text-text-faint hover:bg-surface-hover hover:text-text-strong"
-              }`}
-              onClick={() => cycleSidePanel(pane.id, "workspace")}
+              className={`agx-topbar-btn !px-[5px] ${workspacePanelOpen ? "agx-topbar-btn--active" : ""}`}
+              onClick={toggleWorkspaceSidePanel}
               title="切换工作区面板"
             >
-              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M2 4.5C2 3.67 2.67 3 3.5 3H6.38L7.88 4.5H12.5C13.33 4.5 14 5.17 14 6V11.5C14 12.33 13.33 13 12.5 13H3.5C2.67 13 2 12.33 2 11.5V4.5Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round"/>
-              </svg>
+              <FolderOpen className="h-[18px] w-[18px]" strokeWidth={1.8} />
             </button>
             {paneSubAgents.length > 0 ? (
               <button
-                className={`rounded px-2 py-0.5 text-[11px] transition ${
-                  pane.spawnsColumnOpen
-                    ? "bg-surface-card-strong text-text-strong"
-                    : "text-text-faint hover:bg-surface-hover hover:text-text-strong"
-                }`}
-                onClick={() => {
-                  if (pane.spawnsColumnOpen) {
-                    dismissSpawnsColumn(
-                      pane.id,
-                      paneSubAgents.map((s) => s.id)
-                    );
-                  } else {
-                    setSpawnsColumnOpen(pane.id, true);
-                  }
-                }}
+                className={`agx-topbar-btn !px-[5px] ${pane.spawnsColumnOpen ? "agx-topbar-btn--active" : ""}`}
+                onClick={toggleSpawnsSideColumn}
                 title={pane.spawnsColumnOpen ? "收起 Spawns 列" : "打开 Spawns 列"}
               >
-                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <rect x="3" y="6" width="10" height="7" rx="2" stroke="currentColor" strokeWidth="1.3"/>
-                  <path d="M6 6V4.5A2 2 0 0 1 10 4.5V6" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-                  <circle cx="5.5" cy="9.5" r="0.8" fill="currentColor"/>
-                  <circle cx="10.5" cy="9.5" r="0.8" fill="currentColor"/>
-                  <path d="M1.5 8.5V10.5M14.5 8.5V10.5" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-                  <path d="M6 12h4" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-                </svg>
+                <Bot className="h-[18px] w-[18px]" strokeWidth={1.8} />
               </button>
             ) : null}
             <button
-              className={`rounded px-2 py-0.5 text-[11px] transition ${
-                pane.historyOpen
-                  ? "bg-surface-card-strong text-text-strong"
-                  : "text-text-faint hover:bg-surface-hover hover:text-text-strong"
-              }`}
-              onClick={() => togglePaneHistory(pane.id)}
+              className={`agx-topbar-btn !px-[5px] ${pane.historyOpen ? "agx-topbar-btn--active" : ""}`}
+              onClick={toggleHistorySidePanel}
               title="切换历史面板"
             >
-              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M2.5 3C2.5 2.17 3.17 1.5 4 1.5H12C12.83 1.5 13.5 2.17 13.5 3V9C13.5 9.83 12.83 10.5 12 10.5H9L6.5 13V10.5H4C3.17 10.5 2.5 9.83 2.5 9V3Z" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round"/>
-                <path d="M5 5H11M5 7.5H9" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-              </svg>
+              <History className="h-[18px] w-[18px]" strokeWidth={1.8} />
             </button>
             <button
-              className="rounded px-2 py-0.5 text-[11px] text-text-faint transition hover:bg-surface-hover hover:text-status-error"
+              className="agx-topbar-btn !px-[5px] hover:text-status-error"
               onClick={closePaneAndCleanupEmptySession}
               title="关闭窗格"
             >
-              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M4 4L12 12M12 4L4 12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
-              </svg>
+              <X className="h-[18px] w-[18px]" strokeWidth={1.8} />
             </button>
           </div>
         </div>
 
-        <div
-          ref={listRef}
-          className="agx-pane-message-list relative min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-3"
-        >
-          {focusComposerOnly ? null : !pane.sessionId && (isGroupPane || isAutomationTaskPane) ? (
+        <div className="relative min-h-0 min-w-0 flex-1">
+          <div
+            ref={listRef}
+            className="agx-pane-message-list relative h-full min-h-0 min-w-0 overflow-y-auto overflow-x-hidden px-4 py-3"
+          >
+          {!pane.sessionId && (isGroupPane || isAutomationTaskPane) ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 text-xs text-text-faint">
               <span className="animate-pulse">正在初始化会话...</span>
               <button
@@ -4617,7 +6597,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               ) : null}
             </div>
           ) : (
-            <div className="min-w-0 space-y-2">
+            <div className="mx-auto flex min-w-0 w-full max-w-4xl flex-col gap-3">
               {renderedMessages}
             </div>
           )}
@@ -4629,6 +6609,27 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             onClose={() => setAttachToastOpen(false)}
             timeoutMs={3200}
           />
+          </div>
+
+          {showJumpToBottomFab ? (
+            <div className="pointer-events-none absolute bottom-3 left-0 right-0 z-30 flex justify-center">
+              <button
+                type="button"
+                className="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-full border border-border bg-surface-card-strong/95 text-text-strong shadow-lg backdrop-blur-sm transition hover:bg-surface-hover"
+                aria-label="回到底部"
+                title="回到底部"
+                onClick={() => {
+                  const el = listRef.current;
+                  if (!el) return;
+                  autoScrollPinnedRef.current = true;
+                  el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+                  flushJumpToBottomFab();
+                }}
+              >
+                <ChevronDown className="h-5 w-5" strokeWidth={2.25} aria-hidden />
+              </button>
+            </div>
+          ) : null}
         </div>
 
         {/* 收藏 Toast：位于消息列表与输入框之间，水平居中 */}
@@ -4640,40 +6641,34 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           </div>
         )}
 
-        <div className="agx-pane-composer-shell shrink-0 border-t border-border px-4 py-2.5">
-          <div className="agx-pane-composer-meta mb-1 flex min-w-0 flex-wrap items-center gap-1.5 text-[11px] text-text-faint">
-            {(() => {
-              const tkIn = pane.sessionTokens?.input ?? 0;
-              const tkOut = pane.sessionTokens?.output ?? 0;
-              const tkTotal = tkIn + tkOut;
-              return (
-                <span
-                  className="shrink-0 rounded border border-border bg-surface-card px-2 py-0.5"
-                  title={tkTotal > 0
-                    ? `↑ ${tkIn.toLocaleString()} input  ↓ ${tkOut.toLocaleString()} output`
-                    : "本次会话累计 token 消耗"}
-                >
-                  {tkTotal > 0 ? `${(tkTotal / 1000).toFixed(1)}k tokens` : "0 tokens"}
-                </span>
-              );
-            })()}
-            <span className="shrink-0 truncate rounded border border-border bg-surface-card px-2 py-0.5" style={{ maxWidth: "45%" }}>
-              {pane.sessionId
-                ? `${pane.sessionId.slice(0, 8)}…`
-                : !isGroupPane && !isAutomationTaskPane
-                  ? "未创建"
-                  : "-"}
-            </span>
-            {chatProvider && chatModel ? (
-              <span
-                className="min-w-0 truncate rounded border border-border bg-surface-card px-2 py-0.5"
-                style={{ maxWidth: "55%" }}
-                title={`${chatProvider}/${chatModel}`}
-              >
-                {chatProviderDisplay}/{chatModel}
-              </span>
-            ) : null}
-          </div>
+        {/* 外层 px 与列表 agx-pane-message-list 一致，内层 max-w-4xl 单独一层，避免「padding 吃进 max-width」导致输入框比气泡窄一截 */}
+        <div className="shrink-0 px-4 pt-2.5 pb-4">
+          <div className="agx-pane-composer-shell mx-auto min-w-0 w-full max-w-4xl">
+          <StickyTaskBar
+            messages={pane.messages ?? []}
+            liveness={taskLiveness}
+            executionState={sessionExecutionState}
+            silentSeconds={silentSeconds}
+            onResume={() => void resumeCurrentTask()}
+            codeDevMode={false}
+            phase={undefined}
+            toolBudget={{ used: toolRoundCount, total: toolRoundBudget }}
+            readFiles={0}
+          />
+          {bgCompleteToast ? (
+            <div className="pointer-events-none mb-1 flex justify-center">
+              <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-200">
+                后台任务已完成
+              </div>
+            </div>
+          ) : null}
+          {stallHintToast ? (
+            <div className="pointer-events-none mb-1 flex justify-center">
+              <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs text-amber-200">
+                {stallHintToast}
+              </div>
+            </div>
+          ) : null}
           {selectedSubAgent ? (
             <div className="mb-1 inline-flex items-center gap-2 rounded border border-border bg-surface-card px-2 py-0.5 text-xs text-text-muted">
               对话目标: {selectedSubAgent}
@@ -4728,38 +6723,82 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               <button className="rounded px-1 hover:bg-surface-hover" onClick={() => setSelectedMessageIds(new Set())}>取消</button>
             </div>
           ) : null}
-          <div className="agx-pane-composer-body relative rounded-2xl border border-border bg-surface-card transition-colors focus-within:border-border-strong">
+          <MessageQueuePanel
+            messages={queuedMessages}
+            onEdit={(id, newText) => editPendingMessage(paneId, id, newText)}
+            onRemove={(id) => removePendingMessage(paneId, id)}
+            onSendNow={sendQueuedMessageNow}
+          />
+          {(sessionExecutionState === "running" || stallState === "stall" || sessionUnattended) && (
+            <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] text-text-muted">
+              <span className="rounded-full bg-surface-panel/75 px-2 py-0.5">
+                {currentModelLabel}
+                {sessionExecutionState === "running"
+                  ? " · 运行中"
+                  : sessionWorkInProgress
+                    ? " · 处理中"
+                    : ""}
+                {silentSeconds > 0 ? ` · 静默 ${silentSeconds}s` : ""}
+                {lastToolProgress?.name
+                  ? ` · ${lastToolProgress.name}${lastToolProgress.sec > 0 ? ` ${lastToolProgress.sec}s` : ""}`
+                  : ""}
+              </span>
+              {sessionUnattended && unattendedGlobalEnabled ? (
+                <span className="rounded-full bg-violet-500/10 px-2 py-0.5 text-violet-200">
+                  无人值守 · 续跑 {autoNudgeCount}/{unattendedMaxContinuations}
+                </span>
+              ) : null}
+              {unattendedGlobalEnabled ? (
+                <button
+                  type="button"
+                  onClick={() => void toggleSessionUnattended()}
+                  className={`rounded-full px-2 py-0.5 transition outline-none focus-visible:outline-none ${
+                    sessionUnattended
+                      ? "bg-violet-500/15 text-violet-200"
+                      : "bg-surface-panel/75 text-text-muted hover:text-text-strong"
+                  }`}
+                >
+                  {sessionUnattended ? "本会话无人值守：开" : "本会话无人值守：关"}
+                </button>
+              ) : null}
+              {!isStreamingCurrentSession && sessionExecutionState === "running" ? (
+                <span className="text-amber-300/90">后台运行中</span>
+              ) : null}
+            </div>
+          )}
+          <div className="agx-pane-composer-body agx-theme-focus-ring relative rounded-2xl border border-transparent bg-surface-card transition-all duration-300 ease-out">
             {visibleAttachmentEntries.length > 0 ? (
-              <div className="flex flex-wrap gap-1.5 px-3 pt-3">
+              <div className="flex flex-wrap gap-2 px-3 pt-3">
                 {visibleAttachmentEntries.map(([key, file]) => (
                   <AttachmentChip key={key} file={file} onRemove={() => removeAttachment(key)} />
                 ))}
               </div>
             ) : null}
-            <div className="pointer-events-none absolute right-3 top-2 z-10 flex items-center gap-2">
-              {composerExpanded ? (
-                <span className="text-xs text-text-faint">↩ 键可用于换行</span>
-              ) : null}
-              <button
-                type="button"
-                className="pointer-events-auto inline-flex h-8 w-8 items-center justify-center rounded-xl text-text-faint/55 outline-none transition hover:bg-surface-hover hover:text-text-strong focus:outline-none focus-visible:bg-surface-hover focus-visible:text-text-strong"
-                aria-label={composerExpanded ? "收起输入区" : "展开输入区"}
-                title={composerExpanded ? "收起输入区（Enter 发送）" : "展开输入区（Enter 换行）"}
-                onClick={() => setComposerExpanded((prev) => !prev)}
-              >
+            <div className="relative">
+              <div className="pointer-events-none absolute right-3 top-2 z-10 flex items-center gap-2">
                 {composerExpanded ? (
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-[15px] w-[15px]">
-                    <path d="M9 5H5v4M15 5h4v4M5 15v4h4M19 15v4h-4" />
-                  </svg>
-                ) : (
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-[15px] w-[15px]">
-                    <path d="M15 5h4v4M9 5H5v4M5 15v4h4M19 15v4h-4" />
-                  </svg>
-                )}
-              </button>
-            </div>
-            <div
-              ref={composerRef}
+                  <span className="text-xs text-text-faint">↩ 键可用于换行</span>
+                ) : null}
+                <button
+                  type="button"
+                  className="pointer-events-auto inline-flex h-8 w-8 items-center justify-center rounded-xl text-text-faint/55 outline-none transition hover:bg-surface-hover hover:text-text-strong focus:outline-none focus-visible:bg-surface-hover focus-visible:text-text-strong"
+                  aria-label={composerExpanded ? "收起输入区" : "展开输入区"}
+                  title={composerExpanded ? "收起输入区（Enter 发送）" : "展开输入区（Enter 换行）"}
+                  onClick={() => setComposerExpanded((prev) => !prev)}
+                >
+                  {composerExpanded ? (
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-[15px] w-[15px]">
+                      <path d="M9 5H5v4M15 5h4v4M5 15v4h4M19 15v4h-4" />
+                    </svg>
+                  ) : (
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-[15px] w-[15px]">
+                      <path d="M15 5h4v4M9 5H5v4M5 15v4h4M19 15v4h-4" />
+                    </svg>
+                  )}
+                </button>
+              </div>
+              <div
+                ref={composerRef}
               contentEditable
               suppressContentEditableWarning
               onInput={() => {
@@ -4841,13 +6880,13 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                       const mention = `@${first.label} `;
                       const base = extractComposerText();
                       const next = base.replace(/(?:^|\s)@[^\s@]*$/, (text) => `${text.startsWith(" ") ? " " : ""}${mention}`);
-                      setComposerText(next);
+                      setComposerText(next, { tokenNames: [first.alias || first.label] });
                       void addTaskspaceAliasReference(first.taskspaceId, first.alias, first.path);
                     } else {
                       const mention = `@${first.label} `;
                       const base = extractComposerText();
                       const next = base.replace(/(?:^|\s)@[^\s@]*$/, (text) => `${text.startsWith(" ") ? " " : ""}${mention}`);
-                      setComposerText(next, { tokenNames: [first.label] });
+                      setComposerText(next, { tokenNames: [first.alias || first.label] });
                       void addContextFile(first.taskspaceId, first.path, { referenceToken: true });
                     }
                     return;
@@ -4855,36 +6894,59 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                   if (composerExpanded) {
                     if (e.metaKey || e.ctrlKey) {
                       e.preventDefault();
+                      lastComposerEnterAtRef.current = 0;
                       void sendChat(extractComposerText());
                     }
                     return;
                   }
                   e.preventDefault();
-                  void sendChat(extractComposerText());
+                  const composerText = extractComposerText();
+                  const trimmedComposer = composerText.trim();
+                  const hasComposerPayload = !!trimmedComposer || readyAttachments.length > 0;
+                  const sid = (pane.sessionId || "").trim();
+                  const streamActive = !!sessionStreamStateRef.current[sid]?.active;
+                  const queue = useAppStore.getState().pendingMessages[paneId] ?? [];
+
+                  if (streamActive) {
+                    const sendQueuedNow =
+                      isDoubleEnterWithinWindow(lastComposerEnterAtRef.current) ||
+                      (!hasComposerPayload && queue.length > 0 && lastComposerEnterAtRef.current > 0);
+
+                    if (sendQueuedNow) {
+                      lastComposerEnterAtRef.current = 0;
+                      if (hasComposerPayload) {
+                        void sendChat(composerText, { forceSend: true });
+                      } else {
+                        const latestQueued = queue[queue.length - 1];
+                        if (latestQueued) void sendQueuedMessageNow(latestQueued.id);
+                      }
+                      return;
+                    }
+
+                    if (!hasComposerPayload) return;
+
+                    lastComposerEnterAtRef.current = Date.now();
+                    void sendChat(composerText);
+                    return;
+                  }
+
+                  lastComposerEnterAtRef.current = 0;
+                  void sendChat(composerText);
                 }
               }}
-              className={`agx-pane-composer-input block w-full overflow-y-auto whitespace-pre-wrap break-words bg-transparent px-4 pb-0 pt-3 text-sm text-text-primary outline-none ${
-                composerExpanded ? "max-h-[62vh] min-h-[260px] pr-40" : "max-h-[220px] min-h-[40px] pr-4"
+              className={`agx-pane-composer-input block w-full overflow-y-auto whitespace-pre-wrap break-words bg-transparent px-4 pb-0 pt-4 text-[15px] leading-relaxed text-text-primary outline-none ${
+                // 收起时右侧留白需覆盖「展开输入」角标（absolute right-3 + w-8），pr-4 会导致首行末字与按钮重叠
+                composerExpanded ? "max-h-[62vh] min-h-[260px] pr-40" : "max-h-[220px] min-h-[72px] pr-14"
               }`}
             />
             {input.trim().length === 0 ? (
-              <div className="agx-pane-composer-placeholder pointer-events-none absolute left-4 top-3 text-sm text-text-faint">
-                {focusMode ? "开始任务..." : "发消息..."}
+              <div className="agx-pane-composer-placeholder pointer-events-none absolute left-4 top-4 text-[15px] text-text-faint">
+                发消息...
               </div>
             ) : null}
-            <div className="agx-pane-composer-actions flex min-w-0 items-center justify-between gap-1 px-2 pb-2 pt-1">
+            </div>
+            <div className="agx-pane-composer-actions flex min-w-0 items-center justify-between gap-1 px-2.5 pb-2.5 pt-1">
               <div className="flex shrink-0 items-center gap-0.5">
-                {focusMode ? (
-                  <button
-                    type="button"
-                    className="flex h-7 w-7 items-center justify-center rounded-lg text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
-                    onClick={exitFocusMode}
-                    title="展开回主界面 (⇧⌘F)"
-                    aria-label="展开回主界面"
-                  >
-                    <Expand className="h-[15px] w-[15px]" strokeWidth={1.8} />
-                  </button>
-                ) : null}
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -4909,18 +6971,49 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                   }}
                 />
                 <button
-                  className="flex h-7 w-7 items-center justify-center rounded-lg text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
+                  className="flex h-7 w-7 items-center justify-center rounded-lg text-text-muted transition hover:bg-surface-hover hover:text-text-strong"
                   title="上传附件"
                   onClick={() => fileInputRef.current?.click()}
                 >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-[15px] w-[15px]">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="h-[15px] w-[15px]">
                     <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" />
                   </svg>
                 </button>
-                <NewTopicIconButtons onNewTopic={createNewTopic} />
+                <NewTopicSplitControl onNewTopic={createNewTopic} />
+                <SkillPickerButton
+                  apiBase={apiBase}
+                  apiToken={apiToken}
+                  onSelect={(skill) => {
+                    const el = composerRef.current;
+                    if (!el) return;
+                    const skillToken = createSkillRefToken(skill.name);
+                    const space = document.createTextNode(" ");
+                    // Insert at current caret or append to end
+                    const sel = window.getSelection();
+                    if (sel && sel.rangeCount > 0 && el.contains(sel.anchorNode)) {
+                      const range = sel.getRangeAt(0);
+                      range.deleteContents();
+                      range.insertNode(space);
+                      range.insertNode(skillToken);
+                      range.setStartAfter(space);
+                      range.setEndAfter(space);
+                      sel.removeAllRanges();
+                      sel.addRange(range);
+                    } else {
+                      el.appendChild(skillToken);
+                      el.appendChild(space);
+                      focusComposerEnd();
+                    }
+                    // Sync input state
+                    setInput(extractComposerText());
+                  }}
+                />
+                <div className="flex items-center">
+                  <PaneKnowledgeRetrievalModeSwitch apiToken={apiToken} apiBase={apiBase} />
+                </div>
                 <button
                   type="button"
-                  className="flex h-7 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-2 text-[12px] text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-text-muted transition hover:bg-surface-hover hover:text-text-strong"
                   title="更多"
                 >
                   <svg
@@ -4934,52 +7027,59 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                     <rect x="3" y="13" width="8" height="8" rx="1.5" />
                     <rect x="13" y="13" width="8" height="8" rx="1.5" />
                   </svg>
-                  <span className="shrink-0">更多</span>
                 </button>
               </div>
               {/* ── Team mode action bar (routing="team" only) ─────────── */}
-              {isGroupPane && activeGroup?.routing === "team" && (
-                <div className="flex items-center gap-1 mr-1">
-                  <button
-                    className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] text-text-faint transition hover:bg-indigo-500/10 hover:text-indigo-400"
-                    title="插入任务到队列"
-                    onClick={() => {
-                      const taskDesc = extractComposerText().trim();
-                      if (taskDesc) {
-                        void sendGroupTeamAction("add_task", { task_description: taskDesc });
-                      }
-                    }}
-                  >
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5">
-                      <path d="M12 5v14M5 12h14" />
-                    </svg>
-                    <span className="hidden sm:inline">插入任务</span>
-                  </button>
-                  {isStreamingCurrentSession ? (
+              <div className="flex shrink-0 items-center gap-1.5">
+                {isGroupPane && activeGroup?.routing === "team" && (
+                  <div className="flex items-center gap-1 mr-1">
                     <button
-                      className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] text-amber-400 transition hover:bg-amber-500/10"
-                      title="暂停团队任务"
-                      onClick={() => void sendGroupTeamAction("pause")}
+                      className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] text-text-faint transition hover:bg-indigo-500/10 hover:text-indigo-400"
+                      title="插入任务到队列"
+                      onClick={() => {
+                        const taskDesc = extractComposerText().trim();
+                        if (taskDesc) {
+                          void sendGroupTeamAction("add_task", { task_description: taskDesc });
+                        }
+                      }}
                     >
-                      <svg viewBox="0 0 24 24" fill="currentColor" className="h-3.5 w-3.5">
-                        <rect x="6" y="4" width="4" height="16" />
-                        <rect x="14" y="4" width="4" height="16" />
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5">
+                        <path d="M12 5v14M5 12h14" />
                       </svg>
-                      <span className="hidden sm:inline">暂停</span>
+                      <span className="hidden sm:inline">插入任务</span>
                     </button>
-                  ) : null}
-                </div>
-              )}
-              <ActionCircleButton
-                hasInput={!!pane.sessionId && (!!input.trim() || readyAttachments.length > 0)}
-                streaming={canInterruptCurrentSession}
-                recording={recording}
-                onSend={() => {
-                  void sendChat(extractComposerText());
-                }}
-                onMic={onMicClick}
-                onStop={stopCurrentRun}
-              />
+                    {isStreamingCurrentSession ? (
+                      <button
+                        className="flex h-7 items-center gap-1 rounded-lg px-2 text-[11px] text-amber-400 transition hover:bg-amber-500/10"
+                        title="暂停团队任务"
+                        onClick={() => void sendGroupTeamAction("pause")}
+                      >
+                        <svg viewBox="0 0 24 24" fill="currentColor" className="h-3.5 w-3.5">
+                          <rect x="6" y="4" width="4" height="16" />
+                          <rect x="14" y="4" width="4" height="16" />
+                        </svg>
+                        <span className="hidden sm:inline">暂停</span>
+                      </button>
+                    ) : null}
+                  </div>
+                )}
+                <PaneModelPicker paneId={pane.id} />
+                <ActionCircleButton
+                  hasInput={!!pane.sessionId && (!!input.trim() || readyAttachments.length > 0)}
+                  /* `canInterruptCurrentSession` 只覆盖"当前 pane 自己发起 SSE"的场景。
+                   * 分身被 Meta 委派时，分身 pane 自己没有 SSE，但任务确实在跑。
+                   * 用 `hasDelegation` 兜底，让分身/Meta 视角下都能看到 stop 按钮，
+                   * 后端 `interruptSession` 对任意 session_id 生效。 */
+                  streaming={showStopButton}
+                  recording={recording}
+                  onSend={() => {
+                    lastComposerEnterAtRef.current = 0;
+                    void sendChat(extractComposerText());
+                  }}
+                  onMic={onMicClick}
+                  onStop={stopCurrentRun}
+                />
+              </div>
             </div>
           </div>
           {atOpen ? (
@@ -5011,7 +7111,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                         const mention = `@${item.label} `;
                         const base = extractComposerText();
                         const next = base.replace(/(?:^|\s)@[^\s@]*$/, (text) => `${text.startsWith(" ") ? " " : ""}${mention}`);
-                        setComposerText(next);
+                        setComposerText(next, { tokenNames: [item.alias || item.label] });
                         void addTaskspaceAliasReference(item.taskspaceId, item.alias, item.path);
                       } else {
                         const mention = `@${item.label} `;
@@ -5032,40 +7132,35 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               )}
             </div>
           ) : null}
-          <div className="agx-pane-composer-tail mt-1.5 flex items-center gap-2">
-            <PaneModelPicker paneId={pane.id} />
-            <PaneKnowledgeRetrievalModeSwitch apiToken={apiToken} apiBase={apiBase} />
           </div>
         </div>
       </div>
 
-      {isGroupPane && pane.membersPanelOpen ? (
+      {!compactSidePanels && isGroupPane && pane.membersPanelOpen ? (
         <div className="relative h-full shrink-0 overflow-hidden border-l border-border" style={{ width: taskspaceWidth }}>
           <div
             className="group absolute -left-[3px] top-0 z-20 h-full w-2 cursor-col-resize"
             onMouseDown={startResizeTaskspace}
             title="拖拽调整面板宽度"
           >
-            <div className="mx-auto h-full w-px transition" style={{ background: "var(--ui-accent-divider)" }} />
-            <div className="pointer-events-none absolute left-1/2 top-1/2 h-10 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full border bg-surface-panel opacity-60 transition group-hover:opacity-90" style={{ borderColor: "var(--ui-accent-divider-hover)" }} />
+            <div className="mx-auto h-full w-px bg-[var(--ui-accent-divider)] transition-all duration-200 group-hover:w-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
           </div>
           <GroupMembersSidePanel
             groupId={groupChatId}
             avatarList={avatars}
             metaLeaderLabel={metaLeaderDisplayName}
-            onClose={() => cycleSidePanel(pane.id, "members")}
+            onClose={closeMembersPanelOnly}
           />
         </div>
       ) : null}
-      {workspacePanelOpen ? (
+      {!compactSidePanels && workspacePanelOpen ? (
         <div className="relative h-full shrink-0 overflow-hidden border-l border-border" style={{ width: taskspaceWidth }}>
           <div
             className="group absolute -left-[3px] top-0 z-20 h-full w-2 cursor-col-resize"
             onMouseDown={startResizeTaskspace}
             title="拖拽调整工作区面板宽度"
           >
-            <div className="mx-auto h-full w-px transition" style={{ background: "var(--ui-accent-divider)" }} />
-            <div className="pointer-events-none absolute left-1/2 top-1/2 h-10 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full border bg-surface-panel opacity-60 transition group-hover:opacity-90" style={{ borderColor: "var(--ui-accent-divider-hover)" }} />
+            <div className="mx-auto h-full w-px bg-[var(--ui-accent-divider)] transition-all duration-200 group-hover:w-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
           </div>
           <WorkspacePanel
             paneId={pane.id}
@@ -5073,7 +7168,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             activeTaskspaceId={pane.activeTaskspaceId}
             onActiveTaskspaceChange={(taskspaceId) => setActiveTaskspace(pane.id, taskspaceId)}
             autoRefreshKey={taskspaceAutoRefreshKey}
-            onClose={() => cycleSidePanel(pane.id, "workspace")}
+            onClose={closeWorkspacePanelOnly}
             tintColor={paneTint}
             onPickFileForReference={(path) => {
               if (!pane.activeTaskspaceId) return;
@@ -5089,7 +7184,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           />
         </div>
       ) : null}
-      {pane.spawnsColumnOpen ? (
+      {!compactSidePanels && pane.spawnsColumnOpen ? (
         <SpawnsColumn
           width={spawnsWidth}
           sessionId={pane.sessionId || undefined}
@@ -5113,9 +7208,138 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           tintColor={paneTint}
         />
       ) : null}
-      <HistoryPanelBoundary key={`hpb-${pane.id}-${pane.historyOpen}`}>
-        <SessionHistoryPanel pane={pane} onClose={() => togglePaneHistory(pane.id)} tintColor={paneTint} />
-      </HistoryPanelBoundary>
+      {!compactSidePanels && pane.historyOpen ? (
+        <div className="relative h-full shrink-0 overflow-hidden border-l border-border" style={{ width: historyWidth }}>
+          <div
+            className="group absolute -left-[3px] top-0 z-20 h-full w-2 cursor-col-resize"
+            onMouseDown={startResizeHistory}
+            title="拖拽调整历史面板宽度"
+          >
+            <div className="mx-auto h-full w-px bg-[var(--ui-accent-divider)] transition-all duration-200 group-hover:w-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
+          </div>
+          <HistoryPanelBoundary key={`hpb-${pane.id}-${pane.historyOpen}-inline`}>
+            <SessionHistoryPanel pane={pane} onClose={closeHistoryPanelOnly} tintColor={paneTint} />
+          </HistoryPanelBoundary>
+        </div>
+      ) : null}
+
+      {compactSidePanels &&
+      (workspacePanelOpen ||
+        pane.historyOpen ||
+        (isGroupPane && pane.membersPanelOpen) ||
+        pane.spawnsColumnOpen) ? (
+        <>
+          <div
+            aria-hidden
+            role="presentation"
+            className="pointer-events-auto absolute inset-x-0 bottom-0 top-10 z-[45] bg-black/35 backdrop-blur-[1px]"
+            style={{ WebkitAppRegion: "no-drag" } as CSSProperties}
+            onClick={dismissAuxiliaryOverlays}
+          />
+          {isGroupPane && pane.membersPanelOpen ? (
+            <div
+              className="pointer-events-auto absolute bottom-0 right-0 top-10 z-50 shrink-0 overflow-hidden border-l border-border bg-surface-base shadow-[6px_0_24px_rgba(0,0,0,0.28)]"
+              style={{ width: overlayTaskspaceWidth, WebkitAppRegion: "no-drag" } as CSSProperties}
+            >
+              <div
+                className="group absolute -left-[3px] top-0 z-20 h-full w-2 cursor-col-resize"
+                onMouseDown={startResizeTaskspace}
+                title="拖拽调整面板宽度"
+              >
+                <div className="mx-auto h-full w-px bg-[var(--ui-accent-divider)] transition-all duration-200 group-hover:w-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
+              </div>
+              <GroupMembersSidePanel
+                groupId={groupChatId}
+                avatarList={avatars}
+                metaLeaderLabel={metaLeaderDisplayName}
+                onClose={closeMembersPanelOnly}
+              />
+            </div>
+          ) : null}
+          {workspacePanelOpen ? (
+            <div
+              className="pointer-events-auto absolute bottom-0 right-0 top-10 z-50 shrink-0 overflow-hidden border-l border-border bg-surface-base shadow-[6px_0_24px_rgba(0,0,0,0.28)]"
+              style={{ width: overlayTaskspaceWidth, WebkitAppRegion: "no-drag" } as CSSProperties}
+            >
+              <div
+                className="group absolute -left-[3px] top-0 z-20 h-full w-2 cursor-col-resize"
+                onMouseDown={startResizeTaskspace}
+                title="拖拽调整工作区面板宽度"
+              >
+                <div className="mx-auto h-full w-px bg-[var(--ui-accent-divider)] transition-all duration-200 group-hover:w-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
+              </div>
+              <WorkspacePanel
+                paneId={pane.id}
+                sessionId={pane.sessionId}
+                activeTaskspaceId={pane.activeTaskspaceId}
+                onActiveTaskspaceChange={(taskspaceId) => setActiveTaskspace(pane.id, taskspaceId)}
+                autoRefreshKey={taskspaceAutoRefreshKey}
+                onClose={closeWorkspacePanelOnly}
+                tintColor={paneTint}
+                onPickFileForReference={(path) => {
+                  if (!pane.activeTaskspaceId) return;
+                  void addContextFile(pane.activeTaskspaceId, path, { referenceToken: true });
+                  const fileName = path.split(/[\\/]/).pop() || path;
+                  const mention = `@${fileName}`;
+                  const base = extractComposerText();
+                  const trimmed = base.trimEnd();
+                  const sep = !trimmed || /\s$/.test(base) ? "" : " ";
+                  const next = `${base}${sep}${mention} `;
+                  setComposerText(next, { tokenNames: [fileName] });
+                }}
+              />
+            </div>
+          ) : null}
+          {pane.spawnsColumnOpen ? (
+            <div
+              className="pointer-events-auto absolute bottom-0 right-0 top-10 z-50 shrink-0 overflow-hidden shadow-[6px_0_24px_rgba(0,0,0,0.28)]"
+              style={{ width: overlaySpawnsWidth, WebkitAppRegion: "no-drag" } as CSSProperties}
+            >
+              <SpawnsColumn
+                width={overlaySpawnsWidth}
+                sessionId={pane.sessionId || undefined}
+                subAgents={paneSubAgents}
+                selectedSubAgent={selectedSubAgent}
+                onResizeStart={startResizeSpawns}
+                onClose={() => dismissSpawnsColumn(pane.id, paneSubAgents.map((s) => s.id))}
+                onCancel={(agentId) => void cancelPaneSubAgent(agentId)}
+                onRetry={(agentId) => void retryPaneSubAgent(agentId)}
+                onChat={(agentId) => {
+                  const sub = paneSubAgents.find((item) => item.id === agentId);
+                  const isDelegation =
+                    agentId.startsWith("dlg-") ||
+                    !!(sub?.events?.some((evt) => evt.type.startsWith("delegation")));
+                  if (isDelegation) {
+                    void openDelegatedAvatarSession(agentId);
+                    return;
+                  }
+                  setSelectedSubAgent(agentId);
+                }}
+                onSelect={(agentId) => setSelectedSubAgent(agentId)}
+                onConfirmResolve={(agentId, approved) => void resolvePaneSubAgentConfirm(agentId, approved)}
+                tintColor={paneTint}
+              />
+            </div>
+          ) : null}
+          {pane.historyOpen ? (
+            <div
+              className="pointer-events-auto absolute bottom-0 right-0 top-10 z-50 shrink-0 overflow-hidden border-l border-border bg-surface-base shadow-[6px_0_24px_rgba(0,0,0,0.28)]"
+              style={{ width: overlayHistoryWidth, WebkitAppRegion: "no-drag" } as CSSProperties}
+            >
+              <div
+                className="group absolute -left-[3px] top-0 z-20 h-full w-2 cursor-col-resize"
+                onMouseDown={startResizeHistory}
+                title="拖拽调整历史面板宽度"
+              >
+                <div className="mx-auto h-full w-px bg-[var(--ui-accent-divider)] transition-all duration-200 group-hover:w-[2px] group-hover:bg-[var(--ui-btn-primary-bg)]" />
+              </div>
+              <HistoryPanelBoundary key={`hpb-${pane.id}-${pane.historyOpen}-overlay`}>
+                <SessionHistoryPanel pane={pane} onClose={closeHistoryPanelOnly} tintColor={paneTint} />
+              </HistoryPanelBoundary>
+            </div>
+          ) : null}
+        </>
+      ) : null}
       <ForwardPicker
         open={forwardPickerOpen}
         currentSessionId={pane.sessionId}

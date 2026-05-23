@@ -1,0 +1,140 @@
+import { useMemo, useState } from "react";
+import type { Message } from "../../store";
+import { Check, ChevronDown, ChevronRight } from "lucide-react";
+import { ToolCallCard } from "./ToolCallCard";
+import type { ReactNode } from "react";
+import { TodoUpdateCard } from "../TodoUpdateCard";
+import { isTodoUpdateToolMessage } from "./MessageRenderer";
+
+type Props = {
+  messages: Message[];
+  highlightTerms?: string[];
+  /** Passed through to each ToolCallCard */
+  renderExtras?: (message: Message) => ReactNode;
+  selectable?: boolean;
+  selectedIds?: Set<string>;
+  onToggleSelectMessage?: (message: Message) => void;
+  /** Parent ReAct column already shows Machi avatar — drop left spacer. */
+  omitLeadingSpacer?: boolean;
+  /** When true, remove outer border/rounded so parent unified container provides the single border. */
+  flat?: boolean;
+};
+
+function countToolNames(msgs: Message[]): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const msg of msgs) {
+    const n = String(msg.toolName ?? "").trim() || "tool";
+    m.set(n, (m.get(n) ?? 0) + 1);
+  }
+  return m;
+}
+
+export function TurnToolGroupCard({
+  messages,
+  highlightTerms,
+  renderExtras,
+  selectable,
+  selectedIds,
+  onToggleSelectMessage,
+  omitLeadingSpacer = false,
+  flat = false,
+}: Props) {
+  const [expanded, setExpanded] = useState(false);
+  const summary = useMemo(() => {
+    const counts = countToolNames(messages);
+    const parts = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([name, c]) => `${c} ${name}`);
+    const head = `本次调用 ${messages.length} 个工具`;
+    return parts.length ? `${head} · ${parts.join("，")}` : head;
+  }, [messages]);
+
+  const cardContent = (
+    <div
+      className={
+        flat
+          ? "w-full min-w-0 text-[13px] text-text-muted"
+          : "w-full min-w-0 overflow-hidden rounded-lg border border-border bg-surface-card text-[13px] text-text-muted transition"
+      }
+    >
+      <button
+        type="button"
+        className={`relative z-[1] inline-flex w-full max-w-full items-center gap-2 text-left ${
+          flat ? "px-3 py-1" : "px-3 py-3"
+        }`}
+        onClick={() => setExpanded((v) => !v)}
+      >
+        <span className="flex h-[20px] w-[20px] shrink-0 items-center justify-center" aria-hidden>
+          <span className="flex h-[18px] w-[18px] items-center justify-center rounded-full bg-[rgb(var(--theme-color-rgb,59,130,246))] ring-1 ring-[rgba(var(--theme-color-rgb,59,130,246),0.35)]">
+            <Check className="h-3 w-3 text-white" strokeWidth={2.4} />
+          </span>
+        </span>
+        <span className="flex min-w-0 shrink items-center gap-1.5">
+          <span className="truncate text-[13px] font-medium text-text-subtle">{summary}</span>
+          {expanded ? (
+            <ChevronDown className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+          ) : (
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+          )}
+        </span>
+      </button>
+      {expanded && (
+        <div
+          className={
+            flat
+              ? "relative px-3 pb-2 pt-0.5 text-[13px] text-text-muted"
+              : "relative z-[0] border-t border-border px-3 pb-2 pt-1 text-[13px] text-text-muted"
+          }
+        >
+          {/* 时间线仅在展开列表区，与 nested ToolCallCard 节点同一 X（px-3 12px + half Check 10px = 22px） */}
+          <div
+            className="pointer-events-none absolute left-[22px] top-0 bottom-2 z-0 w-0 border-l border-dashed border-border"
+            aria-hidden
+          />
+          <div className="relative z-[1] space-y-2.5">
+            {messages.map((m) =>
+              isTodoUpdateToolMessage(m.content) ? (
+                <div key={m.id} className="relative w-full min-w-0 text-[13px] text-text-muted">
+                  <div
+                    className="pointer-events-none absolute left-[10px] top-[15px] z-[2] h-2 w-2 -translate-x-1/2 rounded-full border-2 border-surface-card bg-border"
+                    aria-hidden
+                  />
+                  <div className="ml-[28px] w-fit max-w-full rounded-lg border border-border bg-surface-card px-3 py-2 text-[13px] text-text-muted">
+                    <TodoUpdateCard content={m.content} />
+                  </div>
+                </div>
+              ) : (
+                <ToolCallCard
+                  key={m.id}
+                  message={m}
+                  highlightTerms={highlightTerms}
+                  forceExpand={!!m.inlineConfirm}
+                  selectable={selectable}
+                  selected={selectedIds?.has(m.id)}
+                  onToggleSelectMessage={onToggleSelectMessage}
+                  action={renderExtras?.(m)}
+                  variant="nested"
+                  omitLeadingSpacer={flat}
+                />
+              )
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  if (flat && omitLeadingSpacer) {
+    return cardContent;
+  }
+
+  return (
+    <div className="flex min-w-0 items-start gap-2">
+      <div className="flex min-w-0 flex-1 flex-row gap-2">
+        <div className="flex min-w-0 flex-1 flex-col items-start">
+          {cardContent}
+        </div>
+      </div>
+    </div>
+  );
+}

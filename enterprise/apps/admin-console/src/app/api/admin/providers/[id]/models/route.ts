@@ -1,9 +1,9 @@
 import { NextResponse } from "next/server";
-import { requireAdminSession } from "../../../../../../lib/admin-auth";
+import { requireAdminScope } from "../../../../../../lib/admin-auth";
 import { addProviderModel, type ProviderModel } from "../../../../../../lib/model-providers-store";
 
 export async function POST(request: Request, context: { params: Promise<{ id: string }> }) {
-  const auth = await requireAdminSession();
+  const auth = await requireAdminScope(["provider:update"]);
   if (!auth.ok) return auth.response;
   const { id } = await context.params;
   try {
@@ -17,7 +17,7 @@ export async function POST(request: Request, context: { params: Promise<{ id: st
           : ["text"],
       enabled: typeof body.enabled === "boolean" ? body.enabled : true,
     };
-    const updated = addProviderModel(id, model);
+    const updated = await addProviderModel(id, model);
     return NextResponse.json({ code: "00000", message: "ok", data: { provider: updated } });
   } catch (error) {
     const message = error instanceof Error ? error.message : "invalid request";

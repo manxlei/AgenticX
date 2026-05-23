@@ -42,46 +42,130 @@ type MeteringRow = {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  cached_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
   cost_usd: number;
 };
 
-const DEPT_USERS: Record<string, Array<{ id: string; name: string }>> = {
-  "dept-root": [
-    { id: "user_seed_owner", name: "Seed Owner" },
-    { id: "user_demo", name: "Demo User" },
-  ],
-  "dept-ops": [{ id: "user_demo", name: "Demo User" }],
-  "dept-audit": [{ id: "user_auditor", name: "Auditor" }],
-};
+type UserOption = { id: string; name: string; deptId: string | null };
+type PatOption = { id: number; name: string; tokenPrefix: string };
+type ProviderOption = { id: string; name: string; models: string[] };
 
-const PROVIDER_MODELS: Record<string, string[]> = {
-  deepseek: ["deepseek-chat"],
-  moonshot: ["moonshot-v1-8k"],
-  "edge-agent": ["local-ollama-llama3"],
-};
+const ALL = "__all__";
+
+async function readJsonBody<T>(res: Response, fallback: T): Promise<T> {
+  const raw = await res.text();
+  if (!raw.trim()) return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
 
 export default function MeteringPage() {
-  const [dept, setDept] = useState("dept-ops");
-  const [user, setUser] = useState("user_demo");
-  const [provider, setProvider] = useState("deepseek");
-  const [model, setModel] = useState("deepseek-chat");
+  const [dept, setDept] = useState(ALL);
+  const [user, setUser] = useState(ALL);
+  const [apiToken, setApiToken] = useState(ALL);
+  const [provider, setProvider] = useState(ALL);
+  const [model, setModel] = useState(ALL);
   const [start, setStart] = useState(new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString().slice(0, 10));
   const [end, setEnd] = useState(new Date().toISOString().slice(0, 10));
   const [rows, setRows] = useState<MeteringRow[]>([]);
+  const [usersData, setUsersData] = useState<UserOption[]>([]);
+  const [patOptions, setPatOptions] = useState<PatOption[]>([]);
+  const [providersData, setProvidersData] = useState<ProviderOption[]>([]);
   const [loading, setLoading] = useState(false);
 
-  const users = useMemo(() => DEPT_USERS[dept] ?? [], [dept]);
-  const models = useMemo(() => PROVIDER_MODELS[provider] ?? [], [provider]);
+  const deptOptions = useMemo(() => {
+    const buckets = new Set<string>();
+    for (const row of rows) if (row.dims.dept) buckets.add(row.dims.dept);
+    for (const item of usersData) if (item.deptId) buckets.add(item.deptId);
+    return Array.from(buckets).sort();
+  }, [rows, usersData]);
+
+  const users = useMemo(() => {
+    if (dept === ALL) return usersData;
+    return usersData.filter((item) => item.deptId === dept);
+  }, [dept, usersData]);
+
+  const providers = useMemo(() => providersData, [providersData]);
+
+  const models = useMemo(() => {
+    if (provider === ALL) {
+      const allModels = new Set<string>();
+      for (const p of providersData) for (const m of p.models) allModels.add(m);
+      return Array.from(allModels).sort();
+    }
+    return providersData.find((item) => item.id === provider)?.models ?? [];
+  }, [provider, providersData]);
 
   useEffect(() => {
-    if (!users.find((item) => item.id === user)) {
-      setUser(users[0]?.id ?? "");
+    let active = true;
+    const loadMeta = async () => {
+      try {
+        const [usersRes, providersRes, patRes] = await Promise.all([
+          fetch("/api/admin/users?limit=200", { cache: "no-store" }),
+          fetch("/api/admin/providers", { cache: "no-store" }),
+          fetch("/api/admin/api-tokens", { cache: "no-store" }),
+        ]);
+        const emptyUsers = { data: { items: [] as Array<{ id: string; displayName: string; deptId: string | null }> } };
+        const emptyProviders = {
+          data: {
+            providers: [] as Array<{ id: string; displayName: string; enabled: boolean; models?: Array<{ name: string; enabled: boolean }> }>,
+          },
+        };
+        const emptyPats = { data: { tokens: [] as Array<{ id: number; name: string; tokenPrefix: string }> } };
+        const usersJson = await readJsonBody(usersRes, emptyUsers);
+        const providersJson = await readJsonBody(providersRes, emptyProviders);
+        const patJson = await readJsonBody(patRes, emptyPats);
+        if (!active) return;
+        setUsersData(
+          (usersJson.data?.items ?? []).map((item) => ({
+            id: item.id,
+            name: item.displayName || item.id,
+            deptId: item.deptId ?? null,
+          }))
+        );
+        setPatOptions(
+          (patJson.data?.tokens ?? []).map((item) => ({
+            id: item.id,
+            name: item.name,
+            tokenPrefix: item.tokenPrefix,
+          }))
+        );
+        setProvidersData(
+          (providersJson.data?.providers ?? [])
+            .filter((item) => item.enabled)
+            .map((item) => ({
+              id: item.id,
+              name: item.displayName || item.id,
+              models: (item.models ?? []).filter((modelItem) => modelItem.enabled).map((modelItem) => modelItem.name),
+            }))
+        );
+      } catch {
+        if (!active) return;
+        setUsersData([]);
+        setPatOptions([]);
+        setProvidersData([]);
+      }
+    };
+    void loadMeta();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (user !== ALL && !users.find((item) => item.id === user)) {
+      setUser(ALL);
     }
   }, [users, user]);
 
   useEffect(() => {
-    if (!models.includes(model)) {
-      setModel(models[0] ?? "");
+    if (model !== ALL && !models.includes(model)) {
+      setModel(ALL);
     }
   }, [models, model]);
 
@@ -92,23 +176,24 @@ export default function MeteringPage() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          dept_id: dept ? [dept] : [],
-          user_id: user ? [user] : [],
-          provider: provider ? [provider] : [],
-          model: model ? [model] : [],
+          dept_id: dept !== ALL ? [dept] : [],
+          user_id: user !== ALL ? [user] : [],
+          api_token_id: apiToken !== ALL ? [apiToken] : [],
+          provider: provider !== ALL ? [provider] : [],
+          model: model !== ALL ? [model] : [],
           start: `${start}T00:00:00.000Z`,
           end: `${end}T23:59:59.999Z`,
-          group_by: ["day", "dept", "user", "provider", "model"],
+          group_by: ["day", "dept", "user", "pat", "provider", "model"],
         }),
       });
-      const payload = (await response.json()) as { data?: { rows?: MeteringRow[] } };
+      const payload = await readJsonBody<{ data?: { rows?: MeteringRow[] } }>(response, { data: { rows: [] } });
       setRows(payload.data?.rows ?? []);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "查询失败");
     } finally {
       setLoading(false);
     }
-  }, [dept, user, provider, model, start, end]);
+  }, [dept, user, apiToken, provider, model, start, end]);
 
   useEffect(() => {
     void query();
@@ -119,10 +204,10 @@ export default function MeteringPage() {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        dept_id: dept ? [dept] : [],
-        user_id: user ? [user] : [],
-        provider: provider ? [provider] : [],
-        model: model ? [model] : [],
+        dept_id: dept !== ALL ? [dept] : [],
+        user_id: user !== ALL ? [user] : [],
+        provider: provider !== ALL ? [provider] : [],
+        model: model !== ALL ? [model] : [],
         start: `${start}T00:00:00.000Z`,
         end: `${end}T23:59:59.999Z`,
         group_by: ["day", "dept", "user", "provider", "model"],
@@ -211,10 +296,11 @@ export default function MeteringPage() {
             <Label>部门</Label>
             <Select value={dept} onValueChange={setDept}>
               <SelectTrigger>
-                <SelectValue />
+                <SelectValue placeholder="全部部门" />
               </SelectTrigger>
               <SelectContent>
-                {Object.keys(DEPT_USERS).map((deptId) => (
+                <SelectItem value={ALL}>全部</SelectItem>
+                {deptOptions.map((deptId) => (
                   <SelectItem key={deptId} value={deptId}>
                     {deptId}
                   </SelectItem>
@@ -224,11 +310,12 @@ export default function MeteringPage() {
           </div>
           <div className="space-y-1.5">
             <Label>员工</Label>
-            <Select value={user} onValueChange={setUser} disabled={users.length === 0}>
+            <Select value={user} onValueChange={setUser}>
               <SelectTrigger>
-                <SelectValue placeholder="选择员工" />
+                <SelectValue placeholder="全部员工" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value={ALL}>全部</SelectItem>
                 {users.map((item) => (
                   <SelectItem key={item.id} value={item.id}>
                     {item.name}
@@ -238,15 +325,32 @@ export default function MeteringPage() {
             </Select>
           </div>
           <div className="space-y-1.5">
+            <Label>API Token</Label>
+            <Select value={apiToken} onValueChange={setApiToken}>
+              <SelectTrigger>
+                <SelectValue placeholder="全部 PAT" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={ALL}>全部</SelectItem>
+                {patOptions.map((item) => (
+                  <SelectItem key={item.id} value={String(item.id)}>
+                    {item.name} ({item.tokenPrefix}…)
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
             <Label>厂商</Label>
             <Select value={provider} onValueChange={setProvider}>
               <SelectTrigger>
-                <SelectValue />
+                <SelectValue placeholder="全部厂商" />
               </SelectTrigger>
               <SelectContent>
-                {Object.keys(PROVIDER_MODELS).map((providerName) => (
-                  <SelectItem key={providerName} value={providerName}>
-                    {providerName}
+                <SelectItem value={ALL}>全部</SelectItem>
+                {providers.map((providerItem) => (
+                  <SelectItem key={providerItem.id} value={providerItem.id}>
+                    {providerItem.name}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -254,11 +358,12 @@ export default function MeteringPage() {
           </div>
           <div className="space-y-1.5">
             <Label>模型</Label>
-            <Select value={model} onValueChange={setModel} disabled={models.length === 0}>
+            <Select value={model} onValueChange={setModel}>
               <SelectTrigger>
-                <SelectValue placeholder="选择模型" />
+                <SelectValue placeholder="全部模型" />
               </SelectTrigger>
               <SelectContent>
+                <SelectItem value={ALL}>全部</SelectItem>
                 {models.map((modelName) => (
                   <SelectItem key={modelName} value={modelName}>
                     {modelName}
@@ -369,6 +474,9 @@ export default function MeteringPage() {
                         <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">用户</th>
                         <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-wide text-muted-foreground">模型</th>
                         <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wide text-muted-foreground">Tokens</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cached</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cache Read</th>
+                        <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wide text-muted-foreground">Cache Write</th>
                         <th className="px-4 py-3 text-right text-xs font-semibold uppercase tracking-wide text-muted-foreground">成本</th>
                       </tr>
                     </thead>
@@ -389,6 +497,9 @@ export default function MeteringPage() {
                             </Badge>
                           </td>
                           <td className="px-4 py-2.5 text-right font-mono">{row.total_tokens.toLocaleString()}</td>
+                          <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">{(row.cached_tokens ?? 0).toLocaleString()}</td>
+                          <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">{(row.cache_read_input_tokens ?? 0).toLocaleString()}</td>
+                          <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">{(row.cache_creation_input_tokens ?? 0).toLocaleString()}</td>
                           <td className="px-4 py-2.5 text-right font-mono">${row.cost_usd.toFixed(6)}</td>
                         </tr>
                       ))}
@@ -399,6 +510,9 @@ export default function MeteringPage() {
                           合计
                         </td>
                         <td className="px-4 py-2.5 text-right font-mono">{totalTokens.toLocaleString()}</td>
+                        <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">—</td>
+                        <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">—</td>
+                        <td className="px-4 py-2.5 text-right font-mono text-muted-foreground">—</td>
                         <td className="px-4 py-2.5 text-right font-mono">${totalCost.toFixed(4)}</td>
                       </tr>
                     </tfoot>

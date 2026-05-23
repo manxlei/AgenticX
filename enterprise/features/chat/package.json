@@ -7,6 +7,7 @@
   "types": "./src/index.ts",
   "scripts": {
     "lint": "echo 'lint placeholder'",
+    "test": "vitest run",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
@@ -16,11 +17,15 @@
     "@agenticx/ui": "workspace:^",
     "@tanstack/react-virtual": "^3.13.24",
     "react": "^19.0.0",
+    "ulid": "^2.3.0",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
+    "prismjs": "^1.29.0",
     "zustand": "^5.0.12"
   },
   "devDependencies": {
-    "@types/react": "19.2.14"
+    "@types/prismjs": "^1.26.5",
+    "@types/react": "19.2.14",
+    "vitest": "^4.1.5"
   }
 }

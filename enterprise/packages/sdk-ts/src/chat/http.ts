@@ -27,6 +27,18 @@ function parseErrorPayload(raw: unknown): { code: string; message: string } {
   return { code: "50000", message: "Gateway request failed" };
 }
 
+function pickStreamDelta(deltaObj: { content?: string; reasoning_content?: string } | undefined): string | undefined {
+  if (!deltaObj) return undefined;
+  const parts: string[] = [];
+  if (typeof deltaObj.content === "string" && deltaObj.content.length > 0) {
+    parts.push(deltaObj.content);
+  }
+  if (typeof deltaObj.reasoning_content === "string" && deltaObj.reasoning_content.length > 0) {
+    parts.push(deltaObj.reasoning_content);
+  }
+  return parts.length > 0 ? parts.join("") : undefined;
+}
+
 export class HttpChatClient implements ChatClient {
   private readonly endpoint: string;
   private readonly pending = new Map<string, PendingRequest>();
@@ -64,7 +76,12 @@ export class HttpChatClient implements ChatClient {
     try {
       const response = await fetch(this.endpoint, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: {
+          "content-type": "application/json",
+          ...(pending.request.sessionId?.trim()
+            ? { "x-chat-session-id": pending.request.sessionId.trim() }
+            : {}),
+        },
         body: JSON.stringify({
           model: pending.request.model,
           stream: true,
@@ -113,8 +130,13 @@ export class HttpChatClient implements ChatClient {
           buffer = buffer.slice(splitIdx + 2);
           splitIdx = buffer.indexOf("\n\n");
 
-          if (!frame.startsWith("data:")) continue;
-          const data = frame.replace(/^data:\s*/, "");
+          const dataLines = frame
+            .split("\n")
+            .map((line) => line.trim())
+            .filter((line) => line.startsWith("data:"))
+            .map((line) => line.replace(/^data:\s*/, ""));
+          if (dataLines.length === 0) continue;
+          const data = dataLines.join("\n");
           if (data === "[DONE]") {
             yield { requestId, done: true };
             this.pending.delete(requestId);
@@ -124,7 +146,21 @@ export class HttpChatClient implements ChatClient {
             choices?: Array<{ delta?: { content?: string }; finish_reason?: string | null }>;
             agenticx_usage?: { input_tokens?: number; output_tokens?: number; total_tokens?: number };
             usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number };
+            error?: { code?: string; message?: string };
           };
+
+          if (chunk.error) {
+            yield {
+              requestId,
+              done: true,
+              error: {
+                code: chunk.error.code ?? "50000",
+                message: chunk.error.message ?? "Gateway request failed",
+              },
+            };
+            this.pending.delete(requestId);
+            return;
+          }
 
           // 自定义 usage 事件（gateway 真调流末追加），不算 delta
           if (chunk.agenticx_usage) {
@@ -156,7 +192,10 @@ export class HttpChatClient implements ChatClient {
             };
           }
 
-          const delta = chunk.choices?.[0]?.delta?.content;
+          const deltaObj = chunk.choices?.[0]?.delta as
+            | { content?: string; reasoning_content?: string }
+            | undefined;
+          const delta = pickStreamDelta(deltaObj);
           const finished = chunk.choices?.[0]?.finish_reason === "stop";
           if (delta) {
             yield {

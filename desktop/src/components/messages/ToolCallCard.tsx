@@ -1,11 +1,26 @@
 import type { Message } from "../../store";
 import type { ReactNode } from "react";
 import { useEffect, useMemo, useState } from "react";
-import { Wrench, ChevronDown, ChevronRight } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  FileText,
+  ListChecks,
+  Plug,
+  Search,
+  Terminal,
+  Wrench,
+} from "lucide-react";
+import { Shimmer } from "../ds/Shimmer";
+import { ToolOutputStream } from "./ToolOutputStream";
 
 type Props = {
   message: Message;
   action?: ReactNode;
+  /** Nested inside TurnToolGroupCard — lighter chrome */
+  variant?: "default" | "nested" | "flat";
+  /** When true, remove left w-8 spacer (ReAct block already has avatar column). */
+  omitLeadingSpacer?: boolean;
   /** 有需要用户操作的内联确认时强制展开 */
   forceExpand?: boolean;
   /** 历史搜索关键词高亮（命中时自动展开） */
@@ -16,16 +31,55 @@ type Props = {
   onToggleSelectMessage?: (message: Message) => void;
 };
 
-/** 从工具消息内容中提取工具名摘要，用于折叠状态显示 */
+/** Legacy: extract tool name from old 🔧/✅ prefixed content */
 function extractToolSummary(content: string): string {
-  // 格式：🔧 tool_name: {...}
   const toolMatch = content.match(/^🔧\s+([^:]+)/);
   if (toolMatch) return toolMatch[1].trim();
-  // 格式：⚠️ / ❌ / 🗣 前缀消息
   const emojiMatch = content.match(/^([⚠️❌🗣✅])\s+(.{0,60})/u);
   if (emojiMatch) return emojiMatch[2].trim();
-  // 纯内容截断
   return content.slice(0, 60).replace(/\n/g, " ").trim();
+}
+
+export function buildToolCardTitle(message: Message): string {
+  const name = (message.toolName ?? "").trim();
+  const args = message.toolArgs ?? {};
+  if (name === "file_read" || name === "file_write" || name === "file_edit") {
+    const p = String(args.path ?? "").trim();
+    const sl = args.start_line;
+    const el = args.end_line;
+    if (p && sl != null && el != null) return `Read ${p} L${sl}-${el}`;
+    if (p) return `${name} ${p}`;
+  }
+  if (name === "bash_exec") {
+    const cmd = String(args.command ?? "").replace(/\s+/g, " ").trim();
+    if (!cmd) return "bash_exec";
+    return cmd.length > 80 ? `${cmd.slice(0, 80)}…` : cmd;
+  }
+  if (name === "todo_write") return "todo_write";
+  if (name === "mcp_call") {
+    const tn = String(args.tool_name ?? "").trim();
+    return tn ? `mcp_call ${tn}` : "mcp_call";
+  }
+  if (name === "knowledge_search") return "knowledge_search";
+  if (name) return name;
+  return extractToolSummary(message.content);
+}
+
+function pickToolIcon(name: string) {
+  if (name === "bash_exec") return Terminal;
+  if (name === "file_read" || name === "file_write" || name === "file_edit") return FileText;
+  if (name === "todo_write") return ListChecks;
+  if (name === "mcp_call") return Plug;
+  if (name === "knowledge_search") return Search;
+  return Wrench;
+}
+
+function iconTone(st: Message["toolStatus"]): string {
+  if (st === "done") return "text-emerald-400";
+  if (st === "error") return "text-rose-400";
+  if (st === "cancelled") return "text-text-faint";
+  if (st === "running" || st === "pending") return "text-cyan-400";
+  return "text-text-subtle";
 }
 
 function escapeRegExp(input: string): string {
@@ -69,7 +123,9 @@ function renderHighlightedText(content: string, terms: string[]): ReactNode {
 export function ToolCallCard({
   message,
   action,
+  variant = "default",
   forceExpand = false,
+  omitLeadingSpacer = false,
   highlightTerms,
   selectable,
   selected,
@@ -83,22 +139,171 @@ export function ToolCallCard({
   }, [message.content, normalizedTerms]);
   const shouldForceExpand = forceExpand || matchedByHighlight;
   const [expanded, setExpanded] = useState(shouldForceExpand);
-  const summary = extractToolSummary(message.content);
-  const hasDetail = message.content.length > 0;
+
+  const title = useMemo(() => buildToolCardTitle(message), [message]);
+  const toolName = (message.toolName ?? "").trim();
+  const Icon = pickToolIcon(toolName || extractToolSummary(message.content).split(/\s/)[0] || "tool");
+  const status = message.toolStatus;
+  const hasStream = (message.toolStreamLines?.length ?? 0) > 0;
+  const hasDetail = message.content.length > 0 || hasStream;
+
+  const titleEl =
+    status === "running" || status === "pending" ? (
+      <Shimmer text={title} className="text-[13px] font-medium" />
+    ) : (
+      <span className="text-[13px] font-medium text-text-subtle">{title}</span>
+    );
+
+  const sec = message.toolElapsedSec;
+  const metaRight =
+    sec != null && Number.isFinite(sec) && (status === "running" || status === "pending") ? (
+      <span className="shrink-0 text-[12px] text-text-faint tabular-nums">{sec}s</span>
+    ) : null;
 
   useEffect(() => {
     if (shouldForceExpand) setExpanded(true);
   }, [shouldForceExpand]);
 
+  const expandedDetailClass =
+    variant === "flat"
+      ? "space-y-1 px-3 pb-2 pt-0.5 text-[13px] leading-[1.7]"
+      : variant === "nested"
+        ? "mt-1.5 space-y-1 pl-3 text-[13px] leading-[1.7]"
+        : "space-y-1 border-t border-border px-3 pb-2 pt-1.5 text-[13px] leading-[1.7]";
+  const forcedActionClass =
+    variant === "flat"
+      ? "px-3 pb-2 pt-0.5"
+      : variant === "nested"
+        ? "mt-1.5 pl-3"
+        : "border-t border-border px-3 pb-2 pt-1.5";
+
+  const detailBody = (
+    <>
+      {hasStream ? <ToolOutputStream lines={message.toolStreamLines ?? []} /> : null}
+      {message.content ? (
+        <span className="break-all whitespace-pre-wrap">
+          {renderHighlightedText(message.content, normalizedTerms)}
+        </span>
+      ) : null}
+      {action}
+    </>
+  );
+
+  const shellOuterClass =
+    variant === "nested"
+      ? "relative w-full min-w-0 text-[13px] text-text-muted"
+      : variant === "flat"
+        ? "w-full min-w-0 overflow-hidden text-[13px] text-text-muted"
+        : `w-full min-w-0 overflow-hidden rounded-lg border bg-surface-card text-[13px] text-text-muted transition ${
+            selected ? "border-[rgba(var(--theme-color-rgb,6,182,212),0.6)]" : "border-border"
+          }`;
+
+  const shell =
+    variant === "nested" ? (
+      <div className={shellOuterClass}>
+        {/* 与 TurnToolGroupCard 左侧虚线对齐（父容器 px-3 12px + 10px = 22px） */}
+        <div
+          className="pointer-events-none absolute left-[10px] top-[15px] z-[2] h-2 w-2 -translate-x-1/2 rounded-full border-2 border-surface-card bg-border"
+          aria-hidden
+        />
+        <div className="ml-[28px] min-w-0">
+          <button
+            type="button"
+            className={`group inline-flex max-w-full items-center gap-2 rounded-full border border-border/70 bg-zinc-100/60 px-3 py-1.5 text-left shadow-sm transition hover:bg-zinc-200/60 disabled:cursor-default disabled:opacity-60 dark:border-white/10 dark:bg-white/[0.03] dark:hover:bg-white/[0.05] ${
+              selected ? "ring-1 ring-[rgba(var(--theme-color-rgb,6,182,212),0.55)]" : ""
+            }`}
+            onClick={() => hasDetail && setExpanded((v) => !v)}
+            disabled={!hasDetail}
+          >
+            <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded bg-transparent">
+              <Icon className={`h-3 w-3 ${iconTone(status)}`} aria-hidden />
+            </span>
+            <span className="min-w-0 shrink truncate text-left">{titleEl}</span>
+            {metaRight}
+            {hasDetail ? (
+              expanded ? (
+                <ChevronDown className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+              )
+            ) : null}
+          </button>
+
+          {expanded && <div className={expandedDetailClass}>{detailBody}</div>}
+          {!expanded && shouldForceExpand && action && <div className={forcedActionClass}>{action}</div>}
+        </div>
+      </div>
+    ) : variant === "flat" ? (
+      <div className={shellOuterClass}>
+        <button
+          type="button"
+          className="relative z-[1] inline-flex w-full max-w-full items-center gap-2 px-3 py-1 text-left disabled:cursor-default disabled:opacity-60"
+          onClick={() => hasDetail && setExpanded((v) => !v)}
+          disabled={!hasDetail}
+        >
+          <span className="flex h-[20px] w-[20px] shrink-0 items-center justify-center" aria-hidden>
+            <Icon className={`h-3.5 w-3.5 ${iconTone(status)}`} aria-hidden />
+          </span>
+          <span className="flex min-w-0 flex-1 items-center gap-1.5">
+            <span className="min-w-0 flex-1 truncate text-left">{titleEl}</span>
+            {metaRight}
+          </span>
+          {hasDetail ? (
+            expanded ? (
+              <ChevronDown className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+            )
+          ) : null}
+        </button>
+
+        {expanded && (
+          <div className={expandedDetailClass}>
+            <div className="pl-[28px]">{detailBody}</div>
+          </div>
+        )}
+
+        {!expanded && shouldForceExpand && action && <div className={forcedActionClass}>{action}</div>}
+      </div>
+    ) : (
+      <div className={shellOuterClass}>
+        <div className={`flex w-full items-center gap-1.5 px-3 py-3 text-left`}>
+          <button
+            type="button"
+            className="inline-flex min-w-0 flex-1 items-center gap-1.5 text-left disabled:cursor-default disabled:opacity-60"
+            onClick={() => hasDetail && setExpanded((v) => !v)}
+            disabled={!hasDetail}
+          >
+            {hasDetail &&
+              (expanded ? (
+                <ChevronDown className="h-3 w-3 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+              ) : (
+                <ChevronRight className="h-3 w-3 shrink-0 text-text-muted" strokeWidth={2} aria-hidden />
+              ))}
+            <Icon className={`h-3.5 w-3.5 shrink-0 ${iconTone(status)}`} />
+            <span className="min-w-0 flex-1 truncate">{titleEl}</span>
+            {metaRight}
+          </button>
+        </div>
+
+        {expanded && <div className={expandedDetailClass}>{detailBody}</div>}
+
+        {!expanded && shouldForceExpand && action && <div className={forcedActionClass}>{action}</div>}
+      </div>
+    );
+
+  if (variant === "nested" || (variant === "flat" && omitLeadingSpacer)) {
+    return <div className="min-w-0 w-full">{shell}</div>;
+  }
+
   return (
     <div className="flex min-w-0 items-start gap-2">
-      {/* 多选勾选框，与 ImBubble 对齐 */}
       {selectable && (
         <button
           type="button"
           className={`mt-2 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition ${
             selected
-              ? "border-cyan-500 bg-cyan-500 text-white"
+              ? "border-[rgb(var(--theme-color-rgb,6,182,212))] bg-[rgb(var(--theme-color-rgb,6,182,212))] text-white"
               : "border-text-faint bg-transparent text-transparent"
           }`}
           onClick={() => onToggleSelectMessage?.(message)}
@@ -110,50 +315,10 @@ export function ToolCallCard({
         </button>
       )}
 
-      {/* 与 ImBubble 保持一致的对齐骨架 */}
       <div className="flex min-w-0 flex-1 justify-start gap-2">
         <div className="flex min-w-0 flex-1 flex-row gap-2">
-          <div className="flex h-8 w-8 shrink-0" aria-hidden />
-          <div className="flex min-w-0 flex-1 flex-col items-start" style={{ maxWidth: "min(92%, 960px)" }}>
-            <div
-              className={`w-full min-w-0 overflow-hidden rounded-lg border bg-surface-card text-xs text-text-muted transition ${
-                selected ? "border-cyan-500/60" : "border-border"
-              }`}
-            >
-              {/* 折叠头部，始终可见 */}
-              <button
-                type="button"
-                className="flex w-full items-center gap-1.5 px-3 py-2 text-left transition-colors hover:bg-surface-hover"
-                onClick={() => setExpanded((v) => !v)}
-                disabled={!hasDetail}
-              >
-                <Wrench className="h-3.5 w-3.5 shrink-0 text-text-subtle" />
-                <span className="flex-1 truncate text-[11px] font-medium text-text-subtle">{summary}</span>
-                {hasDetail &&
-                  (expanded ? (
-                    <ChevronDown className="h-3 w-3 shrink-0 text-text-muted" />
-                  ) : (
-                    <ChevronRight className="h-3 w-3 shrink-0 text-text-muted" />
-                  ))}
-              </button>
-
-              {/* 展开内容 */}
-              {expanded && (
-                <div className="space-y-1 border-t border-border px-3 pb-2 pt-1.5">
-                  <span className="break-all whitespace-pre-wrap">
-                    {renderHighlightedText(message.content, normalizedTerms)}
-                  </span>
-                  {action}
-                </div>
-              )}
-
-              {/* forceExpand 时 action 始终在外部显示（如确认按钮） */}
-              {!expanded && shouldForceExpand && action && (
-                <div className="border-t border-border px-3 pb-2 pt-1.5">
-                  {action}
-                </div>
-              )}
-            </div>
+          <div className="flex min-w-0 flex-1 flex-col items-start">
+            {shell}
           </div>
         </div>
       </div>

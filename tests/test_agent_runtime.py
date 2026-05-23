@@ -57,11 +57,29 @@ class _AlwaysToolLLM:
 
 class _TextOnlyLLM:
     def invoke(self, *_args, **_kwargs):
-        return _FakeResponse("fallback", [])
+        # Empty invoke text forces the stream fallback path (TOKEN chunks then FINAL).
+        return _FakeResponse("", [])
 
     def stream(self, *_args, **_kwargs):
         yield "tok1"
         yield "tok2"
+
+
+class _RateLimitLLM:
+    def invoke(self, *_args, **_kwargs):
+        raise RuntimeError("RateLimitError: rate limit reached")
+
+    def stream(self, *_args, **_kwargs):
+        yield ""
+
+
+class _CaptureMessagesLLM:
+    def __init__(self) -> None:
+        self.messages: List[Dict[str, Any]] = []
+
+    def invoke(self, messages, **_kwargs):
+        self.messages = [dict(item) for item in messages]
+        return _FakeResponse("ok", [])
 
 
 class _ApproveGate(ConfirmGate):
@@ -167,6 +185,38 @@ def test_runtime_accepts_custom_agent_id() -> None:
     events = __import__("asyncio").run(_collect_custom())
     assert events
     assert all(e["agent_id"] == "sa-1" for e in events)
+
+
+def test_runtime_rate_limit_pauses_subagent(monkeypatch) -> None:
+    monkeypatch.setenv("AGX_LLM_RETRY_RATE_LIMIT", "0")
+    runtime = AgentRuntime(_RateLimitLLM(), _ApproveGate())
+
+    async def _collect_rate_limited() -> List[Dict[str, Any]]:
+        items: List[Dict[str, Any]] = []
+        async for event in runtime.run_turn("long task", StudioSession(), agent_id="worker-1"):
+            items.append({"type": event.type, "data": event.data, "agent_id": event.agent_id})
+        return items
+
+    events = __import__("asyncio").run(_collect_rate_limited())
+    assert events[-1]["type"] == EventType.SUBAGENT_PAUSED.value
+    assert events[-1]["agent_id"] == "worker-1"
+    assert events[-1]["data"]["detector"] == "rate_limit"
+    assert events[-1]["data"]["retryable"] is True
+
+
+def test_runtime_minimax_does_not_send_non_initial_system_messages() -> None:
+    llm = _CaptureMessagesLLM()
+    runtime = AgentRuntime(llm, _ApproveGate())
+    session = StudioSession()
+    session.provider_name = "minimax"
+    session.model_name = "MiniMax-M2.7"
+
+    events = __import__("asyncio").run(_collect(runtime, session, "hello"))
+
+    assert events[-1]["type"] == EventType.FINAL.value
+    assert llm.messages
+    assert llm.messages[0]["role"] == "system"
+    assert all(message.get("role") != "system" for message in llm.messages[1:])
 
 
 def test_runtime_rejects_tool_outside_allowlist(monkeypatch) -> None:

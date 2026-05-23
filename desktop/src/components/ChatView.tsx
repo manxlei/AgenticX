@@ -16,15 +16,42 @@ import {
 } from "../utils/cc-bridge-ui";
 import { KeybindingsPanel } from "./KeybindingsPanel";
 import { attachmentsFromSessionRow } from "../utils/session-message-map";
-import { MessageRenderer } from "./messages/MessageRenderer";
+import { MessageRenderer, renderToolMessageExtras } from "./messages/MessageRenderer";
+import { groupConsecutiveToolMessages, type GroupedChatRow } from "./messages/group-tool-messages";
+import { expandMessagesToTopLevelRows } from "./messages/react-blocks";
+import { TurnToolGroupCard } from "./messages/TurnToolGroupCard";
 import { messagePlainTextForClipboard } from "../utils/markdown-copy-format";
-import { ImBubble } from "./messages/ImBubble";
+import { buildCompactionNoticeText } from "../utils/context-notice";
+import { StallRecoveryCard } from "./messages/StallRecoveryCard";
+import {
+  isDoubleEnterWithinWindow,
+  shouldEnqueueOnResend,
+  shouldShowStopButton,
+  type SessionExecutionState,
+} from "../utils/streaming-stop-policy";
+import {
+  CHANNEL_C_GRACE_MS,
+  stallDetectSilenceMs,
+  messageLooksLikeAssistantFinal,
+  shouldAllowStallAutoNudge,
+  shouldTriggerIncompleteEndStall,
+} from "../utils/task-stall-policy";
+import {
+  continueSessionUrl,
+  inferContinueReason,
+  type ContinueReason,
+  type ContinueSource,
+} from "../utils/session-continue";
+import { ChatImAvatar, ImBubble } from "./messages/ImBubble";
 import { TerminalLine } from "./messages/TerminalLine";
 import { CleanBlock } from "./messages/CleanBlock";
-import { QueuedMessageBubble } from "./messages/QueuedMessageBubble";
-import { ToolOutputStream } from "./messages/ToolOutputStream";
-
+import { MessageQueuePanel } from "./messages/MessageQueuePanel";
 const EMPTY_QUEUE: QueuedMessage[] = [];
+
+/** Matches {@link useAppStore.getState().updateMessageByToolCallId} `patch` argument. */
+type ToolCallStreamPatch = Partial<
+  Pick<Message, "content" | "toolStatus" | "toolElapsedSec" | "toolResultPreview" | "toolStreamLines" | "inlineConfirm">
+> & { appendStreamLine?: string };
 
 type Props = {
   onOpenConfirm: (
@@ -58,6 +85,9 @@ const confirmModeLabel: Record<string, string> = {
 function formatToolResultMessage(toolNameRaw: unknown, resultRaw: unknown): { content: string; silent: boolean } {
   const toolName = String(toolNameRaw ?? "tool");
   const resultText = String(resultRaw ?? "");
+  if (toolName === "check_resources") {
+    return { content: "", silent: true };
+  }
   if (toolName === "delegate_to_avatar") {
     try {
       const parsed = JSON.parse(resultText) as Record<string, unknown>;
@@ -146,14 +176,11 @@ function formatToolResultMessage(toolNameRaw: unknown, resultRaw: unknown): { co
       }
       const rows = Array.isArray(parsed?.subagents) ? (parsed.subagents as Array<Record<string, unknown>>) : [];
       if (rows.length > 0) {
-        const counts = rows.reduce(
-          (acc, row) => {
-            const s = String(row.status ?? "unknown");
-            acc[s] = (acc[s] ?? 0) + 1;
-            return acc;
-          },
-          {} as Record<string, number>
-        );
+        const counts = rows.reduce<Record<string, number>>((acc, row) => {
+          const s = String(row.status ?? "unknown");
+          acc[s] = (acc[s] ?? 0) + 1;
+          return acc;
+        }, {});
         const summary = Object.entries(counts)
           .map(([k, v]) => `${k}:${v}`)
           .join(" ");
@@ -177,6 +204,32 @@ function formatToolResultMessage(toolNameRaw: unknown, resultRaw: unknown): { co
     return { content: `⚠️ ${toolName} 提示: ${resultText}`, silent: false };
   }
   return { content: `✅ ${toolName} 结果: ${resultText}`, silent: false };
+}
+
+function deriveToolStatusFromResult(resultRaw: unknown): "done" | "error" {
+  const t =
+    typeof resultRaw === "string"
+      ? resultRaw
+      : (() => {
+          try {
+            return JSON.stringify(resultRaw ?? "");
+          } catch {
+            return String(resultRaw ?? "");
+          }
+        })();
+  if (/^\s*ERROR:/i.test(t)) return "error";
+  const m = t.match(/exit_code=(\d+)/);
+  if (m && m[1] !== "0") return "error";
+  return "done";
+}
+
+function serializeToolResultRaw(resultRaw: unknown): string {
+  if (typeof resultRaw === "string") return resultRaw;
+  try {
+    return JSON.stringify(resultRaw ?? "", null, 2);
+  } catch {
+    return String(resultRaw ?? "");
+  }
 }
 
 function buildToolCallLivePreview(toolNameRaw: unknown, argsRaw: unknown): string | null {
@@ -268,6 +321,8 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
   const messages = useAppStore((s) => s.messages);
   const status = useAppStore((s) => s.status);
   const addMessage = useAppStore((s) => s.addMessage);
+  const mergeLastMessageByRole = useAppStore((s) => s.mergeLastMessageByRole);
+  const updateMessageByToolCallId = useAppStore((s) => s.updateMessageByToolCallId);
   const insertMessageAfter = useAppStore((s) => s.insertMessageAfter);
   const setStatus = useAppStore((s) => s.setStatus);
   const openSettings = useAppStore((s) => s.openSettings);
@@ -298,6 +353,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
   const liteQueueKey = "lite-pane";
   const queuedMessages = useAppStore((s) => s.pendingMessages[liteQueueKey] ?? EMPTY_QUEUE);
   const enqueuePaneMessage = useAppStore((s) => s.enqueuePaneMessage);
+  const takePendingMessage = useAppStore((s) => s.takePendingMessage);
   const removePendingMessage = useAppStore((s) => s.removePendingMessage);
   const editPendingMessage = useAppStore((s) => s.editPendingMessage);
   const addSubAgent = useAppStore((s) => s.addSubAgent);
@@ -308,7 +364,6 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
   const [streaming, setStreaming] = useState(false);
   const [streamedAssistantText, setStreamedAssistantText] = useState("");
   const [streamingModel, setStreamingModel] = useState<{ provider: string; model: string } | null>(null);
-  const [toolOutputLines, setToolOutputLines] = useState<string[]>([]);
   const [panelOpen, setPanelOpen] = useState(false);
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [headerModelPickerOpen, setHeaderModelPickerOpen] = useState(false);
@@ -330,10 +385,27 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
   const activeRequestIdRef = useRef(0);
   const modelBtnRef = useRef<HTMLButtonElement | null>(null);
   const imeComposingRef = useRef(false);
+  const lastComposerEnterAtRef = useRef(0);
   const polledEventSeenRef = useRef<Record<string, Set<string>>>({});
   const subAgentsRef = useRef(subAgents);
   const subAgentStatusRef = useRef<Record<string, string>>({});
   const ccBridgeLastSessionModeRef = useRef<CcBridgeSessionModeHint>("");
+  const [stallState, setStallState] = useState<"none" | "stall">("none");
+  const [sessionExecutionState, setSessionExecutionState] = useState<SessionExecutionState>("idle");
+  const [sseActive, setSseActive] = useState(false);
+  const [stallTick, setStallTick] = useState(0);
+  const [stallDetectSeconds, setStallDetectSeconds] = useState(90);
+  const [stallNudgeConfig, setStallNudgeConfig] = useState({
+    stall_auto_nudge_enabled: false,
+    stall_auto_nudge_after_seconds: 120,
+    stall_auto_nudge_max_per_session: 2,
+  });
+  const [autoNudgeCount, setAutoNudgeCount] = useState(0);
+  const autoNudgeTriggeredRef = useRef<Record<string, number>>({});
+  const autoNudgeBucketRef = useRef<Record<string, number>>({});
+  const lastProgressAtRef = useRef(0);
+  const sessionEnteredAtRef = useRef(0);
+  const settings = useAppStore((s) => s.settings);
   const isLite = mode === "lite";
   const applyUserMode = useCallback(
     async (nextMode: "pro" | "lite") => {
@@ -394,9 +466,136 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
   );
 
   const canSend = useMemo(() => !!(apiBase && sessionId), [apiBase, sessionId]);
+
+  const stallModelOptions = useMemo(() => {
+    const result: { provider: string; model: string; label: string }[] = [];
+    for (const [provName, entry] of Object.entries(settings.providers)) {
+      if (entry.enabled === false) continue;
+      if (!entry.apiKey) continue;
+      const provLabel = getProviderDisplayName(provName, entry);
+      if (entry.models.length > 0) {
+        for (const m of entry.models) {
+          result.push({ provider: provName, model: m, label: `${provLabel}/${m}` });
+        }
+      } else if (entry.model) {
+        result.push({ provider: provName, model: entry.model, label: `${provLabel}/${entry.model}` });
+      }
+    }
+    return result;
+  }, [settings.providers]);
+
+  const currentModelLabel = useMemo(() => {
+    if (!activeModel) return "未选模型";
+    if (!activeProvider) return activeModel;
+    const entry = settings.providers[activeProvider];
+    return `${getProviderDisplayName(activeProvider, entry)}/${activeModel}`;
+  }, [activeModel, activeProvider, settings.providers]);
+
+  const showStopButton = shouldShowStopButton({
+    streaming,
+    streamingSessionId: sessionId || "",
+    currentSessionId: sessionId || "",
+    executionState: sessionExecutionState,
+  });
+
+  const recordProgressActivity = useCallback(() => {
+    lastProgressAtRef.current = Date.now();
+    setStallState((prev) => (prev === "stall" ? "none" : prev));
+  }, []);
+
+  useEffect(() => {
+    void window.agenticxDesktop.loadRuntimeConfig().then((r) => {
+      if (!r?.ok) return;
+      const sec = Number(r.stall_detect_silence_seconds ?? 90);
+      if (Number.isFinite(sec)) {
+        setStallDetectSeconds(Math.max(30, Math.min(300, Math.round(sec))));
+      }
+      setStallNudgeConfig({
+        stall_auto_nudge_enabled: Boolean(r.stall_auto_nudge_enabled),
+        stall_auto_nudge_after_seconds: Math.max(
+          30,
+          Math.min(300, Number(r.stall_auto_nudge_after_seconds ?? 120) || 120),
+        ),
+        stall_auto_nudge_max_per_session: Math.max(
+          1,
+          Math.min(5, Number(r.stall_auto_nudge_max_per_session ?? 2) || 2),
+        ),
+      });
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    sessionEnteredAtRef.current = Date.now();
+    setAutoNudgeCount(autoNudgeTriggeredRef.current[sessionId] ?? 0);
+    void window.agenticxDesktop.listSessions(undefined).then((r) => {
+      if (!r.ok) return;
+      const row = (r.sessions ?? []).find((s) => s.session_id === sessionId);
+      setSessionExecutionState((row?.execution_state ?? "idle") as SessionExecutionState);
+    });
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    const evaluate = async () => {
+      const lastProgress = lastProgressAtRef.current;
+      const now = Date.now();
+      const silentMs = lastProgress > 0 ? now - lastProgress : 0;
+      let execState: SessionExecutionState = sessionExecutionState;
+      try {
+        const r = await window.agenticxDesktop.listSessions(undefined);
+        if (cancelled || !r.ok) return;
+        const row = (r.sessions ?? []).find((s) => s.session_id === sessionId);
+        if (row?.execution_state) {
+          execState = row.execution_state as SessionExecutionState;
+          setSessionExecutionState(execState);
+        }
+      } catch {
+        /* ignore */
+      }
+      const lastMsg = messages[messages.length - 1];
+      const graceMs = now - sessionEnteredAtRef.current;
+      const stallSilenceMs = stallDetectSilenceMs(stallDetectSeconds);
+      const channelA = sseActive && lastProgress > 0 && silentMs >= stallSilenceMs;
+      const channelB =
+        !sseActive &&
+        execState === "running" &&
+        lastProgress > 0 &&
+        silentMs >= stallSilenceMs;
+      const channelC =
+        graceMs >= CHANNEL_C_GRACE_MS &&
+        shouldTriggerIncompleteEndStall(execState, sseActive, lastMsg, CHANNEL_C_GRACE_MS);
+      if (channelA || channelB || channelC) {
+        setStallState("stall");
+        return;
+      }
+      if (stallState === "stall" && (messageLooksLikeAssistantFinal(lastMsg) || silentMs < stallSilenceMs)) {
+        setStallState("none");
+      }
+    };
+    void evaluate();
+    const timer = window.setInterval(() => {
+      setStallTick((t) => t + 1);
+      void evaluate();
+    }, 3000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [messages, sessionExecutionState, sessionId, sseActive, stallDetectSeconds, stallState]);
+
   const visibleMessages = useMemo(
     () => messages.filter((item) => !item.agentId || item.agentId === "meta"),
     [messages]
+  );
+  const groupedVisibleMessages = useMemo(
+    () => groupConsecutiveToolMessages(visibleMessages),
+    [visibleMessages]
+  );
+  const topLevelRowsIm = useMemo(
+    () => (chatStyle === "im" ? expandMessagesToTopLevelRows(visibleMessages) : null),
+    [chatStyle, visibleMessages]
   );
   /** Avoid showing __stream__ on top of an already-committed assistant bubble with identical text. */
   const hideStreamOverlayAsDuplicate = useMemo(() => {
@@ -552,7 +751,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
           provider?: string;
           model?: string;
           task?: string;
-          status?: "pending" | "running" | "completed" | "failed" | "cancelled";
+          status?: "pending" | "running" | "paused" | "completed" | "failed" | "cancelled";
           result_summary?: string;
           error_text?: string;
           recent_events?: Array<{ type?: string; data?: Record<string, unknown> }>;
@@ -705,14 +904,40 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
 
   const sendChat = async (
     userText: string,
-    opts?: { provider?: string; model?: string; insertAfterId?: string; agentId?: string }
+    opts?: {
+      provider?: string;
+      model?: string;
+      insertAfterId?: string;
+      agentId?: string;
+      forceSend?: boolean;
+      continuation?: { reason: ContinueReason; source: ContinueSource };
+    }
   ) => {
-    if (!userText || !apiBase || !sessionId) return;
-    if (streaming) {
+    const isContinuation = !!opts?.continuation;
+    if ((!userText && !isContinuation) || !apiBase || !sessionId) return;
+
+    if (
+      !isContinuation &&
+      shouldEnqueueOnResend({ isStreamRunActive: streaming, forceSend: opts?.forceSend })
+    ) {
+      enqueuePaneMessage(liteQueueKey, {
+        id: crypto.randomUUID(),
+        text: userText,
+        attachments: [],
+        contextFiles: [],
+        timestamp: Date.now(),
+      });
+      setInput("");
+      return;
+    }
+
+    if (streaming && opts?.forceSend) {
       abortedByUserRef.current = true;
       abortRef.current?.abort();
       const partial = streamTextRef.current.trim();
-      if (partial && !isThinkingPlaceholderText(partial) && !streamCommittedRef.current) {
+      const partialCommitted =
+        !!partial && !isThinkingPlaceholderText(partial) && !streamCommittedRef.current;
+      if (partialCommitted) {
         addMessage("assistant", streamTextRef.current, "meta", activeProvider, activeModel);
         streamCommittedRef.current = true;
       }
@@ -723,6 +948,35 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
       setStreamingModel(null);
       setStatus("idle");
       setStreaming(false);
+
+      // Close the prior user turn with "（已中断）" so the next request does
+      // not arrive at the backend with two consecutive unanswered user
+      // messages (the model would otherwise answer both).
+      if (!partialCommitted) {
+        const interruptedNote = "（已中断）";
+        addMessage("assistant", interruptedNote, "meta", activeProvider, activeModel);
+        try {
+          await fetch(`${apiBase}/api/session/messages/append`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-agx-desktop-token": apiToken,
+            },
+            body: JSON.stringify({
+              session_id: sessionId,
+              messages: [
+                {
+                  role: "assistant",
+                  content: interruptedNote,
+                  metadata: { source: "barge-in" },
+                },
+              ],
+            }),
+          });
+        } catch (err) {
+          console.warn("[ChatView] append interrupted placeholder failed:", err);
+        }
+      }
     }
     const reqProvider = opts?.provider ?? activeProvider;
     const reqModel = opts?.model ?? activeModel;
@@ -735,7 +989,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
     activeRequestIdRef.current = requestId;
     const isCurrentRequest = () => activeRequestIdRef.current === requestId;
     let insertAfterCursor = opts?.insertAfterId;
-    const appendAssistantMessage = (content: string) => {
+    const appendAssistantMessage = (content: string, extras?: Partial<Pick<Message, "suggestedQuestions">>) => {
       if (insertAfterCursor) {
         insertAfterCursor = insertMessageAfter(insertAfterCursor, {
           role: "assistant",
@@ -743,15 +997,18 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
           agentId: "meta",
           provider: reqProvider,
           model: reqModel,
+          ...extras,
         });
         return;
       }
-      addMessage("assistant", content, "meta", reqProvider, reqModel);
+      addMessage("assistant", content, "meta", reqProvider, reqModel, undefined, extras);
     };
     const commitCurrentStreamIfNeeded = () => {
-      const partial = streamTextRef.current.trim();
+      const raw = streamTextRef.current.trim();
+      // Trim trailing colon ("：" or ":") that model writes just before calling a tool.
+      const partial = raw.replace(/[：:]\s*$/, "").trimEnd();
       if (!partial || isThinkingPlaceholderText(partial) || streamCommittedRef.current) return false;
-      appendAssistantMessage(streamTextRef.current);
+      appendAssistantMessage(partial);
       streamCommittedRef.current = true;
       lastMidStreamAssistantCommitRef.current = partial;
       return true;
@@ -772,7 +1029,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
       streamCommittedRef.current = false;
     };
 
-    if (!opts?.insertAfterId) {
+    if (!opts?.insertAfterId && !isContinuation) {
       setInput("");
       if (targetAgentId === "meta") {
         addMessage("user", userText, "meta");
@@ -784,6 +1041,9 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
 
     setStatus("processing");
     setStreaming(true);
+    setSseActive(true);
+    setSessionExecutionState("running");
+    recordProgressActivity();
     cancelStreamRenderFrame();
     setStreamedAssistantText("");
     setStreamingModel(reqModel ? { provider: reqProvider, model: reqModel } : null);
@@ -799,12 +1059,23 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
       if (reqProvider) body.provider = reqProvider;
       if (reqModel) body.model = reqModel;
       if (targetAgentId !== "meta") body.agent_id = targetAgentId;
-      const resp = await fetch(`${apiBase}/api/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
-        body: JSON.stringify(body),
-        signal: abortController.signal
-      });
+      const resp = isContinuation && opts?.continuation
+        ? await fetch(continueSessionUrl(apiBase, sessionId), {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+            body: JSON.stringify({
+              reason: opts.continuation.reason,
+              source: opts.continuation.source,
+              suppress_user_echo: true,
+            }),
+            signal: abortController.signal,
+          })
+        : await fetch(`${apiBase}/api/chat`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+            body: JSON.stringify(body),
+            signal: abortController.signal,
+          });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const reader = resp.body?.getReader();
       const decoder = new TextDecoder();
@@ -812,6 +1083,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
 
       let full = "";
       let cumulativeFull = "";
+      let pendingSuggestedQuestions: string[] = [];
       let buffer = "";
       while (true) {
         if (!isCurrentRequest()) return;
@@ -826,27 +1098,40 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
           try {
             const payload = JSON.parse(line.slice(6));
             const eventAgentId = payload.data?.agent_id ?? "meta";
+            if (payload.type === "continuation_notice") {
+              const noticeText = String(payload.data?.text ?? "").trim();
+              if (noticeText) addMessage("tool", noticeText, "meta");
+              continue;
+            }
+            if (payload.type === "continuation_rejected") {
+              continue;
+            }
             if (payload.type === "tool_progress") {
               if (!isCurrentRequest()) continue;
+              recordProgressActivity();
               const name = String(payload.data?.name ?? "tool");
               const sec = Number(payload.data?.elapsed_seconds ?? 0);
               const outputLine = payload.data?.line as string | undefined;
-              if (outputLine !== undefined && eventAgentId === "meta") {
-                setToolOutputLines((prev) => [...prev.slice(-200), outputLine]);
-                const streamLabel = payload.data?.stream === "stderr" ? "stderr" : "stdout";
-                setStreamedAssistantText(`⏳ ${name} 执行中…（${streamLabel}）`);
+              const progressCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (eventAgentId === "meta" && progressCallId) {
+                const patch: ToolCallStreamPatch = {
+                  toolStatus: "running",
+                };
+                if (Number.isFinite(sec)) patch.toolElapsedSec = sec;
+                if (outputLine !== undefined) patch.appendStreamLine = String(outputLine);
+                updateMessageByToolCallId(progressCallId, patch);
                 continue;
               }
-              const waitLabel = (() => {
-                if (name === "cc_bridge_send") {
-                  return ccBridgeSendToolProgressLabel(sec, ccBridgeLastSessionModeRef.current);
-                }
-                return Number.isFinite(sec)
-                  ? `⏳ ${name} 执行中…（已等待 ${sec}s）`
-                  : `⏳ ${name} 执行中…`;
-              })();
+              if (outputLine !== undefined && eventAgentId === "meta" && !progressCallId) {
+                continue;
+              }
               if (eventAgentId === "meta") {
-                setStreamedAssistantText(waitLabel);
+                continue;
+              }
+              if (name === "cc_bridge_send") {
+                updateSubAgent(eventAgentId, {
+                  currentAction: ccBridgeSendToolProgressLabel(sec, ccBridgeLastSessionModeRef.current),
+                });
               } else {
                 updateSubAgent(eventAgentId, {
                   currentAction: Number.isFinite(sec) ? `${name} 执行中… (${sec}s)` : `${name} 执行中…`,
@@ -856,16 +1141,20 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
             }
             if (payload.type === "token") {
               if (eventAgentId !== "meta") { addSubAgentEvent(eventAgentId, { type: "token", content: "生成中..." }); continue; }
-              const tokenText = String(payload.data?.text ?? "");
+              recordProgressActivity();
+              const rawToken = String(payload.data?.text ?? "");
+              // Strip backend-emitted ⏳ waiting placeholder from streamed tokens.
+              const tokenText = rawToken.replace(/⏳\s*/g, "");
+              if (!tokenText) continue;
               full += tokenText;
               cumulativeFull += tokenText;
               scheduleStreamTextUpdate(full);
             }
             if (payload.type === "tool_call") {
-              setToolOutputLines([]);
-              const toolName = payload.data?.name ?? "tool";
+              const toolNameStr = String(payload.data?.name ?? "tool");
               const toolArgs = (payload.data?.arguments ?? payload.data?.args ?? {}) as Record<string, unknown>;
-              if (eventAgentId === "meta" && toolName === "cc_bridge_start") {
+              const toolCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (eventAgentId === "meta" && toolNameStr === "cc_bridge_start") {
                 const modeHint = parseCcBridgeModeFromPayload(toolArgs);
                 if (modeHint === "headless") {
                   ccBridgeLastSessionModeRef.current = "headless";
@@ -874,19 +1163,37 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
                 }
               }
               const SILENT_TOOLS_SSE = new Set(["check_resources"]);
-              if (!SILENT_TOOLS_SSE.has(toolName)) {
-                const content = `🔧 ${toolName}: ${JSON.stringify(
-                  payload.data?.arguments ?? payload.data?.args ?? {}
-                ).slice(0, 120)}`;
+              if (!SILENT_TOOLS_SSE.has(toolNameStr)) {
                 if (eventAgentId === "meta") {
                   commitCurrentStreamIfNeeded();
                   full = "";
                   resetStreamSegment();
-                  addMessage("tool", content, "meta");
+                  const globalMsgs = useAppStore.getState().messages;
+                  const lastMsg = globalMsgs.length ? globalMsgs[globalMsgs.length - 1] : undefined;
+                  const toolGroupId =
+                    lastMsg?.role === "tool" && lastMsg.toolGroupId
+                      ? lastMsg.toolGroupId
+                      : crypto.randomUUID();
+                  const rawArgs = JSON.stringify(toolArgs);
+                  const content =
+                    rawArgs.length > 80_000 ? `${rawArgs.slice(0, 80_000)}\n… (truncated)` : rawArgs;
+                  if (toolCallId) {
+                    addMessage("tool", content, "meta", undefined, undefined, undefined, {
+                      toolCallId,
+                      toolName: toolNameStr,
+                      toolArgs,
+                      toolStatus: "running",
+                      toolGroupId,
+                    });
+                  } else {
+                    const legacy = `\u{1F527} ${toolNameStr}: ${JSON.stringify(toolArgs).slice(0, 120)}`;
+                    addMessage("tool", legacy, "meta");
+                  }
                 } else {
-                  updateSubAgent(eventAgentId, { status: "running", currentAction: `调用工具 ${toolName}` });
-                  addSubAgentEvent(eventAgentId, { type: "tool_call", content });
-                  const livePreview = buildToolCallLivePreview(toolName, toolArgs);
+                  const legacy = `\u{1F527} ${toolNameStr}: ${JSON.stringify(toolArgs).slice(0, 120)}`;
+                  updateSubAgent(eventAgentId, { status: "running", currentAction: `调用工具 ${toolNameStr}` });
+                  addSubAgentEvent(eventAgentId, { type: "tool_call", content: legacy });
+                  const livePreview = buildToolCallLivePreview(toolNameStr, toolArgs);
                   if (livePreview) {
                     const sub = useAppStore.getState().subAgents.find((item) => item.id === eventAgentId);
                     const prev = sub?.liveOutput ?? "";
@@ -897,14 +1204,17 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
             }
             if (payload.type === "tool_result") {
               const toolName = payload.data?.name ?? "tool";
-              let resultText = String(payload.data?.result ?? "");
               let resultObjForCc: Record<string, unknown> | null = null;
-              try {
-                const parsed = JSON.parse(resultText);
-                resultObjForCc = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
-                resultText = JSON.stringify(parsed, null, 2);
-              } catch {
-                // Keep original plain text if not JSON.
+              const resultRaw = payload.data?.result;
+              if (typeof resultRaw === "string") {
+                try {
+                  const parsed = JSON.parse(resultRaw);
+                  resultObjForCc = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+                } catch {
+                  resultObjForCc = null;
+                }
+              } else if (resultRaw && typeof resultRaw === "object") {
+                resultObjForCc = resultRaw as Record<string, unknown>;
               }
               if (eventAgentId === "meta" && toolName === "cc_bridge_start" && resultObjForCc) {
                 const hint = parseCcBridgeModeFromPayload(resultObjForCc);
@@ -912,10 +1222,25 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
                   ccBridgeLastSessionModeRef.current = hint;
                 }
               }
-              const formatted = formatToolResultMessage(toolName, resultText);
+              const formatted = formatToolResultMessage(toolName, resultRaw);
               if (formatted.silent) continue;
-              if (eventAgentId === "meta") addMessage("tool", formatted.content, "meta");
-              else {
+              const resultCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              const rawContent = serializeToolResultRaw(resultRaw);
+              const preview = formatted.content.replace(/\s+/g, " ").trim().slice(0, 160);
+              const mergedStatus = deriveToolStatusFromResult(resultRaw);
+              if (eventAgentId === "meta" && resultCallId) {
+                const merged = updateMessageByToolCallId(resultCallId, {
+                  content: rawContent,
+                  toolStatus: mergedStatus,
+                  toolResultPreview: preview,
+                  toolStreamLines: [],
+                });
+                if (!merged) {
+                  addMessage("tool", formatted.content, "meta");
+                }
+              } else if (eventAgentId === "meta") {
+                addMessage("tool", formatted.content, "meta");
+              } else {
                 addSubAgentEvent(eventAgentId, { type: "tool_result", content: formatted.content });
                 if (toolName === "file_write" || toolName === "file_edit") {
                   const sub = useAppStore.getState().subAgents.find((item) => item.id === eventAgentId);
@@ -972,6 +1297,10 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
             }
             if (payload.type === "final") {
               if (eventAgentId !== "meta") { updateSubAgent(eventAgentId, { status: "completed", currentAction: "已完成" }); addSubAgentEvent(eventAgentId, { type: "final", content: payload.data?.text ?? "" }); continue; }
+              const sqRaw = payload.data?.suggested_questions;
+              pendingSuggestedQuestions = Array.isArray(sqRaw)
+                ? sqRaw.map((x: unknown) => String(x).trim()).filter(Boolean).slice(0, 3)
+                : [];
               const finalText = String(payload.data?.text ?? "");
               if (finalText) {
                 if (finalText.startsWith(cumulativeFull)) {
@@ -1034,11 +1363,26 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               }
             }
             if (payload.type === "subagent_paused") {
+              // FR-2: dedicated "paused" status (was previously misreported as "failed").
               const subId = payload.data?.agent_id;
               if (subId) {
-                updateSubAgent(subId, { status: "failed", currentAction: payload.data?.text ?? "已暂停，等待指令" });
-                addSubAgentEvent(subId, { type: "paused", content: payload.data?.text ?? "已暂停，等待指令" });
+                const round = Number(payload.data?.round ?? 0) || 0;
+                const maxRounds = Number(payload.data?.max_rounds ?? 0) || 0;
+                const baseText = String(payload.data?.text ?? "已暂停").trim();
+                const roundLabel = round && maxRounds ? `（触顶 ${round}/${maxRounds} 轮）` : "";
+                const display = `${baseText}${roundLabel}`;
+                updateSubAgent(subId, { status: "paused", currentAction: display });
+                addSubAgentEvent(subId, { type: "paused", content: display });
               }
+            }
+            if (payload.type === "compaction") {
+              // FR-3: surface auto-compaction so users can see it in real time.
+              const count = Number(payload.data?.compacted_count ?? 0) || 0;
+              const reactive = Boolean(payload.data?.reactive);
+              const note = buildCompactionNoticeText(count, reactive);
+              addMessage("tool", note, eventAgentId || "meta", undefined, undefined, undefined, undefined, {
+                noticeKind: reactive ? "compaction_reactive" : "compaction_proactive",
+              });
             }
             if (payload.type === "subagent_completed") {
               const subId = payload.data?.agent_id;
@@ -1071,8 +1415,28 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               }
             }
             if (payload.type === "error") {
-              if (eventAgentId === "meta") addMessage("tool", `❌ ${payload.data?.text ?? "未知错误"}`, "meta");
-              else { updateSubAgent(eventAgentId, { status: "failed", currentAction: payload.data?.text ?? "执行异常" }); addSubAgentEvent(eventAgentId, { type: "error", content: payload.data?.text ?? "未知错误" }); }
+              const errText = String(payload.data?.text ?? "未知错误");
+              const severity = String(payload.data?.severity ?? "").trim();
+              const detector = String(payload.data?.detector ?? "").trim();
+              const isWarning = severity === "warning"
+                || detector === "token_budget_compress"
+                || detector === "compactor_circuit_breaker";
+              if (eventAgentId === "meta") {
+                if (isWarning) {
+                  const noticeKind =
+                    detector === "compactor_circuit_breaker" ? "compactor_cb" : "budget_compress";
+                  addMessage("tool", errText, "meta", undefined, undefined, undefined, undefined, {
+                    noticeKind,
+                  });
+                } else {
+                  addMessage("tool", `❌ ${errText}`, "meta");
+                }
+              } else if (isWarning) {
+                addSubAgentEvent(eventAgentId, { type: "warning", content: errText });
+              } else {
+                updateSubAgent(eventAgentId, { status: "failed", currentAction: errText });
+                addSubAgentEvent(eventAgentId, { type: "error", content: errText });
+              }
             }
           } catch { /* skip malformed SSE */ }
         }
@@ -1080,12 +1444,19 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
       }
 
       const trimmedFull = full.trim();
+      const sugExtras =
+        pendingSuggestedQuestions.length > 0
+          ? { suggestedQuestions: pendingSuggestedQuestions.slice(0, 3) }
+          : undefined;
       if (isCurrentRequest() && trimmedFull && !isThinkingPlaceholderText(full) && !streamCommittedRef.current) {
         const mid = lastMidStreamAssistantCommitRef.current;
         if (mid !== null && trimmedFull === mid) {
           streamCommittedRef.current = true;
+          if (sugExtras) {
+            mergeLastMessageByRole("assistant", sugExtras);
+          }
         } else {
-          appendAssistantMessage(full);
+          appendAssistantMessage(full, sugExtras);
           streamCommittedRef.current = true;
         }
         void speak(full);
@@ -1107,9 +1478,9 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
       streamTextRef.current = "";
       setStreamedAssistantText("");
       setStreamingModel(null);
-      setToolOutputLines([]);
       setStatus("idle");
       setStreaming(false);
+      setSseActive(false);
       scrollToBottom();
       void syncSubAgents();
 
@@ -1119,6 +1490,68 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
       }
     }
   };
+
+  const sendChatRef = useRef(sendChat);
+  sendChatRef.current = sendChat;
+
+  useEffect(() => {
+    if (!stallNudgeConfig.stall_auto_nudge_enabled) return;
+    if (!shouldAllowStallAutoNudge(stallState, sessionExecutionState)) return;
+    const sid = (sessionId || "").trim();
+    if (!sid) return;
+    const silentSeconds =
+      lastProgressAtRef.current > 0
+        ? Math.floor((Date.now() - lastProgressAtRef.current) / 1000)
+        : 0;
+    if (silentSeconds < stallNudgeConfig.stall_auto_nudge_after_seconds) return;
+    const count = autoNudgeTriggeredRef.current[sid] ?? 0;
+    if (count >= stallNudgeConfig.stall_auto_nudge_max_per_session) return;
+    const bucket = Math.floor(
+      silentSeconds / Math.max(1, stallNudgeConfig.stall_auto_nudge_after_seconds),
+    );
+    if ((autoNudgeBucketRef.current[sid] ?? -1) >= bucket) return;
+    autoNudgeBucketRef.current[sid] = bucket;
+    autoNudgeTriggeredRef.current[sid] = count + 1;
+    setAutoNudgeCount(count + 1);
+    const reason: ContinueReason =
+      sessionExecutionState === "interrupted" ? "interrupted" : "stall";
+    void sendChatRef.current("", {
+      continuation: { reason, source: "desktop_auto_nudge" },
+    });
+  }, [sessionExecutionState, sessionId, stallNudgeConfig, stallState, stallTick]);
+
+  const resumeCurrentTask = useCallback(async () => {
+    if (!sessionId) return;
+    let state: SessionExecutionState = sessionExecutionState;
+    try {
+      const r = await window.agenticxDesktop.listSessions(undefined);
+      if (r.ok) {
+        const row = (r.sessions ?? []).find((s) => s.session_id === sessionId);
+        state = (row?.execution_state ?? "idle") as SessionExecutionState;
+        setSessionExecutionState(state);
+      }
+    } catch {
+      /* ignore */
+    }
+    if (state === "running") return;
+    setStallState("none");
+    const reason = inferContinueReason({
+      stallState,
+      executionState: state,
+    });
+    await sendChatRef.current("", {
+      continuation: { reason, source: "desktop_manual" },
+    });
+  }, [sessionExecutionState, sessionId, stallState]);
+
+  const resumeWithModel = useCallback(
+    async (provider: string, model: string) => {
+      setActiveModel(provider, model);
+      void window.agenticxDesktop.saveConfig({ activeProvider: provider, activeModel: model });
+      await resumeCurrentTask();
+    },
+    [resumeCurrentTask, setActiveModel]
+  );
 
   const send = async (manualInput?: string) => {
     const toSend = (manualInput ?? input).trim();
@@ -1140,7 +1573,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
   };
 
   const stopStreaming = () => {
-    if (!streaming) return;
+    if (!showStopButton) return;
     const sid = String(sessionId || "").trim();
     if (sid) {
       void window.agenticxDesktop.interruptSession?.(sid);
@@ -1267,6 +1700,35 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
         }
         return;
       }
+      if (streaming) {
+        const trimmed = input.trim();
+        const queue = useAppStore.getState().pendingMessages[liteQueueKey] ?? [];
+        const sendQueuedNow =
+          isDoubleEnterWithinWindow(lastComposerEnterAtRef.current) ||
+          (!trimmed && queue.length > 0 && lastComposerEnterAtRef.current > 0);
+
+        if (sendQueuedNow) {
+          lastComposerEnterAtRef.current = 0;
+          if (trimmed) {
+            void sendChat(trimmed, { forceSend: true });
+          } else {
+            const latestQueued = queue[queue.length - 1];
+            if (latestQueued) {
+              const item = takePendingMessage(liteQueueKey, latestQueued.id);
+              if (item) void sendChatRef.current(item.text, { forceSend: true });
+            }
+          }
+          return;
+        }
+
+        if (!trimmed) return;
+
+        lastComposerEnterAtRef.current = Date.now();
+        void send();
+        return;
+      }
+
+      lastComposerEnterAtRef.current = 0;
       void send();
     }
   };
@@ -1345,11 +1807,6 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
             onClick={() => {
               const next = theme === "dark" || theme === "dim" ? "light" : "dark";
               setTheme(next);
-              try {
-                window.localStorage.setItem("agx-theme", next);
-              } catch {
-                // ignore storage errors
-              }
             }}
             title={theme === "light" ? "切换到暗色" : "切换到亮色"}
             aria-label="切换主题"
@@ -1379,7 +1836,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               }}
               title={agxAccount.displayName || agxAccount.email || "已登录"}
             >
-              <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-emerald-400/90 text-[9px] font-semibold text-black">
+              <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[rgba(var(--theme-color-rgb),0.9)] text-[9px] font-semibold text-black">
                 {(agxAccount.displayName || agxAccount.email || "?").trim().charAt(0).toUpperCase()}
               </span>
               <span className="max-w-[80px] truncate">
@@ -1431,26 +1888,70 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
             </div>
           </div>
         )}
-        <div className={`mx-auto max-w-2xl space-y-3 ${isLite ? "text-[15px]" : ""}`}>
-          {visibleMessages.map((m) => (
-            <div key={m.id} className={`${isLite ? "text-[15px]" : "text-sm"}`}>
-              <MessageRenderer
-                message={m}
-                assistantBadge={!isLite && m.role === "assistant" ? <ModelBadge provider={m.provider} model={m.model} /> : undefined}
-                assistantName="Machi"
-              />
-              {!isLite && (
-                <MessageActions
-                  msg={m}
-                  onCopy={() => onCopyMessage(m)}
-                  onRetry={() => onRetryMessage(m)}
-                  onReanswer={() => onReanswerMessage(m.id)}
+        <div className={`mx-auto max-w-3xl space-y-3 ${isLite ? "text-[15px]" : ""}`}>
+          {(() => {
+            const renderGroupedChatRow = (row: GroupedChatRow, reactWorkCol: boolean) => {
+              if (row.kind === "message") {
+                const m = row.message;
+                return (
+                  <div key={m.id} className={`${isLite ? "text-[15px]" : "text-sm"}`}>
+                    <MessageRenderer
+                      message={m}
+                      assistantBadge={!isLite && m.role === "assistant" ? <ModelBadge provider={m.provider} model={m.model} /> : undefined}
+                      assistantName="Machi"
+                      imAssistantVisual={
+                        m.role === "assistant" && reactWorkCol ? "compact-inline" : "default"
+                      }
+                      noBubbleBorder={reactWorkCol}
+                      toolCardOmitLeadingSpacer={m.role === "tool" && reactWorkCol}
+                      onFollowupClick={(t) => void send(t)}
+                    />
+                    {!isLite && (
+                      <MessageActions
+                        msg={m}
+                        onCopy={() => onCopyMessage(m)}
+                        onRetry={() => onRetryMessage(m)}
+                        onReanswer={() => onReanswerMessage(m.id)}
+                      />
+                    )}
+                  </div>
+                );
+              }
+              return (
+                <TurnToolGroupCard
+                  key={`tg-${row.groupId}`}
+                  messages={row.messages}
+                  renderExtras={(msg) => renderToolMessageExtras(msg, {})}
+                  omitLeadingSpacer={reactWorkCol}
+                  flat={reactWorkCol}
                 />
-              )}
-            </div>
-          ))}
+              );
+            };
+
+            if (topLevelRowsIm) {
+              return topLevelRowsIm.map((seg, segIdx) => {
+                if (seg.kind === "user") {
+                  return renderGroupedChatRow({ kind: "message", message: seg.message }, false);
+                }
+                const { workMessages, finalAssistant } = seg.block;
+                const groupedWork = groupConsecutiveToolMessages(workMessages);
+                const blockKey = `react-${workMessages[0]?.id ?? segIdx}-${finalAssistant?.id ?? ""}`;
+                return (
+                  <div key={blockKey} className="space-y-3">
+                    <div className="flex min-w-0 items-start gap-2">
+                      <div className="flex min-w-0 flex-1 flex-col gap-3">
+                        {groupedWork.map((r) => renderGroupedChatRow(r, true))}
+                      </div>
+                    </div>
+                    {finalAssistant ? renderGroupedChatRow({ kind: "message", message: finalAssistant }, false) : null}
+                  </div>
+                );
+              });
+            }
+            return groupedVisibleMessages.map((row) => renderGroupedChatRow(row, false));
+          })()}
           {streaming && !hideStreamOverlayAsDuplicate && (
-            <div className={`${isLite ? "text-[15px]" : "text-sm"}`}>
+            <div className={["!mt-1.5", isLite ? "text-[15px]" : "text-sm"].join(" ")}>
               {chatStyle === "terminal" ? (
                 <TerminalLine
                   message={{ id: "__stream__", role: "assistant", content: streamedAssistantText || "" }}
@@ -1470,26 +1971,35 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               )}
             </div>
           )}
-          {streaming && toolOutputLines.length > 0 && (
-            <div className="ml-4">
-              <ToolOutputStream lines={toolOutputLines} />
-            </div>
-          )}
-          {queuedMessages.length > 0 && queuedMessages.map((qm, qi) => (
-            <QueuedMessageBubble
-              key={qm.id}
-              msg={qm}
-              index={qi}
-              total={queuedMessages.length}
-              onEdit={(id, newText) => editPendingMessage(liteQueueKey, id, newText)}
-              onRemove={(id) => removePendingMessage(liteQueueKey, id)}
+          {stallState === "stall" ? (
+            <StallRecoveryCard
+              kind="stall"
+              currentModelLabel={currentModelLabel}
+              modelOptions={stallModelOptions}
+              autoNudgeCount={autoNudgeCount}
+              autoNudgeMax={stallNudgeConfig.stall_auto_nudge_max_per_session}
+              onResume={() => void resumeCurrentTask()}
+              onResumeWithModel={(provider, model) => void resumeWithModel(provider, model)}
+              onStop={stopStreaming}
             />
-          ))}
+          ) : null}
         </div>
       </div>
 
       {/* Input area */}
-      <div className="relative shrink-0 border-t border-border bg-surface-panel/80 px-4 py-3">
+      <div className="relative shrink-0 border-t border-border bg-surface-panel/80 px-4 pt-3 pb-4">
+        <div className="mx-auto mb-2 max-w-2xl">
+          <MessageQueuePanel
+            messages={queuedMessages}
+            onEdit={(id, newText) => editPendingMessage(liteQueueKey, id, newText)}
+            onRemove={(id) => removePendingMessage(liteQueueKey, id)}
+            onSendNow={(id) => {
+              const item = takePendingMessage(liteQueueKey, id);
+              if (!item) return;
+              void sendChatRef.current(item.text, { forceSend: true });
+            }}
+          />
+        </div>
         {!isLite && (
           <CommandPalette
             open={commandOpen}
@@ -1548,15 +2058,15 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
             }}
             onKeyDown={onKeyDown}
             rows={input.split("\n").length > 3 ? 4 : input.includes("\n") ? 2 : 1}
-            placeholder={canSend ? (isLite ? (selectedSubAgent ? `对 ${selectedSubAgentName} 发送消息...` : "问我任何问题...") : (planMode ? "计划模式：描述目标，我只返回可执行计划" : (selectedSubAgent ? `对 ${selectedSubAgentName} 发送补充指令，Enter 发送` : "输入需求，Enter 发送（生成中可直接追问）"))) : "连接中..."}
+            placeholder={canSend ? (isLite ? (selectedSubAgent ? `对 ${selectedSubAgentName} 发送消息...` : (streaming ? "生成中：Enter 排队，连按两次 Enter 立即发送" : "问我任何问题...")) : (planMode ? "计划模式：描述目标，我只返回可执行计划" : (selectedSubAgent ? `对 ${selectedSubAgentName} 发送补充指令，Enter 发送` : (streaming ? "生成中：Enter 排队，连按两次 Enter 立即发送" : "输入需求，Enter 发送")))) : "连接中..."}
             disabled={!canSend && !streaming}
             className="min-h-[40px] max-h-[120px] flex-1 resize-none rounded-xl border border-border bg-surface-card px-3 py-2.5 text-sm outline-none transition placeholder:text-text-faint focus:border-cyan-500/50"
           />
           <button className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border text-lg transition hover:bg-surface-hover" onClick={onMicClick} title="语音输入">🎙</button>
-          {streaming ? (
+          {showStopButton ? (
             <div className="flex items-center gap-2">
               <button className="flex h-10 shrink-0 items-center rounded-xl bg-rose-500 px-4 text-sm font-medium text-white transition hover:bg-rose-400" onClick={stopStreaming}>中断</button>
-              <button className="flex h-10 shrink-0 items-center rounded-xl bg-cyan-500 px-4 text-sm font-medium text-black transition hover:bg-cyan-400 disabled:opacity-40 disabled:hover:bg-cyan-500" disabled={!canSend || !input.trim()} onClick={() => void send()}>追问</button>
+              <button className="flex h-10 shrink-0 items-center rounded-xl bg-btnPrimary px-4 text-sm font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover disabled:opacity-40 disabled:hover:bg-btnPrimary" disabled={!canSend || !input.trim()} onClick={() => { lastComposerEnterAtRef.current = 0; void sendChat(input.trim(), { forceSend: true }); }}>立即发送</button>
               <button
                 className="flex h-10 shrink-0 items-center rounded-xl border border-border px-4 text-sm font-medium text-text-subtle transition hover:bg-surface-hover disabled:opacity-40"
                 disabled={!canSend || !input.trim()}
@@ -1576,7 +2086,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               >排队</button>
             </div>
           ) : (
-            <button className="flex h-10 shrink-0 items-center rounded-xl bg-cyan-500 px-4 text-sm font-medium text-black transition hover:bg-cyan-400 disabled:opacity-40 disabled:hover:bg-cyan-500" disabled={!canSend || !input.trim()} onClick={() => void send()}>发送</button>
+            <button className="flex h-10 shrink-0 items-center rounded-xl bg-btnPrimary px-4 text-sm font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover disabled:opacity-40 disabled:hover:bg-btnPrimary" disabled={!canSend || !input.trim()} onClick={() => void send()}>发送</button>
           )}
         </div>
         {!isLite && <ShortcutHints />}
