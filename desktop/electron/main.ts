@@ -33,6 +33,25 @@ import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import yaml from "js-yaml";
+import {
+  closeSplash,
+  configureSplashLayoutThemeReader,
+  createSplashWindow,
+  onMainWindowDidFinishLoad,
+  registerSplashIpcHandlers,
+  scheduleSplashForceShowFallback,
+  updateSplashStage,
+} from "./splash";
+import {
+  getSystemSearchInfo,
+  openSystemSearchPath,
+  openSystemSearchWith,
+  previewSystemSearchFile,
+  revealSystemSearchPath,
+  runSystemSearch,
+  type SystemSearchCategory,
+} from "./system-search";
+import { proxyAwareFetch, logProxyConfig } from "./proxy-fetch";
 
 /** Node fetch honors HTTP_PROXY; localhost cc-bridge POSTs then fail (e.g. 502) and PTY input never reaches Claude. */
 function ccBridgeUrlIsLoopback(urlStr: string): boolean {
@@ -231,7 +250,7 @@ type AgxConfig = {
   };
   automation?: { prevent_sleep?: boolean };
   skills?: { non_high_risk_auto_install?: boolean };
-  /** Machi 官网 / Supabase 账号（桌面端轮询写入，勿在日志中打印 token） */
+  /** Near 官网 / Supabase 账号（桌面端轮询写入，勿在日志中打印 token） */
   agx_account?: {
     user_email?: string;
     user_display_name?: string;
@@ -664,7 +683,7 @@ async function invokeAutomationUserTurnWithSignal(
   const chatBody: Record<string, unknown> = {
     session_id: sessionId,
     user_input: userInput,
-    // interactive：不把任务提示词包进 AutoSolve 长模板写入历史；避免与飞书/Machi 会话混淆且便于删除持久化
+    // interactive：不把任务提示词包进 AutoSolve 长模板写入历史；避免与飞书/Near 会话混淆且便于删除持久化
     mode: "interactive",
   };
   if (prov && mod) {
@@ -1313,6 +1332,23 @@ function validateTrinityConfigPayload(input: unknown): { ok: true; config: Trini
 }
 
 let mainWindow: BrowserWindow | null = null;
+let mainWindowReadyToShow = false;
+let mainWindowRevealPending = false;
+
+function showMainWindowSafely(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindowRevealPending = true;
+  if (!mainWindowReadyToShow) return;
+  mainWindowRevealPending = false;
+  if (mainWindow.isMinimized()) mainWindow.restore();
+  mainWindow.show();
+  mainWindow.focus();
+}
+
+async function revealMainWindowAfterSplash(options?: { fade?: boolean }): Promise<void> {
+  await closeSplash({ fade: options?.fade ?? true });
+  showMainWindowSafely();
+}
 let tray: Tray | null = null;
 const WIN_TITLE_BAR_OVERLAY_HEIGHT = 44;
 type WinTitleBarTheme = "dark" | "light" | "dim";
@@ -1387,6 +1423,35 @@ function loadRemoteConfig(): ResolvedRemoteConfig | null {
   return { url, token: (rs.token || "").trim() };
 }
 
+/** Stable localStorage namespace key for renderer (host:port, lowercased). */
+function backendScopeFromRemoteConfig(cfg: ResolvedRemoteConfig | null): string {
+  if (!cfg) return "local";
+  const url = cfg.url.trim().replace(/\/+$/, "");
+  if (!url) return "local";
+  try {
+    const withProto = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url) ? url : `http://${url}`;
+    const u = new URL(withProto);
+    const host = u.hostname.toLowerCase();
+    const port = u.port || (u.protocol === "https:" ? "443" : "80");
+    return `${host}:${port}`;
+  } catch {
+    return url.toLowerCase();
+  }
+}
+
+function getInjectedConnectionMode(): "local" | "remote" {
+  return remoteConfig ? "remote" : "local";
+}
+
+function getInjectedBackendScope(): string {
+  return backendScopeFromRemoteConfig(remoteConfig);
+}
+
+function notifyRendererConnectionModeChanged(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("agx-connection-mode-changed");
+}
+
 async function pingRemoteServer(config: ResolvedRemoteConfig, timeoutMs = 10000): Promise<boolean> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -1409,6 +1474,49 @@ function getStudioUrl(): string {
 
 function getStudioToken(): string {
   return remoteConfig ? remoteConfig.token : apiToken;
+}
+
+function isRemoteMode(): boolean {
+  return Boolean(remoteConfig);
+}
+
+/**
+ * Fetch JSON from the studio backend (local or remote depending on mode) with
+ * the Desktop auth token attached. Used by remote-mode provider IPC bridges.
+ */
+async function studioFetchJson(
+  path: string,
+  init?: { method?: string; body?: unknown },
+): Promise<{ ok: boolean; status: number; data?: any; error?: string }> {
+  const url = `${getStudioUrl()}${path}`;
+  const headers: Record<string, string> = {
+    "x-agx-desktop-token": getStudioToken(),
+  };
+  let body: BodyInit | undefined;
+  if (init?.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(init.body);
+  }
+  try {
+    const resp = await fetch(url, { method: init?.method ?? "GET", headers, body });
+    let data: any = undefined;
+    try {
+      data = await resp.json();
+    } catch {
+      // ignore body decode errors
+    }
+    if (!resp.ok) {
+      return {
+        ok: false,
+        status: resp.status,
+        data,
+        error: `HTTP ${resp.status}${data?.detail ? `: ${data.detail}` : ""}`,
+      };
+    }
+    return { ok: true, status: resp.status, data };
+  } catch (err) {
+    return { ok: false, status: 0, error: String(err) };
+  }
 }
 
 // ── Studio readiness barrier ─────────────────────────────────────
@@ -1438,6 +1546,9 @@ function markStudioReady(): void {
   for (const cb of queued) {
     try { cb(); } catch { /* noop */ }
   }
+  // Only arm splash force-show after backend is ready so the main window
+  // does not appear with empty avatars/sessions during cold start.
+  scheduleSplashForceShowFallback(showMainWindowSafely);
 }
 
 function resetStudioReady(): void {
@@ -1463,6 +1574,111 @@ function waitForStudio(timeoutMs = 30000): Promise<boolean> {
     }, timeoutMs);
     studioReadyWaiters.push(onReady);
   });
+}
+
+/** Keep in sync with `desktop/src/utils/splash-preload-core.ts`. */
+const PRELOAD_READY_BUDGET_MS = 40_000;
+const PRELOAD_FETCH_TIMEOUT_MS = 10_000;
+const SESSION_MESSAGES_FETCH_TIMEOUT_MS = 30_000;
+
+function withFetchTimeout<T>(
+  promise: Promise<T>,
+  fallback: T,
+  timeoutMs = PRELOAD_FETCH_TIMEOUT_MS
+): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => {
+      setTimeout(() => resolve(fallback), timeoutMs);
+    }),
+  ]);
+}
+
+async function fetchListAvatarsOnce(): Promise<{ ok: boolean; avatars: unknown[] }> {
+  try {
+    const resp = await fetch(`${getStudioUrl()}/api/avatars`, {
+      headers: { "x-agx-desktop-token": getStudioToken() },
+    });
+    if (!resp.ok) return { ok: false, avatars: [] };
+    const data = (await resp.json()) as { ok?: boolean; avatars?: unknown[] };
+    return { ok: Boolean(data.ok), avatars: Array.isArray(data.avatars) ? data.avatars : [] };
+  } catch {
+    return { ok: false, avatars: [] };
+  }
+}
+
+async function fetchListSessionsOnce(
+  avatarId?: string
+): Promise<{ ok: boolean; sessions: unknown[] }> {
+  try {
+    const params = avatarId ? `?avatar_id=${encodeURIComponent(avatarId)}` : "";
+    const resp = await fetch(`${getStudioUrl()}/api/sessions${params}`, {
+      headers: { "x-agx-desktop-token": getStudioToken() },
+    });
+    if (!resp.ok) return { ok: false, sessions: [] };
+    const data = (await resp.json()) as { ok?: boolean; sessions?: unknown[] };
+    return { ok: Boolean(data.ok), sessions: Array.isArray(data.sessions) ? data.sessions : [] };
+  } catch {
+    return { ok: false, sessions: [] };
+  }
+}
+
+async function fetchListAvatarsCore(): Promise<{ ok: boolean; avatars: unknown[] }> {
+  await waitForStudio();
+  return fetchListAvatarsOnce();
+}
+
+async function fetchListSessionsCore(avatarId?: string): Promise<{ ok: boolean; sessions: unknown[] }> {
+  await waitForStudio();
+  return fetchListSessionsOnce(avatarId);
+}
+
+async function fetchListTaskspacesCore(
+  sessionId: string
+): Promise<{ ok: boolean; workspaces: unknown[]; error?: string }> {
+  const sid = String(sessionId || "").trim();
+  if (!sid) return { ok: false, workspaces: [], error: "sessionId is required" };
+  try {
+    const resp = await fetch(
+      `${getStudioUrl()}/api/taskspace/workspaces?session_id=${encodeURIComponent(sid)}`,
+      { headers: { "x-agx-desktop-token": getStudioToken() } }
+    );
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      return { ok: false, workspaces: [], error: `HTTP ${resp.status}: ${body.slice(0, 300)}` };
+    }
+    const data = (await resp.json()) as { ok?: boolean; workspaces?: unknown[] };
+    return {
+      ok: Boolean(data.ok),
+      workspaces: Array.isArray(data.workspaces) ? data.workspaces : [],
+    };
+  } catch (err) {
+    return { ok: false, workspaces: [], error: String(err) };
+  }
+}
+
+async function fetchSessionMessagesCore(
+  sessionId: string
+): Promise<{ ok: boolean; messages: unknown[]; error?: string }> {
+  const sid = String(sessionId || "").trim();
+  if (!sid) return { ok: false, messages: [], error: "sessionId is required" };
+  try {
+    const resp = await fetch(
+      `${getStudioUrl()}/api/session/messages?session_id=${encodeURIComponent(sid)}`,
+      { headers: { "x-agx-desktop-token": getStudioToken() } }
+    );
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => "");
+      return { ok: false, messages: [], error: `HTTP ${resp.status}: ${body.slice(0, 300)}` };
+    }
+    const data = (await resp.json()) as { ok?: boolean; messages?: unknown[] };
+    return {
+      ok: Boolean(data.ok),
+      messages: Array.isArray(data.messages) ? data.messages : [],
+    };
+  } catch (err) {
+    return { ok: false, messages: [], error: String(err) };
+  }
 }
 
 function emitSkillsChanged(): void {
@@ -2218,7 +2434,7 @@ function createWindow(): void {
   // awaits later resolve, the whenReady callback calls `createWindow()`
   // again, which used to unconditionally `new BrowserWindow(...)` and
   // overwrite the `mainWindow` pointer, leaving window A orphaned but
-  // still visible. That's the "two Machi windows on DMG launch" bug.
+  // still visible. That's the "two Near windows on DMG launch" bug.
   // Bail out early when a live main window already exists.
   if (mainWindow && !mainWindow.isDestroyed()) {
     if (mainWindow.isMinimized()) mainWindow.restore();
@@ -2226,6 +2442,8 @@ function createWindow(): void {
     mainWindow.focus();
     return;
   }
+  mainWindowReadyToShow = false;
+  mainWindowRevealPending = false;
   const vibrancyEnabled = process.env.AGX_ENABLE_VIBRANCY === "1";
   const devUrl = process.env.VITE_DEV_SERVER_URL ?? "http://localhost:5173";
   const appEntryUrl = app.isPackaged
@@ -2295,7 +2513,7 @@ function createWindow(): void {
   const mainWindowBackgroundColor = transparentMainWindow ? "#00000000" : "#14141c";
   mainWindow = new BrowserWindow({
     ...boundsOverride,
-    title: "Machi",
+    title: "Near",
     minWidth: 680,
     minHeight: 480,
     show: false,
@@ -2318,7 +2536,11 @@ function createWindow(): void {
     backgroundColor: mainWindowBackgroundColor,
     roundedCorners: true,
     webPreferences: {
-      preload: path.join(__dirname, "preload.js")
+      preload: path.join(__dirname, "preload.js"),
+      additionalArguments: [
+        `--agx-backend-scope=${encodeURIComponent(getInjectedBackendScope())}`,
+        `--agx-connection-mode=${getInjectedConnectionMode()}`,
+      ],
     }
   });
   if (savedBounds.isMaximized) {
@@ -2356,6 +2578,8 @@ function createWindow(): void {
   mainWindow.on("resize", scheduleBoundsSave);
   mainWindow.on("maximize", scheduleBoundsSave);
   mainWindow.on("unmaximize", scheduleBoundsSave);
+  updateSplashStage("loading-ui");
+
   const tryOpenExternalBrowser = (targetUrl: string): boolean => {
     if (!shouldOpenInExternalBrowser(targetUrl, appEntryUrl)) return false;
     void shell.openExternal(targetUrl);
@@ -2370,7 +2594,13 @@ function createWindow(): void {
     event.preventDefault();
   });
   mainWindow.once("ready-to-show", () => {
-    mainWindow?.show();
+    mainWindowReadyToShow = true;
+    if (mainWindowRevealPending) {
+      showMainWindowSafely();
+    }
+  });
+  mainWindow.webContents.once("did-finish-load", () => {
+    onMainWindowDidFinishLoad();
   });
   if (app.isPackaged) {
     const indexPath = path.join(__dirname, "..", "dist", "index.html");
@@ -2379,14 +2609,18 @@ function createWindow(): void {
       void mainWindow
         ?.loadURL(
           `data:text/html;charset=utf-8,${encodeURIComponent(
-            `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;font-family:SF Pro Text,PingFang SC,sans-serif;background:#14141c;color:rgba(255,255,255,.7);padding:1.5rem;box-sizing:border-box;-webkit-app-region:drag"><div style="text-align:center;max-width:36rem"><h3 style="margin:0">无法加载 Machi 界面</h3><p style="margin-top:.75rem;font-size:.85rem;opacity:.85;white-space:pre-wrap;word-break:break-all">${detail}</p><p style="margin-top:.5rem;font-size:.8rem;opacity:.6">请重新安装应用或从源码构建。</p></div></body></html>`
+            `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;font-family:SF Pro Text,PingFang SC,sans-serif;background:#14141c;color:rgba(255,255,255,.7);padding:1.5rem;box-sizing:border-box;-webkit-app-region:drag"><div style="text-align:center;max-width:36rem"><h3 style="margin:0">无法加载 Near 界面</h3><p style="margin-top:.75rem;font-size:.85rem;opacity:.85;white-space:pre-wrap;word-break:break-all">${detail}</p><p style="margin-top:.5rem;font-size:.8rem;opacity:.6">请重新安装应用或从源码构建。</p></div></body></html>`
           )}`
         )
         .then(() => {
-          mainWindow?.show();
+          void revealMainWindowAfterSplash({ fade: false });
         });
     });
   } else {
+    const swallow = (_err: unknown) => {
+      // Window may be destroyed mid-load when user picks "退出" from the
+      // startup dialog; ignore those rejections rather than crashing.
+    };
     void mainWindow.loadURL(devUrl).catch(() => {
       const distFallback = path.join(__dirname, "..", "dist", "index.html");
       if (fs.existsSync(distFallback)) {
@@ -2398,15 +2632,19 @@ function createWindow(): void {
               )}`
             )
             .then(() => {
-              mainWindow?.show();
-            });
+              void revealMainWindowAfterSplash({ fade: false });
+            })
+            .catch(swallow);
         });
       } else {
-        void mainWindow?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(
-          `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;font-family:SF Pro Text,PingFang SC,sans-serif;background:#14141c;color:rgba(255,255,255,.7);-webkit-app-region:drag"><div style="text-align:center"><h3 style="margin:0">无法连接到开发服务器</h3><p style="margin-top:.5rem;font-size:.85rem;opacity:.6">请确保已运行 <code>npm run dev</code></p></div></body></html>`
-        )}`).then(() => {
-          mainWindow?.show();
-        });
+        void mainWindow
+          ?.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(
+            `<!DOCTYPE html><html><head><meta charset="utf-8"></head><body style="margin:0;height:100vh;display:flex;align-items:center;justify-content:center;font-family:SF Pro Text,PingFang SC,sans-serif;background:#14141c;color:rgba(255,255,255,.7);-webkit-app-region:drag"><div style="text-align:center"><h3 style="margin:0">无法连接到开发服务器</h3><p style="margin-top:.5rem;font-size:.85rem;opacity:.6">请确保已运行 <code>npm run dev</code></p></div></body></html>`
+          )}`)
+          .then(() => {
+            void revealMainWindowAfterSplash({ fade: false });
+          })
+          .catch(swallow);
       }
     });
   }
@@ -2427,6 +2665,9 @@ function createTray(): void {
     return;
   }
   const icon = nativeImage.createFromPath(iconPath);
+  if (process.platform === "darwin") {
+    icon.setTemplateImage(true);
+  }
   tray = new Tray(icon);
   const menu = Menu.buildFromTemplate([
     {
@@ -2455,7 +2696,7 @@ function createTray(): void {
       mainWindow.focus();
     }
   });
-  tray.setToolTip("Machi");
+  tray.setToolTip("Near");
 }
 
 /**
@@ -2464,10 +2705,27 @@ function createTray(): void {
  * so they need to be registered as early as possible in app.whenReady().
  */
 function registerEarlyIpc(): void {
+  ipcMain.handle("open-external", async (_event, url: unknown) => {
+    const href = String(url ?? "").trim();
+    if (!/^https?:\/\//i.test(href)) {
+      return { ok: false, error: "Only http(s) URLs are allowed" };
+    }
+    await shell.openExternal(href);
+    return { ok: true };
+  });
+
   ipcMain.handle("get-api-base", async () => getStudioUrl());
   ipcMain.handle("get-api-auth-token", async () => getStudioToken());
   ipcMain.handle("get-platform", async () => process.platform);
-  ipcMain.handle("get-connection-mode", async () => remoteConfig ? "remote" : "local");
+  ipcMain.handle("get-connection-mode", async () => getInjectedConnectionMode());
+  ipcMain.handle("get-backend-scope-sync", async () => getInjectedBackendScope());
+  ipcMain.handle("get-connection-mode-sync", async () => getInjectedConnectionMode());
+  ipcMain.on("agx-query-backend-scope", (event) => {
+    event.returnValue = getInjectedBackendScope();
+  });
+  ipcMain.on("agx-query-connection-mode", (event) => {
+    event.returnValue = getInjectedConnectionMode();
+  });
   ipcMain.handle("sync-title-bar-overlay", async (_event, theme: unknown) => {
     if (process.platform !== "win32") return { ok: true, skipped: true };
     const mode: WinTitleBarTheme =
@@ -2666,14 +2924,37 @@ function registerEarlyIpc(): void {
       saveAgxConfig(cfg);
     }
     const acct = cfg.agx_account;
+    // Provider/active model fields: in remote mode, read from the connected
+    // backend so the UI reflects the actually-used config (the local file is
+    // not what the remote model loader sees). Other fields — userMode,
+    // onboarding, agxAccount — remain Desktop-local concerns.
+    let defaultProvider = cfg.default_provider ?? "";
+    let providers: Record<string, ProviderConfig> = cfg.providers ?? {};
+    let activeProvider = cfg.active_provider ?? "";
+    let activeModel = cfg.active_model ?? "";
+    if (isRemoteMode()) {
+      try {
+        await waitForStudio();
+      } catch {
+        // best-effort
+      }
+      const r = await studioFetchJson("/api/config/providers");
+      if (r.ok && r.data && r.data.ok !== false) {
+        defaultProvider = String(r.data.defaultProvider ?? "");
+        const p = r.data.providers;
+        providers = p && typeof p === "object" ? (p as Record<string, ProviderConfig>) : {};
+        activeProvider = String(r.data.activeProvider ?? "");
+        activeModel = String(r.data.activeModel ?? "");
+      }
+    }
     return {
-      defaultProvider: cfg.default_provider ?? "",
-      providers: cfg.providers ?? {},
+      defaultProvider,
+      providers,
       userMode: cfg.user_mode ?? "pro",
       onboardingCompleted: true,
       confirmStrategy: cfg.confirm_strategy ?? "semi-auto",
-      activeProvider: cfg.active_provider ?? "",
-      activeModel: cfg.active_model ?? "",
+      activeProvider,
+      activeModel,
       agxAccount: {
         loggedIn: Boolean(acct?.access_token),
         email: acct?.user_email ?? "",
@@ -2717,6 +2998,35 @@ function registerEarlyIpc(): void {
       return { ok: false, error: String(err) };
     }
   });
+
+  ipcMain.handle(
+    "system-search",
+    async (_event, payload: { query?: string; category?: SystemSearchCategory }) => {
+      const query = String(payload?.query ?? "");
+      const category = (payload?.category ?? "all") as SystemSearchCategory;
+      return runSystemSearch(query, category);
+    }
+  );
+
+  ipcMain.handle("system-search:preview", async (_event, filePath: unknown) => {
+    return previewSystemSearchFile(String(filePath ?? ""));
+  });
+
+  ipcMain.handle("system-search:open", async (_event, filePath: unknown) => {
+    return openSystemSearchPath(String(filePath ?? ""));
+  });
+
+  ipcMain.handle("system-search:reveal", async (_event, filePath: unknown) => {
+    return revealSystemSearchPath(String(filePath ?? ""));
+  });
+
+  ipcMain.handle("system-search:get-info", async (_event, filePath: unknown) => {
+    return getSystemSearchInfo(String(filePath ?? ""));
+  });
+
+  ipcMain.handle("system-search:open-with", async (_event, filePath: unknown) => {
+    return openSystemSearchWith(String(filePath ?? ""));
+  });
 }
 
 function registerIpc(): void {
@@ -2739,13 +3049,25 @@ function registerIpc(): void {
     token: string;
   }) => {
     const cfg = loadAgxConfig();
+    const prev = cfg.remote_server ?? {};
+    const prevEnabled = Boolean(prev.enabled);
+    const prevUrl = String(prev.url ?? "").trim().replace(/\/+$/, "");
+    const nextEnabled = Boolean(payload.enabled);
+    const nextUrl = String(payload.url || "").trim().replace(/\/+$/, "");
+    const modeChanged = prevEnabled !== nextEnabled || (nextEnabled && prevUrl !== nextUrl);
     cfg.remote_server = {
-      enabled: payload.enabled,
-      url: (payload.url || "").trim().replace(/\/+$/, ""),
+      enabled: nextEnabled,
+      url: nextUrl,
       token: (payload.token || "").trim(),
     };
     saveAgxConfig(cfg);
-    return { ok: true, restart_required: true };
+    return { ok: true, restart_required: true, mode_changed: modeChanged };
+  });
+
+  ipcMain.handle("app-relaunch", async () => {
+    app.relaunch();
+    app.exit(0);
+    return { ok: true };
   });
 
   ipcMain.handle("test-remote-server", async (_event, payload: {
@@ -3039,21 +3361,58 @@ function registerIpc(): void {
     return { ok: true };
   });
 
-  ipcMain.handle("list-avatars", async () => {
-    try {
-      // Wait for studio cold start before fetching, otherwise the renderer
-      // would receive `{ ok: false, avatars: [] }` and silently render
-      // "暂无分身" until something else triggers a refresh (issue #11).
-      await waitForStudio();
-      const resp = await fetch(`${getStudioUrl()}/api/avatars`, {
-        headers: { "x-agx-desktop-token": getStudioToken() },
-      });
-      if (!resp.ok) return { ok: false, avatars: [] };
-      return await resp.json();
-    } catch {
-      return { ok: false, avatars: [] };
+  ipcMain.handle("list-avatars", async () => fetchListAvatarsCore());
+
+  ipcMain.handle(
+    "preload-core-data",
+    async (
+      _event,
+      payload: { avatarId?: string; sessionId?: string }
+    ): Promise<{
+      ok: boolean;
+      avatars: { ok: boolean; avatars: unknown[] };
+      sessions: { ok: boolean; sessions: unknown[] };
+      taskspaces: { ok: boolean; workspaces: unknown[]; error?: string };
+      messages: { ok: boolean; messages: unknown[]; error?: string };
+    }> => {
+      const avatarId = String(payload?.avatarId ?? "").trim() || undefined;
+      const sessionId = String(payload?.sessionId ?? "").trim() || undefined;
+
+      const studioOk = await waitForStudio(PRELOAD_READY_BUDGET_MS);
+      if (!studioOk) {
+        return {
+          ok: false,
+          avatars: { ok: false, avatars: [] },
+          sessions: { ok: false, sessions: [] },
+          taskspaces: { ok: false, workspaces: [], error: "studio_not_ready" },
+          messages: { ok: false, messages: [], error: "studio_not_ready" },
+        };
+      }
+
+      const [avatars, sessions, taskspaces, messages] = await Promise.all([
+        withFetchTimeout(fetchListAvatarsOnce(), { ok: false, avatars: [] }),
+        withFetchTimeout(fetchListSessionsOnce(avatarId), { ok: false, sessions: [] }),
+        sessionId
+          ? withFetchTimeout(fetchListTaskspacesCore(sessionId), {
+              ok: false,
+              workspaces: [],
+              error: "timeout",
+            })
+          : Promise.resolve({ ok: false, workspaces: [] as unknown[], error: "skipped" }),
+        sessionId
+          ? withFetchTimeout(fetchSessionMessagesCore(sessionId), {
+              ok: false,
+              messages: [],
+              error: "timeout",
+            })
+          : Promise.resolve({ ok: false, messages: [] as unknown[], error: "skipped" }),
+      ]);
+
+      const anyOk =
+        avatars.ok || sessions.ok || taskspaces.ok || messages.ok;
+      return { ok: anyOk, avatars, sessions, taskspaces, messages };
     }
-  });
+  );
 
   ipcMain.handle("create-avatar", async (_event, payload: {
     name: string;
@@ -3641,21 +4000,28 @@ function registerIpc(): void {
   ipcMain.handle("load-session-messages", async (_event, sessionId: string) => {
     const sid = String(sessionId || "").trim();
     if (!sid) return { ok: false, messages: [], error: "sessionId is required" };
-    try {
-      const resp = await fetch(
-        `${getStudioUrl()}/api/session/messages?session_id=${encodeURIComponent(sid)}`,
-        {
-          headers: { "x-agx-desktop-token": getStudioToken() },
+    await waitForStudio(PRELOAD_READY_BUDGET_MS);
+    return withFetchTimeout(
+      (async () => {
+        try {
+          const resp = await fetch(
+            `${getStudioUrl()}/api/session/messages?session_id=${encodeURIComponent(sid)}`,
+            {
+              headers: { "x-agx-desktop-token": getStudioToken() },
+            }
+          );
+          if (!resp.ok) {
+            const body = await resp.text().catch(() => "");
+            return { ok: false, messages: [], error: `HTTP ${resp.status}: ${body.slice(0, 300)}` };
+          }
+          return await resp.json();
+        } catch (err) {
+          return { ok: false, messages: [], error: String(err) };
         }
-      );
-      if (!resp.ok) {
-        const body = await resp.text().catch(() => "");
-        return { ok: false, messages: [], error: `HTTP ${resp.status}: ${body.slice(0, 300)}` };
-      }
-      return await resp.json();
-    } catch (err) {
-      return { ok: false, messages: [], error: String(err) };
-    }
+      })(),
+      { ok: false, messages: [], error: "timeout" },
+      SESSION_MESSAGES_FETCH_TIMEOUT_MS
+    );
   });
 
   ipcMain.handle("fork-avatar", async (_event, payload: { sessionId: string; name: string; role?: string }) => {
@@ -3905,6 +4271,23 @@ function registerIpc(): void {
     };
   };
 
+  const readTokenBudgetRuntime = (raw: Record<string, unknown>) => {
+    const nested =
+      raw.token_budget && typeof raw.token_budget === "object" && !Array.isArray(raw.token_budget)
+        ? (raw.token_budget as Record<string, unknown>)
+        : {};
+    const sessionRaw = Number(nested.max_tokens_per_session ?? raw.max_tokens_per_session ?? 500_000);
+    const turnRaw = Number(nested.max_tokens_per_turn ?? raw.max_tokens_per_turn ?? 100_000);
+    return {
+      max_tokens_per_session: Number.isFinite(sessionRaw)
+        ? Math.max(100_000, Math.min(5_000_000, Math.round(sessionRaw)))
+        : 500_000,
+      max_tokens_per_turn: Number.isFinite(turnRaw)
+        ? Math.max(50_000, Math.min(1_000_000, Math.round(turnRaw)))
+        : 100_000,
+    };
+  };
+
   ipcMain.handle("load-runtime-config", async () => {
     try {
       const cfg = loadAgxConfig();
@@ -3920,6 +4303,8 @@ function registerIpc(): void {
         max_auto_resumes: Math.max(0, Math.min(10, Number(raw.max_auto_resumes ?? 3))),
         ...readStallNudgeRuntime(raw),
         ...readUnattendedRuntime(raw),
+        ...readTokenBudgetRuntime(raw),
+        live_reattach_enabled: Boolean(raw.live_reattach_enabled ?? false),
       };
     } catch (err) {
       return {
@@ -3938,6 +4323,9 @@ function registerIpc(): void {
         unattended_stall_continue_after_seconds: 120,
         unattended_auto_resume_exhausted: true,
         unattended_auto_resume_interrupted: true,
+        max_tokens_per_session: 500_000,
+        max_tokens_per_turn: 100_000,
+        live_reattach_enabled: false,
       };
     }
   });
@@ -4027,6 +4415,24 @@ function registerIpc(): void {
       }
       if (Object.keys(unattendedMerged).length > 0) {
         merged.unattended = unattendedMerged;
+      }
+      const tokenBudgetPrev =
+        merged.token_budget && typeof merged.token_budget === "object" && !Array.isArray(merged.token_budget)
+          ? { ...(merged.token_budget as Record<string, unknown>) }
+          : {};
+      const tokenBudgetMerged: Record<string, unknown> = { ...tokenBudgetPrev };
+      if (p.max_tokens_per_session !== undefined) {
+        const v = Number(p.max_tokens_per_session);
+        if (!Number.isFinite(v)) return { ok: false, error: "max_tokens_per_session must be a number" };
+        tokenBudgetMerged.max_tokens_per_session = Math.max(100_000, Math.min(5_000_000, Math.round(v)));
+      }
+      if (p.max_tokens_per_turn !== undefined) {
+        const v = Number(p.max_tokens_per_turn);
+        if (!Number.isFinite(v)) return { ok: false, error: "max_tokens_per_turn must be a number" };
+        tokenBudgetMerged.max_tokens_per_turn = Math.max(50_000, Math.min(1_000_000, Math.round(v)));
+      }
+      if (Object.keys(tokenBudgetMerged).length > 0) {
+        merged.token_budget = tokenBudgetMerged;
       }
       root.runtime = merged;
       saveAgxConfig(cfg);
@@ -4739,6 +5145,70 @@ function registerIpc(): void {
     }
   });
 
+  ipcMain.handle("get-guard-settings", async () => {
+    try {
+      const resp = await fetch(`${getStudioUrl()}/api/skills/guard-settings`, {
+        headers: { "x-agx-desktop-token": getStudioToken() },
+      });
+      if (!resp.ok) {
+        const body = await resp.text().catch(() => "");
+        return { ok: false, error: `HTTP ${resp.status}: ${body.slice(0, 300)}` };
+      }
+      return await resp.json();
+    } catch (err) {
+      return { ok: false, error: String(err) };
+    }
+  });
+
+  ipcMain.handle(
+    "put-guard-settings",
+    async (_event, payload: { version?: number; scan_mode?: string; llm_verify?: boolean }) => {
+      try {
+        const resp = await fetch(`${getStudioUrl()}/api/skills/guard-settings`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            "x-agx-desktop-token": getStudioToken(),
+          },
+          body: JSON.stringify(payload ?? {}),
+        });
+        if (!resp.ok) {
+          const body = await resp.text().catch(() => "");
+          return { ok: false, error: `HTTP ${resp.status}: ${body.slice(0, 300)}` };
+        }
+        return await resp.json();
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    },
+  );
+
+  ipcMain.handle(
+    "guard-scan-skill",
+    async (
+      _event,
+      payload: { skill_path?: string; markdown?: string; skill_name?: string; mode?: string },
+    ) => {
+      try {
+        const resp = await fetch(`${getStudioUrl()}/api/skills/guard-scan`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-agx-desktop-token": getStudioToken(),
+          },
+          body: JSON.stringify({ ...payload, html_report: false }),
+        });
+        if (!resp.ok) {
+          const body = await resp.text().catch(() => "");
+          return { ok: false, error: `HTTP ${resp.status}: ${body.slice(0, 300)}` };
+        }
+        return await resp.json();
+      } catch (err) {
+        return { ok: false, error: String(err) };
+      }
+    },
+  );
+
   ipcMain.handle(
     "put-skill-settings",
     async (
@@ -4835,6 +5305,13 @@ function registerIpc(): void {
     displayName?: string;
     interface?: "openai";
   }) => {
+    if (isRemoteMode()) {
+      const r = await studioFetchJson(
+        `/api/config/providers/${encodeURIComponent(payload.name)}`,
+        { method: "PUT", body: payload },
+      );
+      return r.ok ? { ok: true } : { ok: false, error: r.error || "remote save-provider failed" };
+    }
     const cfg = loadAgxConfig();
     if (!cfg.providers) cfg.providers = {};
     const prev = cfg.providers[payload.name] ?? {};
@@ -4869,6 +5346,13 @@ function registerIpc(): void {
   });
 
   ipcMain.handle("set-default-provider", async (_event, name: string) => {
+    if (isRemoteMode()) {
+      const r = await studioFetchJson("/api/config/default-provider", {
+        method: "PUT",
+        body: { name },
+      });
+      return r.ok ? { ok: true } : { ok: false, error: r.error || "remote set-default failed" };
+    }
     const cfg = loadAgxConfig();
     cfg.default_provider = name;
     saveAgxConfig(cfg);
@@ -4876,6 +5360,13 @@ function registerIpc(): void {
   });
 
   ipcMain.handle("delete-provider", async (_event, name: string) => {
+    if (isRemoteMode()) {
+      const r = await studioFetchJson(
+        `/api/config/providers/${encodeURIComponent(name)}`,
+        { method: "DELETE" },
+      );
+      return r.ok ? { ok: true } : { ok: false, error: r.error || "remote delete-provider failed" };
+    }
     const cfg = loadAgxConfig();
     if (cfg.providers) delete cfg.providers[name];
     if (cfg.default_provider === name) cfg.default_provider = Object.keys(cfg.providers ?? {})[0] ?? "";
@@ -4896,7 +5387,7 @@ function registerIpc(): void {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 10000);
       const resp = isMinimax
-        ? await fetch(url, {
+        ? await proxyAwareFetch(url, {
             method: "POST",
             headers: {
               Authorization: `Bearer ${payload.apiKey}`,
@@ -4909,7 +5400,7 @@ function registerIpc(): void {
             }),
             signal: controller.signal,
           })
-        : await fetch(url, {
+        : await proxyAwareFetch(url, {
             headers: { Authorization: `Bearer ${payload.apiKey}` },
             signal: controller.signal,
           });
@@ -4933,7 +5424,7 @@ function registerIpc(): void {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
-      const resp = await fetch(url, {
+      const resp = await proxyAwareFetch(url, {
         headers: { Authorization: `Bearer ${payload.apiKey}` },
         signal: controller.signal,
       });
@@ -4966,7 +5457,7 @@ function registerIpc(): void {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 15000);
       const t0 = performance.now();
-      const resp = await fetch(url, {
+      const resp = await proxyAwareFetch(url, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${payload.apiKey}`,
@@ -4991,6 +5482,29 @@ function registerIpc(): void {
 
   // Legacy compatibility
   ipcMain.handle("save-config", async (_event, payload: { provider?: string; model?: string; apiKey?: string; activeProvider?: string; activeModel?: string }) => {
+    if (isRemoteMode()) {
+      const name = (payload.provider || "").trim();
+      if (name && (payload.apiKey || payload.model)) {
+        await studioFetchJson(`/api/config/providers/${encodeURIComponent(name)}`, {
+          method: "PUT",
+          body: {
+            apiKey: payload.apiKey,
+            model: payload.model,
+          },
+        });
+        await studioFetchJson("/api/config/default-provider", {
+          method: "PUT",
+          body: { name },
+        });
+      }
+      if (payload.activeProvider || payload.activeModel) {
+        await studioFetchJson("/api/config/active-model", {
+          method: "PUT",
+          body: { provider: payload.activeProvider, model: payload.activeModel },
+        });
+      }
+      return { ok: true, path: "remote" };
+    }
     const cfg = loadAgxConfig();
     const name = payload.provider || cfg.default_provider || "openai";
     if (!cfg.providers) cfg.providers = {};
@@ -5486,10 +6000,11 @@ if (!gotTheLock) {
     }
   });
 
-  app.setName("Machi");
+  app.setName("Near");
 
   app.whenReady().then(async () => {
     try {
+      logProxyConfig();
       if (process.platform === "win32" || process.platform === "linux") {
         Menu.setApplicationMenu(null);
       } else {
@@ -5503,6 +6018,16 @@ if (!gotTheLock) {
           app.dock.setIcon(iconPath);
         }
       }
+
+      configureSplashLayoutThemeReader(() => {
+        const theme = loadLayoutData().theme;
+        return theme === "light" ? "light" : "dark";
+      });
+      registerSplashIpcHandlers({
+        showMainWindow: showMainWindowSafely,
+        quitApp: () => app.quit(),
+      });
+      createSplashWindow();
 
       // Register basic IPC handlers immediately so the renderer never hits
       // "No handler registered" errors during the agx serve startup delay.
@@ -5535,39 +6060,7 @@ if (!gotTheLock) {
       // only created inside startStudioServe / waitServeReady.
       registerIpc();
 
-      if (remoteConfig) {
-        const ok = await pingRemoteServer(remoteConfig);
-        if (ok) {
-          markStudioReady();
-        } else {
-          const { response } = await dialog.showMessageBox({
-            type: "warning",
-            title: "无法连接远程服务器",
-            message: `无法连接到 ${remoteConfig.url}`,
-            detail: [
-              "请检查：",
-              "1. 云主机上 agx serve 是否已启动",
-              "2. URL 和端口是否正确",
-              "3. 防火墙是否放行",
-              "4. Token 是否匹配",
-            ].join("\n"),
-            buttons: ["重试", "退出"],
-            defaultId: 0,
-            cancelId: 1,
-          });
-          if (response === 0) {
-            const retryOk = await pingRemoteServer(remoteConfig);
-            if (!retryOk) {
-              app.quit();
-              return;
-            }
-            markStudioReady();
-          } else {
-            app.quit();
-            return;
-          }
-        }
-      } else {
+      const startLocalBackendFlow = async (): Promise<boolean> => {
         const bundledPath = resolveBundledBackend();
         if (!bundledPath) {
           const agxOk = await checkAgxCli();
@@ -5576,10 +6069,11 @@ if (!gotTheLock) {
             const ctxHint = app.isPackaged
               ? "当前为发布版安装包但未内嵌后端，且未检测到 agx 命令。可选："
               : "当前为开发构建，且未检测到 agx 命令。可选：";
+            await closeSplash({ fade: false });
             const { response } = await dialog.showMessageBox({
               type: "warning",
               title: "缺少 agx 命令行工具",
-              message: "Machi 需要本地 agx CLI 或内嵌后端才能启动",
+              message: "Near 需要本地 agx CLI 或内嵌后端才能启动",
               detail: [
                 ctxHint,
                 "",
@@ -5599,15 +6093,79 @@ if (!gotTheLock) {
               void shell.openExternal(installDocsUrl);
             }
             app.quit();
-            return;
+            return false;
           }
         }
 
+        updateSplashStage("backend-starting");
         await startStudioServe();
+        updateSplashStage("backend-waiting");
         await waitServeReady();
         markStudioReady();
         startFeishuProcess();
         void startWechatSidecar();
+        return true;
+      };
+
+      // Persist `remote_server.enabled = false` so subsequent launches stay
+      // on local mode after the user falls back from an unreachable remote.
+      const disableRemoteInConfig = (): void => {
+        try {
+          const cfg = loadAgxConfig();
+          if (cfg.remote_server) {
+            cfg.remote_server = { ...cfg.remote_server, enabled: false };
+            saveAgxConfig(cfg);
+          }
+        } catch (err) {
+          console.warn("[main] failed to disable remote_server in config:", err);
+        }
+      };
+
+      if (remoteConfig) {
+        updateSplashStage("pinging-remote");
+        let connected = await pingRemoteServer(remoteConfig);
+        while (!connected) {
+          await closeSplash({ fade: false });
+          const { response } = await dialog.showMessageBox({
+            type: "warning",
+            title: "无法连接远程服务器",
+            message: `无法连接到 ${remoteConfig.url}`,
+            detail: [
+              "你之前配置了远程后端（公司/云服务器），现在似乎不可达。",
+              "",
+              "请检查：",
+              "1. 云主机上 agx serve 是否已启动",
+              "2. URL 和端口是否正确（是否需要在内网/VPN 环境）",
+              "3. 防火墙是否放行",
+              "4. Token 是否匹配",
+              "",
+              "或者切换回本地模式：使用本机内嵌/本地安装的 agx serve 启动。",
+            ].join("\n"),
+            buttons: ["重试", "切换到本地模式", "退出"],
+            defaultId: 0,
+            cancelId: 2,
+          });
+          if (response === 0) {
+            connected = await pingRemoteServer(remoteConfig);
+            continue;
+          }
+          if (response === 1) {
+            disableRemoteInConfig();
+            remoteConfig = null;
+            notifyRendererConnectionModeChanged();
+            const ok = await startLocalBackendFlow();
+            if (!ok) return;
+            break;
+          }
+          app.quit();
+          return;
+        }
+        if (remoteConfig && connected) {
+          markStudioReady();
+        }
+      } else {
+        const ok = await startLocalBackendFlow();
+        if (!ok) return;
       }
 
       // registerIpc() was moved above the backend-await block so the
@@ -5624,8 +6182,9 @@ if (!gotTheLock) {
       startSkillsDirWatcher();
       createTray();
     } catch (error) {
+      await closeSplash({ fade: false });
       await dialog.showErrorBox(
-        "Machi 启动失败",
+        "Near 启动失败",
         remoteConfig
           ? `无法连接远程服务器。\n\n${String(error)}`
           : `无法启动本地服务，请检查 agx 是否可用。\n\n${String(error)}`
@@ -5635,6 +6194,9 @@ if (!gotTheLock) {
   });
 
   app.on("activate", () => {
+    // Avoid creating the window before backend mode is resolved — otherwise
+    // preload argv bakes in stale remote scope until a full reload.
+    if (!studioReady) return;
     if (!mainWindow) {
       createWindow();
       return;

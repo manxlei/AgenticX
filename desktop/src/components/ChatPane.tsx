@@ -9,7 +9,6 @@ import {
   Database,
   GitBranch,
   GripVertical,
-  Layers,
   LayoutList,
   Quote,
   Search,
@@ -17,7 +16,6 @@ import {
   Sparkles,
   Radar,
   SquarePen,
-  Wand2,
   Wrench,
   Users,
   FolderOpen,
@@ -37,7 +35,14 @@ import {
   type PendingConfirm,
   type QueuedMessage,
 } from "../store";
-import { startRecording, stopRecording } from "../voice/stt";
+import {
+  appendDictationText,
+  cancelDictation,
+  startDictation,
+  type SttPhase,
+} from "../voice/stt";
+import { useVoicePushToTalk } from "../hooks/useVoicePushToTalk";
+import { VoicePttOverlay } from "./VoicePttOverlay";
 import { SessionHistoryPanel } from "./SessionHistoryPanel";
 import { StickyTaskBar } from "./StickyTaskBar";
 import { WorkspacePanel } from "./WorkspacePanel";
@@ -48,6 +53,7 @@ import { expandMessagesToTopLevelRows } from "./messages/react-blocks";
 import { TurnToolGroupCard } from "./messages/TurnToolGroupCard";
 import { WorkingIndicator } from "./messages/WorkingIndicator";
 import { ChatImAvatar, ImBubble } from "./messages/ImBubble";
+import { MessageTimestamp } from "./messages/MessageTimestamp";
 import { getAssistantActionStyle } from "./messages/im-layout";
 import { TerminalLine } from "./messages/TerminalLine";
 import { ProviderIcon } from "./ProviderIcon";
@@ -56,6 +62,7 @@ import { MessageQueuePanel } from "./messages/MessageQueuePanel";
 import { StallRecoveryCard } from "./messages/StallRecoveryCard";
 import { ForwardPicker, type ForwardConfirmPayload } from "./ForwardPicker";
 import { HoverTip } from "./ds/HoverTip";
+import { SkillPuzzleIcon, skillPuzzleIconInnerHtml } from "./icons/SkillPuzzleIcon";
 import { Toast } from "./ds/Toast";
 import { extractClipboardImageFiles, withClipboardImageNames } from "../utils/clipboard-images";
 import { clipboardPlainTextForPaste } from "../utils/clipboard-plain-text";
@@ -78,12 +85,19 @@ import {
   shouldTriggerIncompleteEndStall,
 } from "../utils/task-stall-policy";
 import {
+  budgetExceededInfoFromPayload,
+  findBudgetExceededInMessages,
+  type BudgetExceededInfo,
+} from "../utils/budget-exceeded";
+import { buildBudgetResumeDraft } from "../utils/budget-resume-draft";
+import {
   continueSessionUrl,
   inferContinueReason,
   type ContinueReason,
   type ContinueSource,
 } from "../utils/session-continue";
 import { mergeSessionMessagesTail } from "../utils/session-message-merge";
+import { reattachSessionStreamUrl, parseSseFrame } from "../utils/session-reattach";
 import {
   attachmentsFromSessionRow,
   mapLoadedSessionMessage,
@@ -93,7 +107,8 @@ import { filterPersistedMessagesForDeletion } from "../utils/retry-trim-policy";
 import { favoriteStorageMessageId } from "../utils/favorite-selection";
 import { createResizeRafScheduler } from "../utils/resize-raf";
 import { avatarTintBg } from "../utils/avatar-color";
-import { getProviderDisplayName } from "../utils/provider-display";
+import { formatModelOptionLabel } from "../utils/model-display";
+import { collectSelectableModelOptions, coerceSelectableModel, isModelSelectable } from "../utils/model-options";
 import { isAutomationPaneAvatarId } from "../utils/automation-pane";
 import {
   ccBridgeSendToolProgressLabel,
@@ -107,7 +122,9 @@ import { buildCompactionNoticeText } from "../utils/context-notice";
 import { usePaneSortableHandle } from "./pane-sortable-context";
 import { FeishuBadge } from "./FeishuBadge";
 import machiEmptyState from "../assets/machi-logo-transparent.png";
+import { APP_DISPLAY_NAME, APP_TAGLINE, META_AGENT_DISPLAY_NAME } from "../constants/branding";
 import { DEFAULT_META_AVATAR_URL } from "../constants/meta-avatar";
+import { isMetaLeaderIdentity, resolveMetaDisplayName } from "../utils/display-name";
 import { createKbApi } from "./settings/knowledge/api";
 import {
   clearPaneAwaitingFreshSession,
@@ -121,6 +138,24 @@ import {
   type PaneSessionMode,
 } from "../utils/pane-fresh-session";
 import { getRememberedSessionForAvatar } from "../utils/avatar-last-session";
+import { readScopedLocalStorage, writeScopedLocalStorage } from "../utils/backend-scope";
+import {
+  GLOBAL_SEARCH_REFERENCE_FILE,
+  GLOBAL_SEARCH_WORKSPACE_ADDED,
+  type GlobalSearchReferenceFileDetail,
+} from "./global-search/global-search-events";
+import { buildFileMentionAppend, fileNameFromPath } from "../utils/chat-file-mention";
+import {
+  accumulateReferenceTurn,
+  applyFinalReferencePayload,
+  referenceExtrasFromTurn,
+} from "../utils/search-reference-sse";
+import { mergeSearchedQueries } from "../types/search-references";
+import type { SearchReference } from "../types/search-references";
+
+const SEARCH_REFERENCE_TOOLS = new Set(["web_search", "knowledge_search"]);
+
+const SESSION_UNATTENDED_STORAGE_KEY = "agx-session-unattended-v1";
 
 /** Shown in the user bubble and sent as user_input when sending attachments without typed text (API min_length=1). */
 const ATTACHMENT_ONLY_USER_PROMPT = "（见附件，请结合附件回答。）";
@@ -142,7 +177,45 @@ function resolveForwardSender(message: Message, userLabel = "我"): string {
   if (message.role !== "assistant") return userLabel.trim() || "我";
   const raw = String(message.avatarName || message.agentId || "AI").trim();
   if (!raw) return "AI";
-  return raw.toLowerCase() === "meta" ? "Machi" : raw;
+  return resolveMetaDisplayName(raw.toLowerCase() === "meta" ? null : raw);
+}
+
+function resolveGroupChatSender(
+  message: Pick<Message, "role" | "avatarName" | "avatarUrl" | "agentId">,
+  opts: {
+    groupMembers: Avatar[];
+    metaAvatarUrl: string;
+    userLabel: string;
+    userAvatarUrl: string;
+  }
+): { name: string; url?: string; avatarId?: string } {
+  if (message.role === "user") {
+    return {
+      name: opts.userLabel.trim() || "用户",
+      url: opts.userAvatarUrl.trim() || undefined,
+    };
+  }
+  const agentId = String(message.agentId ?? "").trim();
+  const rawName = String(message.avatarName ?? "").trim();
+  if (isMetaLeaderIdentity(agentId, rawName)) {
+    return {
+      name: resolveMetaDisplayName(null),
+      url: opts.metaAvatarUrl.trim() || DEFAULT_META_AVATAR_URL,
+      avatarId: "meta",
+    };
+  }
+  const url = String(message.avatarUrl ?? "").trim() || undefined;
+  const member = agentId ? opts.groupMembers.find((a) => a.id === agentId) : undefined;
+  if (member) {
+    return {
+      name: member.name || rawName || agentId,
+      url: url || member.avatarUrl || undefined,
+      avatarId: member.id,
+    };
+  }
+  const name =
+    rawName && rawName !== "分身" ? rawName : agentId || resolveMetaDisplayName(null);
+  return { name, url, avatarId: agentId || undefined };
 }
 
 function shellSingleQuote(input: string): string {
@@ -189,7 +262,7 @@ function openWorkspaceSidebarForPane(
 const FALLBACK_PANE: ChatPaneState = {
   id: "fallback-pane",
   avatarId: null,
-  avatarName: "Machi",
+  avatarName: META_AGENT_DISPLAY_NAME,
   sessionId: "",
   modelProvider: "",
   modelName: "",
@@ -492,7 +565,7 @@ function SkillPickerButton({ apiBase, apiToken, onSelect }: SkillPickerButtonPro
                     }}
                   >
                     <span className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-md bg-[rgba(var(--theme-color-rgb,59,130,246),0.22)] text-[rgb(var(--theme-color-rgb,59,130,246))]">
-                      <Wand2 className="h-3 w-3" aria-hidden />
+                      <SkillPuzzleIcon className="h-3 w-3" />
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="truncate text-[12px] font-medium leading-tight text-text-strong">
@@ -523,7 +596,7 @@ function SkillPickerButton({ apiBase, apiToken, onSelect }: SkillPickerButtonPro
           aria-label="引用技能"
           onClick={open ? handleClose : handleOpen}
         >
-          <Layers className="h-[15px] w-[15px]" strokeWidth={2} aria-hidden />
+          <SkillPuzzleIcon className="h-[15px] w-[15px]" />
         </button>
       </HoverTip>
       {dropdown}
@@ -640,29 +713,21 @@ function PaneModelPicker({ paneId }: { paneId: string }) {
     }
   };
 
-  const options = useMemo(() => {
-    const result: { provider: string; model: string; label: string }[] = [];
-    for (const [provName, entry] of Object.entries(settings.providers)) {
-      if (entry.enabled === false) continue;
-      if (!entry.apiKey) continue;
-      const provLabel = getProviderDisplayName(provName, entry);
-      if (entry.models.length > 0) {
-        for (const m of entry.models) result.push({ provider: provName, model: m, label: `${provLabel}/${m}` });
-      } else if (entry.model) {
-        result.push({ provider: provName, model: entry.model, label: `${provLabel}/${entry.model}` });
-      }
-    }
-    return result;
-  }, [settings.providers]);
+  const options = useMemo(
+    () => collectSelectableModelOptions(settings.providers),
+    [settings.providers],
+  );
 
   const currentProvider = (paneModel?.modelProvider || "").trim();
   const currentModel = (paneModel?.modelName || "").trim();
   const currentLabel = useMemo(() => {
     if (!currentModel) return "未选模型";
     if (!currentProvider) return currentModel;
+    if (!isModelSelectable(currentProvider, currentModel, settings.providers)) {
+      return "未选模型";
+    }
     const entry = settings.providers[currentProvider];
-    const provLabel = getProviderDisplayName(currentProvider, entry);
-    return `${provLabel}/${currentModel}`;
+    return formatModelOptionLabel(currentProvider, currentModel, entry);
   }, [currentModel, currentProvider, settings.providers]);
 
   const syncPanelPosition = useCallback(() => {
@@ -904,12 +969,21 @@ type ActionCircleButtonProps = {
   hasInput: boolean;
   streaming: boolean;
   recording: boolean;
+  transcribing?: boolean;
   onSend: () => void;
   onMic: () => void;
   onStop: () => void;
 };
 
-function ActionCircleButton({ hasInput, streaming, recording, onSend, onMic, onStop }: ActionCircleButtonProps) {
+function ActionCircleButton({
+  hasInput,
+  streaming,
+  recording,
+  transcribing = false,
+  onSend,
+  onMic,
+  onStop,
+}: ActionCircleButtonProps) {
   let onClick: () => void;
   let title: string;
   let icon: ReactNode;
@@ -930,6 +1004,13 @@ function ActionCircleButton({ hasInput, streaming, recording, onSend, onMic, onS
     title = "发送";
     icon = <SendIcon />;
     filled = true;
+  } else if (transcribing) {
+    onClick = onMic;
+    title = "识别中";
+    icon = (
+      <span className="inline-block h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-t-transparent" />
+    );
+    filled = false;
   } else if (recording) {
     onClick = onMic;
     title = "停止录音";
@@ -1049,8 +1130,7 @@ function ModelBadge({ provider, model }: { provider?: string; model?: string }) 
   const providers = useAppStore((s) => s.settings.providers);
   if (!model) return null;
   const entry = provider ? providers[provider] : undefined;
-  const provLabel = provider ? getProviderDisplayName(provider, entry) : "";
-  const label = provLabel ? `${provLabel}/${model}` : model;
+  const label = provider ? formatModelOptionLabel(provider, model, entry) : model;
   return (
     <span className="mb-1 inline-block rounded bg-surface-card-strong px-1.5 py-0.5 text-[10px] text-text-faint">
       {label}
@@ -1077,6 +1157,9 @@ function formatToolResultMessage(toolNameRaw: unknown, resultRaw: unknown): { co
   const toolName = String(toolNameRaw ?? "tool");
   const resultText = String(resultRaw ?? "");
   if (toolName === "check_resources") {
+    return { content: "", silent: true };
+  }
+  if (SEARCH_REFERENCE_TOOLS.has(toolName)) {
     return { content: "", silent: true };
   }
   if (toolName === "delegate_to_avatar") {
@@ -1869,8 +1952,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const panes = useAppStore((s) => s.panes);
   const metaLeaderDisplayName = useMemo(() => {
     const mp = panes.find((p) => p.avatarId === null);
-    const t = (mp?.avatarName ?? "").trim();
-    return t && t !== "分身" ? t : "Machi";
+    return resolveMetaDisplayName(mp?.avatarName);
   }, [panes]);
   const removePane = useAppStore((s) => s.removePane);
   const closePaneAndCleanupEmptySession = () => {
@@ -1924,13 +2006,30 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const storeActiveModel = useAppStore((s) => s.activeModel);
   const settings = useAppStore((s) => s.settings);
   const setPaneModel = useAppStore((s) => s.setPaneModel);
+  const reconcilePaneModels = useAppStore((s) => s.reconcilePaneModels);
   const setForwardAutoReply = useAppStore((s) => s.setForwardAutoReply);
   const { chatProvider, chatModel } = useMemo(() => {
     const pp = (pane?.modelProvider ?? "").trim();
     const pm = (pane?.modelName ?? "").trim();
-    if (pp && pm) return { chatProvider: pp, chatModel: pm };
-    return { chatProvider: storeActiveProvider, chatModel: storeActiveModel };
-  }, [pane?.modelProvider, pane?.modelName, storeActiveProvider, storeActiveModel]);
+    const rawProvider = pp || storeActiveProvider;
+    const rawModel = pm || storeActiveModel;
+    const coerced = coerceSelectableModel(
+      settings.providers,
+      rawProvider,
+      rawModel,
+      rawProvider,
+    );
+    if (!coerced) return { chatProvider: "", chatModel: "" };
+    return { chatProvider: coerced.provider, chatModel: coerced.model };
+  }, [pane?.modelProvider, pane?.modelName, storeActiveProvider, storeActiveModel, settings.providers]);
+
+  useEffect(() => {
+    const pp = (pane?.modelProvider ?? "").trim();
+    const pm = (pane?.modelName ?? "").trim();
+    if (!pp || !pm) return;
+    if (isModelSelectable(pp, pm, settings.providers)) return;
+    reconcilePaneModels();
+  }, [pane?.modelProvider, pane?.modelName, settings.providers, reconcilePaneModels]);
   const selectedSubAgent = useAppStore((s) => s.selectedSubAgent);
   const setSelectedSubAgent = useAppStore((s) => s.setSelectedSubAgent);
   const addSubAgent = useAppStore((s) => s.addSubAgent);
@@ -1945,6 +2044,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const userNickname = useAppStore((s) => s.userNickname);
   const userPreference = useAppStore((s) => s.userPreference);
   const userBubbleLabel = useMemo(() => userNickname.trim() || "我", [userNickname]);
+  const groupChatUserLabel = useMemo(() => userNickname.trim() || "用户", [userNickname]);
   const isGroupPane = Boolean(pane?.avatarId?.startsWith("group:"));
   /** 元智能体窗格：顶栏已展示当前模型，气泡内不再重复展示模型徽章 */
   const isMachiMetaPane = pane.avatarId === null;
@@ -1965,14 +2065,24 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         .filter((a): a is Avatar => Boolean(a)),
     [activeGroup, avatars]
   );
+  const resolveGroupSender = useCallback(
+    (message: Pick<Message, "role" | "avatarName" | "avatarUrl" | "agentId">) =>
+      resolveGroupChatSender(message, {
+        groupMembers,
+        metaAvatarUrl: metaAvatarUrl.trim() || DEFAULT_META_AVATAR_URL,
+        userLabel: groupChatUserLabel,
+        userAvatarUrl: userAvatarUrl || "",
+      }),
+    [groupMembers, groupChatUserLabel, metaAvatarUrl, userAvatarUrl]
+  );
   const workspacePanelOpen = !!pane?.taskspacePanelOpen;
 
   const paneAvatarMeta = useMemo(() => {
     const aid = pane?.avatarId;
     if (!aid) {
-      // avatarId 为空即为 Machi 窗格；勿依赖 avatarName===「Machi」才给 meta 头像（飞书绑定曾错误写入「分身」）
+      // avatarId 为空即为 Near 窗格；勿依赖 avatarName===「Near」才给 meta 头像（飞书绑定曾错误写入「分身」）
       const paneName = (pane?.avatarName ?? "").trim();
-      const name = paneName && paneName !== "分身" ? paneName : "Machi";
+      const name = resolveMetaDisplayName(paneName);
       return { name, url: metaAvatarUrl.trim() || DEFAULT_META_AVATAR_URL };
     }
     if (aid.startsWith("group:")) return { name: pane?.avatarName || "AI", url: undefined };
@@ -1985,6 +2095,9 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const [input, setInput] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [voiceTranscribing, setVoiceTranscribing] = useState(false);
+  const [voiceInputHint, setVoiceInputHint] = useState("");
+  const dictationSessionRef = useRef<{ stop: () => void; cancel: () => void } | null>(null);
   const [streamedAssistantText, setStreamedAssistantText] = useState("");
   const [streamingSessionId, setStreamingSessionId] = useState("");
   const [runGuardSessionId, setRunGuardSessionId] = useState("");
@@ -1994,6 +2107,9 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const sessionStreamStateRef = useRef<
     Record<string, { active: boolean; text: string; provider: string; model: string }>
   >({});
+  /** Live-reattach (FR-4): per-session abort controllers for read-only reattach streams. */
+  const reattachControllersRef = useRef<Record<string, AbortController>>({});
+  const liveReattachEnabledRef = useRef(false);
   const streamTextRef = useRef("");
   const streamCommittedRef = useRef(false);
   /** Text last committed at a tool_call boundary; avoids duplicating the same assistant bubble at stream end. */
@@ -2006,6 +2122,12 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const [stallTick, setStallTick] = useState(0);
   const [bgCompleteToast, setBgCompleteToast] = useState(false);
   const [stallHintToast, setStallHintToast] = useState("");
+  const [stallRejectReason, setStallRejectReason] = useState("");
+  const [resumeInFlight, setResumeInFlight] = useState(false);
+  const resumeInFlightRef = useRef<Record<string, boolean>>({});
+  const resumeInFlightTimerRef = useRef<number | null>(null);
+  /** Mirrors stallState so SSE handlers can tell whether a recovery card is visible. */
+  const stallStateRef = useRef<"none" | "stall" | "exhausted">("none");
   const [autoNudgeCount, setAutoNudgeCount] = useState(0);
   const autoNudgeTriggeredRef = useRef<Record<string, number>>({});
   const autoNudgeBucketRef = useRef<Record<string, number>>({});
@@ -2014,6 +2136,11 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const stopInFlightRef = useRef<Record<string, boolean>>({});
   const interruptNoticeSentRef = useRef<Record<string, boolean>>({});
   const [lastToolProgress, setLastToolProgress] = useState<{ name: string; sec: number } | null>(null);
+  const [contextLoopStats, setContextLoopStats] = useState<{
+    round: number;
+    tool_result_tokens_session: number;
+    archived_tool_calls: number;
+  } | null>(null);
   const [stallRuntimeConfig, setStallRuntimeConfig] = useState({
     stall_detect_silence_seconds: 90,
     stall_auto_nudge_enabled: false,
@@ -2022,7 +2149,15 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   });
   const [unattendedGlobalEnabled, setUnattendedGlobalEnabled] = useState(false);
   const [unattendedMaxContinuations, setUnattendedMaxContinuations] = useState(20);
+  const [unattendedStallContinueAfterSeconds, setUnattendedStallContinueAfterSeconds] = useState(120);
+  const [unattendedContinueCount, setUnattendedContinueCount] = useState(0);
+  const unattendedContinueTriggeredRef = useRef<Record<string, number>>({});
+  const unattendedContinueBucketRef = useRef<Record<string, number>>({});
+  // Tracks the id of the trailing "无人值守已停止" marker we've already reacted to
+  // per session, so the auto-disable effect does not fight a later manual re-enable.
+  const unattendedAutoStopAckRef = useRef<Record<string, string>>({});
   const [sessionUnattended, setSessionUnattended] = useState(false);
+  const [budgetExceededInfo, setBudgetExceededInfo] = useState<BudgetExceededInfo | null>(null);
   const lastSseEventAtRef = useRef(0);
   const lastProgressAtRef = useRef(0);
   const sessionEnteredAtRef = useRef<Record<string, number>>({});
@@ -2593,7 +2728,9 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
 
   useEffect(() => {
     return () => {
-      stopRecording();
+      dictationSessionRef.current?.cancel();
+      dictationSessionRef.current = null;
+      cancelDictation();
     };
   }, []);
 
@@ -2984,10 +3121,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     token.setAttribute("data-skill-name", name);
     token.className =
       "agx-composer-inline-chip mx-0.5 inline-flex max-w-[min(100%,280px)] items-center gap-1 rounded-md px-1.5 py-0.5 align-baseline text-[12px] font-medium leading-[1.2]";
-    // wrench SVG icon + name
     const icon = document.createElement("span");
-    icon.innerHTML =
-      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width:11px;height:11px;display:inline-block;vertical-align:middle;opacity:0.8"><path d="M14.7 6.3a1 1 0 000 1.4l1.6 1.6a1 1 0 001.4 0l3.77-3.77a6 6 0 01-7.94 7.94l-6.91 6.91a2.12 2.12 0 01-3-3l6.91-6.91a6 6 0 017.94-7.94l-3.76 3.76z"/></svg>';
+    icon.innerHTML = skillPuzzleIconInnerHtml(11);
     token.appendChild(icon);
     const label = document.createElement("span");
     label.className = "min-w-0 truncate";
@@ -3748,28 +3883,17 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     sessionWorkInProgress,
   });
 
-  const stallModelOptions = useMemo(() => {
-    const result: { provider: string; model: string; label: string }[] = [];
-    for (const [provName, entry] of Object.entries(settings.providers)) {
-      if (entry.enabled === false) continue;
-      if (!entry.apiKey) continue;
-      const provLabel = getProviderDisplayName(provName, entry);
-      if (entry.models.length > 0) {
-        for (const m of entry.models) {
-          result.push({ provider: provName, model: m, label: `${provLabel}/${m}` });
-        }
-      } else if (entry.model) {
-        result.push({ provider: provName, model: entry.model, label: `${provLabel}/${entry.model}` });
-      }
-    }
-    return result;
-  }, [settings.providers]);
+  const stallModelOptions = useMemo(
+    () => collectSelectableModelOptions(settings.providers),
+    [settings.providers],
+  );
 
   const currentModelLabel = useMemo(() => {
     if (!chatModel) return "未选模型";
     if (!chatProvider) return chatModel;
+    if (!isModelSelectable(chatProvider, chatModel, settings.providers)) return "未选模型";
     const entry = settings.providers[chatProvider];
-    return `${getProviderDisplayName(chatProvider, entry)}/${chatModel}`;
+    return formatModelOptionLabel(chatProvider, chatModel, entry);
   }, [chatModel, chatProvider, settings.providers]);
 
   const silentSeconds = useMemo(() => {
@@ -3785,6 +3909,44 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     if (sessionExecutionState === "running") return "active";
     return "idle";
   }, [sessionWorkInProgress, stallState, sessionExecutionState]);
+
+  const sessionBusy = taskLiveness !== "idle" || stallState !== "none";
+
+  useEffect(() => {
+    stallStateRef.current = stallState;
+  }, [stallState]);
+
+  const lastAssistantMessageId = useMemo(() => {
+    for (let i = visibleMessages.length - 1; i >= 0; i--) {
+      if (visibleMessages[i].role === "assistant") return visibleMessages[i].id;
+    }
+    return null;
+  }, [visibleMessages]);
+
+  const clearResumeInFlight = useCallback((sid: string) => {
+    if (resumeInFlightTimerRef.current != null) {
+      window.clearTimeout(resumeInFlightTimerRef.current);
+      resumeInFlightTimerRef.current = null;
+    }
+    delete resumeInFlightRef.current[sid];
+    if ((pane.sessionId || "").trim() === sid) {
+      setResumeInFlight(false);
+    }
+  }, [pane.sessionId]);
+
+  const beginResumeInFlight = useCallback(
+    (sid: string) => {
+      resumeInFlightRef.current[sid] = true;
+      setResumeInFlight(true);
+      if (resumeInFlightTimerRef.current != null) {
+        window.clearTimeout(resumeInFlightTimerRef.current);
+      }
+      resumeInFlightTimerRef.current = window.setTimeout(() => {
+        clearResumeInFlight(sid);
+      }, 8000);
+    },
+    [clearResumeInFlight]
+  );
 
   const syncStreamingUiForCurrentSession = useCallback(() => {
     const sid = (pane.sessionId || "").trim();
@@ -3831,7 +3993,11 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   /** 任一 SSE 帧视为仍有响应：刷新计时并在曾误判 stall 时立即收起提示 */
   const recordSseActivity = useCallback(() => {
     recordProgressActivity();
-  }, [recordProgressActivity]);
+    const sid = (pane.sessionId || "").trim();
+    if (sid && resumeInFlightRef.current[sid]) {
+      clearResumeInFlight(sid);
+    }
+  }, [clearResumeInFlight, pane.sessionId, recordProgressActivity]);
 
   useEffect(() => {
     void window.agenticxDesktop.loadRuntimeConfig().then((r) => {
@@ -3843,7 +4009,10 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         stall_auto_nudge_max_per_session?: number;
         unattended_enabled?: boolean;
         unattended_max_continuations_per_session?: number;
+        unattended_stall_continue_after_seconds?: number;
+        live_reattach_enabled?: boolean;
       };
+      liveReattachEnabledRef.current = Boolean(cfg.live_reattach_enabled);
       const detectSec = Math.max(
         30,
         Math.min(300, Number(cfg.stall_detect_silence_seconds ?? 90) || 90),
@@ -3864,8 +4033,38 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       setUnattendedMaxContinuations(
         Math.max(1, Math.min(100, Number(cfg.unattended_max_continuations_per_session ?? 20) || 20))
       );
+      setUnattendedStallContinueAfterSeconds(
+        Math.max(
+          30,
+          Math.min(600, Number(cfg.unattended_stall_continue_after_seconds ?? 120) || 120),
+        ),
+      );
     });
   }, []);
+
+  /**
+   * Returns the id of a trailing "无人值守已停止" marker — i.e. an auto-stop
+   * notice that is the most recent unattended event with no later user message.
+   * Used to detect that the supervisor has turned unattended off so the desktop
+   * stops re-enabling it. Returns null when no such trailing marker exists.
+   */
+  const detectTrailingUnattendedStop = useCallback(
+    (msgs: Message[]): string | null => {
+      for (let i = msgs.length - 1; i >= 0; i -= 1) {
+        const m = msgs[i];
+        if (m.role === "user") return null;
+        if (
+          m.role === "tool" &&
+          typeof m.content === "string" &&
+          m.content.includes("无人值守已停止")
+        ) {
+          return String(m.id ?? `idx-${i}`);
+        }
+      }
+      return null;
+    },
+    []
+  );
 
   useEffect(() => {
     const sid = (pane.sessionId || "").trim();
@@ -3874,13 +4073,64 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       return;
     }
     try {
-      const raw = localStorage.getItem("agx-session-unattended-v1");
+      const raw = readScopedLocalStorage(SESSION_UNATTENDED_STORAGE_KEY);
       const map = raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
-      setSessionUnattended(Boolean(map[sid]));
+      const enabled = Boolean(map[sid]);
+      // If the session was already auto-stopped by the supervisor, do not push
+      // it back on — that caused the reopen → re-stop loop with repeated ⛔.
+      const stopId = detectTrailingUnattendedStop(pane.messages ?? []);
+      const autoStopped = stopId !== null && unattendedAutoStopAckRef.current[sid] !== stopId;
+      if (enabled && autoStopped) {
+        setSessionUnattended(false);
+        return;
+      }
+      setSessionUnattended(enabled);
+      if (enabled && apiBase) {
+        void fetch(`${apiBase.replace(/\/$/, "")}/api/sessions/${encodeURIComponent(sid)}/unattended`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+          body: JSON.stringify({ enabled: true }),
+        }).catch(() => {
+          /* best-effort sync after restart */
+        });
+      }
     } catch {
       setSessionUnattended(false);
     }
-  }, [pane.sessionId]);
+  }, [apiBase, apiToken, pane.sessionId, pane.messages, detectTrailingUnattendedStop]);
+
+  // When the supervisor auto-stops unattended (trailing ⛔ marker), reflect that
+  // by clearing the local toggle and syncing the backend off, so it stays off.
+  useEffect(() => {
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) return;
+    const stopId = detectTrailingUnattendedStop(pane.messages ?? []);
+    if (!stopId) return;
+    if (unattendedAutoStopAckRef.current[sid] === stopId) return;
+    unattendedAutoStopAckRef.current[sid] = stopId;
+    let cleared = false;
+    try {
+      const raw = readScopedLocalStorage(SESSION_UNATTENDED_STORAGE_KEY);
+      const map = raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
+      if (map[sid]) {
+        delete map[sid];
+        writeScopedLocalStorage(SESSION_UNATTENDED_STORAGE_KEY, JSON.stringify(map));
+        cleared = true;
+      }
+    } catch {
+      /* best effort */
+    }
+    setSessionUnattended(false);
+    if (cleared && apiBase) {
+      void fetch(`${apiBase.replace(/\/$/, "")}/api/sessions/${encodeURIComponent(sid)}/unattended`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
+        body: JSON.stringify({ enabled: false }),
+      }).catch(() => {
+        /* best effort */
+      });
+    }
+  }, [apiBase, apiToken, pane.sessionId, pane.messages, detectTrailingUnattendedStop]);
 
   const toggleSessionUnattended = useCallback(async () => {
     const sid = (pane.sessionId || "").trim();
@@ -3892,56 +4142,214 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         headers: { "Content-Type": "application/json", "x-agx-desktop-token": apiToken },
         body: JSON.stringify({ enabled: next }),
       });
-      const raw = localStorage.getItem("agx-session-unattended-v1");
+      const raw = readScopedLocalStorage(SESSION_UNATTENDED_STORAGE_KEY);
       const map = raw ? (JSON.parse(raw) as Record<string, boolean>) : {};
-      if (next) map[sid] = true;
-      else delete map[sid];
-      localStorage.setItem("agx-session-unattended-v1", JSON.stringify(map));
+      if (next) {
+        map[sid] = true;
+        // Manual re-enable acknowledges any existing trailing stop marker so the
+        // auto-disable effect does not immediately turn it back off.
+        const stopId = detectTrailingUnattendedStop(pane.messages ?? []);
+        if (stopId) unattendedAutoStopAckRef.current[sid] = stopId;
+      } else {
+        delete map[sid];
+      }
+      writeScopedLocalStorage(SESSION_UNATTENDED_STORAGE_KEY, JSON.stringify(map));
       setSessionUnattended(next);
     } catch {
       setStallHintToast("无人值守开关保存失败");
     }
-  }, [apiBase, apiToken, pane.sessionId, sessionUnattended]);
+  }, [apiBase, apiToken, pane.sessionId, pane.messages, sessionUnattended, detectTrailingUnattendedStop]);
 
-  useEffect(() => {
-    const sid = (pane.sessionId || "").trim();
-    if (!sid) return;
-    sessionEnteredAtRef.current[sid] = Date.now();
-    setAutoNudgeCount(autoNudgeTriggeredRef.current[sid] ?? 0);
-    void window.agenticxDesktop.listSessions(pane.avatarId ?? undefined).then((r) => {
-      if (!r.ok) return;
-      const row = (r.sessions ?? []).find((s) => s.session_id === sid);
-      const st = (row?.execution_state ?? "idle") as SessionExecutionState;
-      setSessionExecutionState(st);
-      prevExecutionStateRef.current = st;
-    });
-  }, [pane.sessionId, pane.avatarId]);
-
-  useEffect(() => {
-    if ((pane.messages ?? []).length > 0) {
-      recordProgressActivity();
-    }
-  }, [pane.messages?.length, recordProgressActivity]);
-
+  /** Returns true only when disk merge actually added/changed rows (used to gate progress timer). */
   const mergeTailFromDisk = useCallback(
-    async (sid: string) => {
+    async (sid: string): Promise<boolean> => {
       try {
         const msgs = await window.agenticxDesktop.loadSessionMessages(sid);
-        if (!msgs.ok || !Array.isArray(msgs.messages)) return;
+        if (!msgs.ok || !Array.isArray(msgs.messages)) return false;
         const current = useAppStore.getState().panes.find((p) => p.id === pane.id)?.messages ?? [];
         const merged = mergeSessionMessagesTail(
           current,
           msgs.messages as LoadedSessionMessage[],
           sid
         );
-        setPaneMessages(pane.id, merged);
-        recordProgressActivity();
+        const changed =
+          merged.length !== current.length ||
+          String(merged[merged.length - 1]?.content ?? "") !==
+            String(current[current.length - 1]?.content ?? "");
+        if (changed) {
+          setPaneMessages(pane.id, merged);
+          recordProgressActivity();
+        }
+        return changed;
       } catch {
         /* best effort */
+        return false;
       }
     },
     [pane.id, recordProgressActivity, setPaneMessages]
   );
+
+  /**
+   * FR-4 live reattach: when re-entering a still-running session with no active
+   * foreground SSE, subscribe to the read-only reattach endpoint to resume
+   * token-level streaming in real time. Structured content (tool cards, refs,
+   * group progress) is reconciled from disk when the stream ends. Falls back to
+   * disk polling on any error or when the feature flag is off.
+   */
+  const reattachLiveStream = useCallback(
+    async (sid: string): Promise<void> => {
+      if (!sid || !apiBase) return;
+      if (reattachControllersRef.current[sid]) return; // already reattached
+      if (sessionStreamStateRef.current[sid]?.active) return; // foreground stream owns it
+      const ctrl = new AbortController();
+      reattachControllersRef.current[sid] = ctrl;
+      const prior = sessionStreamStateRef.current[sid];
+      let liveText = prior?.text ?? "";
+      sessionStreamStateRef.current[sid] = {
+        active: true,
+        text: liveText,
+        provider: prior?.provider ?? "",
+        model: prior?.model ?? "",
+      };
+      const isCurrent = () => (pane.sessionId || "").trim() === sid;
+      if (isCurrent()) syncStreamingUiForCurrentSession();
+      let lastSeq = 0;
+      try {
+        const resp = await fetch(reattachSessionStreamUrl(apiBase, sid, lastSeq), {
+          headers: { "x-agx-desktop-token": apiToken },
+          signal: ctrl.signal,
+        });
+        const reader = resp.ok ? resp.body?.getReader() : undefined;
+        if (!reader) return;
+        const decoder = new TextDecoder();
+        let buffer = "";
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+          for (const frame of frames) {
+            const { eventId, payload } = parseSseFrame(frame);
+            if (eventId != null) lastSeq = eventId;
+            if (!payload || typeof payload !== "object") continue;
+            const p = payload as { type?: string; data?: { text?: string; agent_id?: string } };
+            recordSseActivity();
+            if (p.type === "token" && (p.data?.agent_id ?? "meta") === "meta") {
+              const t = String(p.data?.text ?? "").replace(/⏳\s*/g, "");
+              if (!t) continue;
+              liveText += t;
+              const st = sessionStreamStateRef.current[sid];
+              if (st) st.text = liveText;
+              if (isCurrent()) setStreamedAssistantText(liveText);
+            }
+            // done/final/replay_gap: reconciled from disk in finally.
+          }
+        }
+      } catch {
+        /* aborted or network error — disk merge below reconciles state */
+      } finally {
+        delete reattachControllersRef.current[sid];
+        const st = sessionStreamStateRef.current[sid];
+        if (st) st.active = false;
+        if (isCurrent()) {
+          setStreamedAssistantText("");
+          syncStreamingUiForCurrentSession();
+        }
+        await mergeTailFromDisk(sid);
+      }
+    },
+    [apiBase, apiToken, pane.sessionId, recordSseActivity, mergeTailFromDisk, syncStreamingUiForCurrentSession]
+  );
+
+  useEffect(() => {
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) return;
+    sessionEnteredAtRef.current[sid] = Date.now();
+    setAutoNudgeCount(autoNudgeTriggeredRef.current[sid] ?? 0);
+    const priorUnattended = (pane.messages ?? []).filter(
+      (m) =>
+        m.role === "tool" &&
+        typeof m.content === "string" &&
+        (m.content.includes("无人值守续跑") || m.content.includes("自动续跑提醒")),
+    ).length;
+    unattendedContinueTriggeredRef.current[sid] = priorUnattended;
+    setUnattendedContinueCount(priorUnattended);
+    void window.agenticxDesktop.listSessions(pane.avatarId ?? undefined).then((r) => {
+      if (!r.ok) return;
+      const row = (r.sessions ?? []).find((s) => s.session_id === sid);
+      const st = (row?.execution_state ?? "idle") as SessionExecutionState;
+      setSessionExecutionState(st);
+      prevExecutionStateRef.current = st;
+      if (st === "running" && !sessionStreamStateRef.current[sid]?.active) {
+        setRunGuardSessionId(sid);
+        if (liveReattachEnabledRef.current) void reattachLiveStream(sid);
+        else void mergeTailFromDisk(sid);
+      }
+    });
+  }, [mergeTailFromDisk, reattachLiveStream, pane.sessionId, pane.avatarId]);
+
+  useEffect(() => {
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) return;
+    let cancelled = false;
+    let timer: number | undefined;
+
+    const syncBackgroundRun = async () => {
+      if (cancelled) return;
+      const sseActive = Boolean(sessionStreamStateRef.current[sid]?.active);
+      if (sseActive) return;
+      try {
+        const r = await window.agenticxDesktop.listSessions(pane.avatarId ?? undefined);
+        if (cancelled || !r.ok) return;
+        const row = (r.sessions ?? []).find((s) => s.session_id === sid);
+        const execState = (row?.execution_state ?? "idle") as SessionExecutionState;
+        if (execState !== "running") return;
+        setRunGuardSessionId(sid);
+        if (liveReattachEnabledRef.current) {
+          // Live reattach takes over: marks the stream active (gating future
+          // ticks) and resumes token-level streaming until the run ends.
+          void reattachLiveStream(sid);
+          return;
+        }
+        // mergeTailFromDisk only refreshes the progress timer when it actually
+        // appends new rows; do NOT unconditionally record activity here, or a
+        // backend that has silently hung would never trip the stall card.
+        await mergeTailFromDisk(sid);
+      } catch {
+        /* best effort */
+      }
+    };
+
+    void syncBackgroundRun();
+    timer = window.setInterval(() => void syncBackgroundRun(), 2000);
+    return () => {
+      cancelled = true;
+      if (timer != null) window.clearInterval(timer);
+      // Abort any live reattach stream for this session when leaving / switching.
+      const ctrl = reattachControllersRef.current[sid];
+      if (ctrl) {
+        ctrl.abort();
+        delete reattachControllersRef.current[sid];
+      }
+    };
+  }, [mergeTailFromDisk, reattachLiveStream, pane.avatarId, pane.sessionId]);
+
+  useEffect(() => {
+    const sid = (pane.sessionId || "").trim();
+    const found = findBudgetExceededInMessages(pane.messages ?? []);
+    if (found) {
+      setBudgetExceededInfo({ ...found, sessionId: sid || found.sessionId });
+    } else {
+      setBudgetExceededInfo(null);
+    }
+  }, [pane.messages, pane.sessionId]);
+
+  useEffect(() => {
+    if ((pane.messages ?? []).length > 0) {
+      recordProgressActivity();
+    }
+  }, [pane.messages?.length, recordProgressActivity]);
 
   const stopCurrentRun = useCallback(async () => {
     const sid = (streamingSessionId || pane.sessionId || "").trim();
@@ -3995,6 +4403,35 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       setStoppingSessionId((current) => (current === sid ? "" : current));
     }
   }, [addPaneMessage, pane.id, pane.sessionId, streamingSessionId]);
+
+  const interruptForResume = useCallback(
+    async (sid: string) => {
+      const prevAbort = sessionAbortControllersRef.current[sid];
+      if (prevAbort) {
+        try {
+          prevAbort.abort();
+        } catch {
+          /* already aborted */
+        }
+        delete sessionAbortControllersRef.current[sid];
+      }
+      const st = sessionStreamStateRef.current[sid];
+      if (st) {
+        st.active = false;
+        st.text = "";
+        sessionStreamStateRef.current[sid] = st;
+      }
+      if ((pane.sessionId || "").trim() === sid) {
+        syncStreamingUiForCurrentSession();
+      }
+      try {
+        await window.agenticxDesktop.interruptSession?.(sid);
+      } catch {
+        /* best effort */
+      }
+    },
+    [pane.sessionId, syncStreamingUiForCurrentSession]
+  );
 
   useEffect(() => {
     const sid = (pane.sessionId || "").trim();
@@ -4100,7 +4537,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
 
   useEffect(() => {
     if (!stallRuntimeConfig.stall_auto_nudge_enabled) return;
-    if (!shouldAllowStallAutoNudge(stallState, sessionExecutionState)) return;
+    if (!shouldAllowStallAutoNudge(stallState, sessionExecutionState, Boolean(budgetExceededInfo))) return;
     const sid = (pane.sessionId || "").trim();
     if (!sid) return;
     if (silentSeconds < stallRuntimeConfig.stall_auto_nudge_after_seconds) return;
@@ -4129,6 +4566,44 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     silentSeconds,
     stallRuntimeConfig,
     stallState,
+    budgetExceededInfo,
+  ]);
+
+  useEffect(() => {
+    if (!sessionUnattended || !unattendedGlobalEnabled) return;
+    if (Boolean(budgetExceededInfo)) return;
+    if (!shouldAllowStallAutoNudge(stallState, sessionExecutionState, false)) return;
+    const sid = (pane.sessionId || "").trim();
+    if (!sid) return;
+    if (silentSeconds < unattendedStallContinueAfterSeconds) return;
+    const count = unattendedContinueTriggeredRef.current[sid] ?? 0;
+    if (count >= unattendedMaxContinuations) return;
+    const bucket = Math.floor(
+      silentSeconds / Math.max(1, unattendedStallContinueAfterSeconds),
+    );
+    if ((unattendedContinueBucketRef.current[sid] ?? -1) >= bucket) return;
+    unattendedContinueBucketRef.current[sid] = bucket;
+    unattendedContinueTriggeredRef.current[sid] = count + 1;
+    setUnattendedContinueCount(count + 1);
+    const reason: ContinueReason =
+      sessionExecutionState === "interrupted"
+        ? "interrupted"
+        : stallState === "exhausted"
+          ? "exhausted"
+          : "stall";
+    void sendChatRef.current("", {
+      continuation: { reason, source: "supervisor" },
+    });
+  }, [
+    budgetExceededInfo,
+    pane.sessionId,
+    sessionExecutionState,
+    sessionUnattended,
+    silentSeconds,
+    stallState,
+    unattendedGlobalEnabled,
+    unattendedMaxContinuations,
+    unattendedStallContinueAfterSeconds,
   ]);
 
   useEffect(() => {
@@ -4145,7 +4620,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
 
   const resumeCurrentTask = useCallback(async () => {
     const sid = (pane.sessionId || "").trim();
-    if (!sid) return;
+    if (!sid || resumeInFlightRef.current[sid]) return;
+    beginResumeInFlight(sid);
     delete userStoppedSessionRef.current[sid];
     let state: SessionExecutionState = sessionExecutionState;
     try {
@@ -4159,20 +4635,21 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       /* ignore */
     }
 
-    if (state === "running") {
-      setStallHintToast("任务仍在后台执行中，可继续等待或主动中断");
-      return;
-    }
+    await interruptForResume(sid);
 
-    setStallState("none");
+    // Keep the stall/exhausted card mounted (now in "恢复中…" state) until the
+    // continuation succeeds (continuation_notice / first SSE frame) or is
+    // rejected. Clearing stallState here would unmount the card and hide the
+    // inline reject reason, regressing FR-4.
+    setStallRejectReason("");
     const reason = inferContinueReason({
       stallState,
-      executionState: state,
+      executionState: state === "running" ? "interrupted" : state,
     });
     void sendChatRef.current("", {
       continuation: { reason, source: "desktop_manual" },
     });
-  }, [pane.avatarId, pane.sessionId, sessionExecutionState, stallState]);
+  }, [beginResumeInFlight, interruptForResume, pane.avatarId, pane.sessionId, sessionExecutionState, stallState]);
 
   const resumeWithModel = useCallback(
     async (provider: string, model: string) => {
@@ -4229,6 +4706,10 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         const isSelecting = selectedMessageIds.size > 0;
         const rowSelectable = isSelecting && !reactCol;
         const isSelected = selectedMessageIds.has(message.id);
+        const groupSender = isGroupPane ? resolveGroupSender(message) : null;
+        const imUserName = isGroupPane ? groupChatUserLabel : userBubbleLabel;
+        const imAssistantName = groupSender?.name ?? paneAvatarMeta.name;
+        const imAssistantAvatarUrl = groupSender?.url ?? paneAvatarMeta.url;
         return (
           <div key={message.id} className="group/sel relative">
             {rowSelectable && !isSelected && (
@@ -4256,10 +4737,13 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               noBubbleBorder={reactFlat}
               toolCardOmitLeadingSpacer={message.role === "tool" && reactCol}
               onRevealPath={(path) => void revealFileInTaskspace(path)}
-              assistantName={paneAvatarMeta.name}
-              assistantAvatarUrl={paneAvatarMeta.url}
-              userName={userBubbleLabel}
+              assistantName={imAssistantName}
+              assistantAvatarUrl={imAssistantAvatarUrl}
+              userName={imUserName}
               userAvatarUrl={userAvatarUrl || undefined}
+              showSenderIdentity={isGroupPane}
+              senderAvatarVariant="rounded-square"
+              senderAvatarId={groupSender?.avatarId}
               onCopyMessage={copyMessage}
               onQuoteMessage={(msg, selectedText) =>
                 setQuoteTarget({ message: msg, body: resolveQuoteBody(msg, selectedText) })
@@ -4274,6 +4758,15 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               selected={rowSelectable && isSelected}
               onFollowupClick={sendFollowupChip}
               omitSuggestedQuestions={omitSuggestedQuestions}
+              budgetExceededActive={Boolean(budgetExceededInfo)}
+              allMessages={pane.messages ?? []}
+              sessionId={(pane.sessionId || "").trim() || undefined}
+              onResumeInNewSession={() => resumeInNewSessionRef.current()}
+              onOpenBudgetSettings={() => useAppStore.getState().openSettings("automation")}
+              sessionBusy={sessionBusy}
+              isLastAssistantInPane={
+                message.role === "assistant" && message.id === lastAssistantMessageId
+              }
             />
           </div>
         );
@@ -4427,7 +4920,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                     {isSelecting ? <div className="h-5 w-5 shrink-0" aria-hidden /> : null}
                     <div className="min-w-0 flex-1">
                       <div className="flex min-w-0 flex-col gap-2">
-                        <div className="flex w-fit flex-wrap items-center gap-0.5 text-text-faint" style={reactActionStyle}>
+                        <div className="group flex w-fit flex-wrap items-center gap-0.5 text-text-faint" style={reactActionStyle}>
                           <HoverTip label="复制">
                             <button
                               type="button"
@@ -4489,6 +4982,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                               <LayoutList size={13} />
                             </button>
                           </HoverTip>
+                          <MessageTimestamp ts={lastAssistantInBlock?.timestamp} align="left" />
                         </div>
                         {peeledFollowupAssistant?.suggestedQuestions &&
                         peeledFollowupAssistant.suggestedQuestions.length > 0 ? (
@@ -4519,13 +5013,25 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     return (
     <>
       {mainRows}
-      {Object.entries(groupTyping).map(([agentId, name]) => (
-        <ImBubble
-          key={`typing-${agentId}`}
-          message={{ id: `typing-${agentId}`, role: "assistant", content: "", avatarName: name, agentId }}
-          assistantName={name}
-        />
-      ))}
+      {Object.entries(groupTyping).map(([agentId, name]) => {
+        const typingSender = resolveGroupSender({
+          role: "assistant",
+          avatarName: name,
+          avatarUrl: undefined,
+          agentId,
+        });
+        return (
+          <ImBubble
+            key={`typing-${agentId}`}
+            message={{ id: `typing-${agentId}`, role: "assistant", content: "", avatarName: name, agentId }}
+            assistantName={typingSender.name}
+            assistantAvatarUrl={typingSender.url}
+            showSenderIdentity={isGroupPane}
+            senderAvatarVariant="rounded-square"
+            senderAvatarId={typingSender.avatarId}
+          />
+        );
+      })}
       {sessionWorkInProgress && !isStreamingCurrentSession && !isGroupPane ? (
         <ImBubble
           key="typing-meta"
@@ -4564,6 +5070,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             }
             assistantName={paneAvatarMeta.name}
             assistantAvatarUrl={paneAvatarMeta.url}
+            streamStalled={stallState === "stall"}
+            streamStalledSeconds={silentSeconds}
           />
         )
       ) : null}
@@ -4574,6 +5082,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           modelOptions={stallModelOptions}
           autoNudgeCount={autoNudgeCount}
           autoNudgeMax={stallRuntimeConfig.stall_auto_nudge_max_per_session}
+          resumeInFlight={resumeInFlight}
+          rejectReason={stallRejectReason}
           onResume={() => void resumeCurrentTask()}
           onResumeWithModel={(provider, model) => void resumeWithModel(provider, model)}
           onStop={() => void stopCurrentRun()}
@@ -4587,6 +5097,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
           maxRounds={exhaustedRounds?.maxRounds}
           currentModelLabel={currentModelLabel}
           modelOptions={stallModelOptions}
+          resumeInFlight={resumeInFlight}
+          rejectReason={stallRejectReason}
           onResume={() => void resumeCurrentTask()}
           onResumeWithModel={(provider, model) => void resumeWithModel(provider, model)}
           onStop={() => void stopCurrentRun()}
@@ -4596,7 +5108,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       )}
     </>
     );
-  }, [autoNudgeCount, chatStyle, copyMessage, copyReActBlock, currentModelLabel, exhaustedRounds, favoriteMessage, forwardOneMessage, groupTyping, groupedVisibleMessages, hideStreamOverlayAsDuplicate, input, isGroupPane, isRunGuardCurrentSession, isStreamingCurrentSession, pane.historySearchTerms, pane.sessionId, paneAvatarMeta, paneId, readyAttachments.length, resolveGroupInlineConfirm, resolveQuoteBody, resumeCurrentTask, resumeWithModel, revealFileInTaskspace, retryUserMessage, selectUpTo, selectedMessageIds, sendFollowupChip, sessionWorkInProgress, setQuoteTarget, showInlineAssistantModelBadge, stallModelOptions, stallRuntimeConfig.stall_auto_nudge_max_per_session, stallState, stopCurrentRun, streamTextForCurrentSession, streamingModel, toggleSelectBlock, toggleSelectMessage, topLevelRowsIm, userAvatarUrl, userBubbleLabel]);
+  }, [autoNudgeCount, budgetExceededInfo, chatStyle, copyMessage, copyReActBlock, currentModelLabel, exhaustedRounds, favoriteMessage, forwardOneMessage, groupChatUserLabel, groupTyping, groupedVisibleMessages, hideStreamOverlayAsDuplicate, input, isGroupPane, isRunGuardCurrentSession, isStreamingCurrentSession, lastAssistantMessageId, pane.historySearchTerms, pane.messages, pane.sessionId, paneAvatarMeta, paneId, readyAttachments.length, resolveGroupInlineConfirm, resolveGroupSender, resolveQuoteBody, resumeCurrentTask, resumeInFlight, resumeWithModel, revealFileInTaskspace, retryUserMessage, selectUpTo, selectedMessageIds, sendFollowupChip, sessionBusy, sessionWorkInProgress, setQuoteTarget, showInlineAssistantModelBadge, silentSeconds, stallModelOptions, stallRejectReason, stallRuntimeConfig.stall_auto_nudge_max_per_session, stallState, stopCurrentRun, streamTextForCurrentSession, streamingModel, toggleSelectBlock, toggleSelectMessage, topLevelRowsIm, userAvatarUrl, userBubbleLabel]);
 
   const removeAttachment = useCallback((key: string) => {
     setContextFiles((prev) => {
@@ -4700,26 +5212,73 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     }));
   }, [chatProvider, chatModel]);
 
+  useEffect(() => {
+    if (!voiceInputHint) return;
+    const t = window.setTimeout(() => setVoiceInputHint(""), 4200);
+    return () => window.clearTimeout(t);
+  }, [voiceInputHint]);
+
+  const applyVoiceTranscript = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      const next = appendDictationText(extractComposerText(), trimmed);
+      setComposerText(next);
+    },
+    [extractComposerText, setComposerText]
+  );
+
+  const { pttActive, pttLiveText, cancelPtt } = useVoicePushToTalk({
+    enabled: Boolean(pane.sessionId),
+    composerEmpty: !input.trim(),
+    apiBase,
+    apiToken,
+    language: "zh-CN",
+    onCommit: applyVoiceTranscript,
+    onError: (message) => setVoiceInputHint(message),
+  });
+
+  useEffect(() => () => cancelPtt(), [cancelPtt]);
+
   const onMicClick = () => {
-    if (recording) {
-      stopRecording();
+    cancelPtt();
+    if (recording || voiceTranscribing) {
+      dictationSessionRef.current?.stop();
+      dictationSessionRef.current = null;
       setRecording(false);
+      setVoiceTranscribing(false);
       return;
     }
-    setRecording(true);
-    void startRecording(
-      async (text) => {
-        setRecording(false);
-        await sendChat(text);
+    setVoiceInputHint("");
+    void startDictation(
+      {
+        onPhase: (phase: SttPhase) => {
+          setRecording(phase === "recording");
+          setVoiceTranscribing(phase === "transcribing");
+        },
+        onInterim: (interim) => {
+          if (!interim.trim()) return;
+          setVoiceInputHint(interim.trim());
+        },
+        onFinal: (text) => {
+          dictationSessionRef.current = null;
+          setRecording(false);
+          setVoiceTranscribing(false);
+          setVoiceInputHint("");
+          applyVoiceTranscript(text);
+        },
+        onError: (message) => {
+          setVoiceInputHint(message);
+        },
       },
-      () => {
-        // Keep UI simple in pane mode: no interim transcript rendering.
+      {
+        apiBase,
+        apiToken,
+        language: "zh",
       }
-    );
-    window.setTimeout(() => {
-      stopRecording();
-      setRecording(false);
-    }, 5000);
+    ).then((session) => {
+      dictationSessionRef.current = session;
+    });
   };
 
   const sendChatRef = useRef<(
@@ -4734,6 +5293,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   ) => Promise<void>>(
     async () => {}
   );
+  const resumeInNewSessionRef = useRef<() => void>(() => {});
 
   /** Send a team-mode action (ADD_TASK / PAUSE / RESUME / STOP) to TaskLock via Studio API. */
   const sendGroupTeamAction = async (action: string, data?: Record<string, unknown>) => {
@@ -5021,6 +5581,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     setRunGuardSessionId(requestSessionId);
     setSessionExecutionState("running");
     prevExecutionStateRef.current = "running";
+    useAppStore.getState().markSessionHistoryActive(requestSessionId);
+    useAppStore.getState().bumpSessionCatalogRevision();
     recordSseActivity();
     setStallState("none");
     setExhaustedRounds(null);
@@ -5094,9 +5656,12 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         body.group_id = groupChatId;
         body.mentioned_avatar_ids = mentionedAvatarIds;
         body.meta_leader_display_name = metaLeaderDisplayName;
-        body.user_display_name = userBubbleLabel;
+        body.user_display_name = groupChatUserLabel;
       }
-      if (userBubbleLabel && userBubbleLabel !== "我") body.user_nickname = userBubbleLabel;
+      const outboundUserNickname = isGroupPane ? groupChatUserLabel : userBubbleLabel;
+      if (outboundUserNickname && outboundUserNickname !== "我" && outboundUserNickname !== "用户") {
+        body.user_nickname = outboundUserNickname;
+      }
       if (userPreference.trim()) body.user_preference = userPreference.trim();
       // Extract @skill:// references from message text
       const skillSlugMatches = messageText.match(/@skill:\/\/([^\s@,，。！？\n]+)/g);
@@ -5197,6 +5762,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
         }
       }
       lastGroupProgressRef.current = {};
+      const groupProgressRunId = crypto.randomUUID();
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
 
       const reader = resp.body?.getReader();
@@ -5206,6 +5772,8 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       let full = "";
       let cumulativeFull = "";
       let pendingSuggestedQuestions: string[] = [];
+      let pendingReferences: SearchReference[] = [];
+      let pendingSearchedQueries: string[] = [];
       let buffer = "";
       while (true) {
         const { value: chunk, done } = await reader.read();
@@ -5225,11 +5793,25 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               if (noticeText) {
                 addPaneMessageIfSessionActive(pane.id, "tool", noticeText, "meta");
               }
+              clearResumeInFlight(requestSessionId);
+              setStallRejectReason("");
+              // Continuation accepted: now safe to dismiss the stall/exhausted card.
+              setStallState("none");
               continue;
             }
             if (payload.type === "continuation_rejected") {
               const rejectText = String(payload.data?.text ?? "").trim();
-              if (rejectText) setStallHintToast(rejectText);
+              clearResumeInFlight(requestSessionId);
+              if (rejectText) {
+                setStallRejectReason(rejectText);
+                // Inline reject only shows inside a mounted recovery card. Fall
+                // back to a toast when the user has left the pane OR no card is
+                // currently visible (stallState === "none").
+                const samePane = (pane.sessionId || "").trim() === requestSessionId;
+                if (!samePane || stallStateRef.current === "none") {
+                  setStallHintToast(rejectText);
+                }
+              }
               continue;
             }
             if (payload.type === "group_typing") {
@@ -5241,21 +5823,37 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               const avatarName = String(payload.data?.avatar_name ?? eventAgentId);
               const avatarUrl = String(payload.data?.avatar_url ?? "");
               const progressText = String(payload.data?.content ?? "").trim();
+              const progressTitle = `${avatarName}：${progressText}`;
+              const progressCallId = `${groupProgressRunId}:group-progress:${eventAgentId}`;
               setGroupTyping((prev) => ({ ...prev, [eventAgentId]: avatarName }));
               if (!progressText) continue;
               const prevText = lastGroupProgressRef.current[eventAgentId] ?? "";
               if (prevText === progressText) continue;
               lastGroupProgressRef.current[eventAgentId] = progressText;
-              addPaneMessageIfSessionActive(
-                pane.id,
-                "tool",
-                `${avatarName}：${progressText}`,
-                eventAgentId,
-                chatProvider,
-                chatModel,
-                undefined,
-                { avatarName, avatarUrl: avatarUrl || undefined }
-              );
+              const merged = updatePaneMessageByToolCallId(pane.id, progressCallId, {
+                content: "",
+                toolStatus: "running",
+                toolResultPreview: progressTitle,
+              });
+              if (!merged) {
+                addPaneMessageIfSessionActive(
+                  pane.id,
+                  "tool",
+                  "",
+                  eventAgentId,
+                  chatProvider,
+                  chatModel,
+                  undefined,
+                  {
+                    avatarName,
+                    avatarUrl: avatarUrl || undefined,
+                    toolCallId: progressCallId,
+                    toolName: "group_progress",
+                    toolStatus: "running",
+                    toolResultPreview: progressTitle,
+                  }
+                );
+              }
               continue;
             }
             if (payload.type === "group_blocked") {
@@ -5324,6 +5922,9 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               const avatarUrl = String(payload.data?.avatar_url ?? "");
               const content = String(payload.data?.content ?? "");
               const errorText = String(payload.data?.error ?? "");
+              updatePaneMessageByToolCallId(pane.id, `${groupProgressRunId}:group-progress:${eventAgentId}`, {
+                toolStatus: errorText.trim() ? "error" : "done",
+              });
               setGroupTyping((prev) => {
                 const next = { ...prev };
                 delete next[eventAgentId];
@@ -5373,6 +5974,9 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               continue;
             }
             if (payload.type === "group_skipped") {
+              updatePaneMessageByToolCallId(pane.id, `${groupProgressRunId}:group-progress:${eventAgentId}`, {
+                toolStatus: "cancelled",
+              });
               setGroupTyping((prev) => {
                 const next = { ...prev };
                 delete next[eventAgentId];
@@ -5527,6 +6131,11 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               const toolNameStr = String(payload.data?.name ?? "tool");
               const toolArgs = (payload.data?.arguments ?? payload.data?.args ?? {}) as Record<string, unknown>;
               const toolCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (SEARCH_REFERENCE_TOOLS.has(toolNameStr)) {
+                const q = String(toolArgs.query ?? "").trim();
+                if (q) pendingSearchedQueries = mergeSearchedQueries(pendingSearchedQueries, [q]);
+                continue;
+              }
               if (eventAgentId === "meta" && toolNameStr === "cc_bridge_start") {
                 const callKey = toolCallId || `${requestSessionId || "session"}:cc_bridge_start`;
                 const modeHint = parseCcBridgeModeFromPayload(toolArgs);
@@ -5585,6 +6194,16 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             }
             if (payload.type === "tool_result") {
               const toolName = String(payload.data?.name ?? "");
+              if (SEARCH_REFERENCE_TOOLS.has(toolName)) {
+                const accumulated = accumulateReferenceTurn(
+                  pendingReferences,
+                  pendingSearchedQueries,
+                  payload.data,
+                );
+                pendingReferences = accumulated.references;
+                pendingSearchedQueries = accumulated.queries;
+                continue;
+              }
               const formatted = formatToolResultMessage(toolName, payload.data?.result);
               if (formatted.silent) continue;
               const resultCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
@@ -5867,6 +6486,13 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                 pendingSuggestedQuestions = Array.isArray(sqRaw)
                   ? sqRaw.map((x: unknown) => String(x).trim()).filter(Boolean).slice(0, 3)
                   : [];
+                const appliedRefs = applyFinalReferencePayload(
+                  pendingReferences,
+                  pendingSearchedQueries,
+                  payload.data,
+                );
+                pendingReferences = appliedRefs.references;
+                pendingSearchedQueries = appliedRefs.queries;
                 // Final payload is authoritative. Replacing (instead of merging) avoids
                 // duplicate concatenation when token stream shape differs from final text.
                 if (finalText.trim() && !isThinkingPlaceholderText(finalText)) {
@@ -5896,11 +6522,38 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                 noticeKind: reactive ? "compaction_reactive" : "compaction_proactive",
               });
             }
+            if (payload.type === "context_stats") {
+              const round = Number(payload.data?.round ?? 0) || 0;
+              const toolSession = Number(payload.data?.tool_result_tokens_session ?? 0) || 0;
+              const archived = Number(payload.data?.archived_tool_calls ?? 0) || 0;
+              setContextLoopStats({ round, tool_result_tokens_session: toolSession, archived_tool_calls: archived });
+            }
             if (payload.type === "error") {
               const errText = String(payload.data?.text ?? "未知错误");
               const severity = String(payload.data?.severity ?? "").trim();
               const detector = String(payload.data?.detector ?? "").trim();
-              if (severity === "warning" || detector === "token_budget_compress" || detector === "compactor_circuit_breaker") {
+              const budgetInfo = budgetExceededInfoFromPayload(
+                payload.data as Record<string, unknown> | undefined,
+              );
+              if (budgetInfo) {
+                const sid = (pane.sessionId || "").trim();
+                setBudgetExceededInfo({ ...budgetInfo, sessionId: sid || budgetInfo.sessionId });
+                addPaneMessageIfSessionActive(
+                  pane.id,
+                  "tool",
+                  errText,
+                  eventAgentId || "meta",
+                  undefined,
+                  undefined,
+                  undefined,
+                  {
+                    noticeKind: "budget_exceeded",
+                    budgetSource: budgetInfo.source,
+                    budgetCurrent: budgetInfo.current,
+                    budgetMax: budgetInfo.maxAllowed,
+                  },
+                );
+              } else if (severity === "warning" || detector === "token_budget_compress" || detector === "compactor_circuit_breaker") {
                 // FR-4 / FR-5: non-fatal warnings render as flat context notices, not tool cards.
                 const noticeKind =
                   detector === "compactor_circuit_breaker" ? "compactor_cb" : "budget_compress";
@@ -5924,17 +6577,26 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
       }
 
       const trimmedFull = full.trim();
+      const refExtras = referenceExtrasFromTurn(pendingReferences, pendingSearchedQueries);
       const sugExtras =
         pendingSuggestedQuestions.length > 0
           ? { suggestedQuestions: pendingSuggestedQuestions.slice(0, 3) }
           : undefined;
+      const turnExtras = refExtras || sugExtras ? { ...refExtras, ...sugExtras } : undefined;
+      const completedAt = Date.now();
+      const stampLastAssistantCompletedAt = () => {
+        useAppStore.getState().mergeLastPaneMessageByRole(pane.id, "assistant", {
+          timestamp: completedAt,
+        });
+      };
       if (trimmedFull && !isThinkingPlaceholderText(full) && !streamCommittedRef.current) {
         const mid = lastMidStreamAssistantCommitRef.current;
         if (mid !== null && trimmedFull === mid) {
           streamCommittedRef.current = true;
-          if (sugExtras) {
-            useAppStore.getState().mergeLastPaneMessageByRole(pane.id, "assistant", sugExtras);
-          }
+          useAppStore.getState().mergeLastPaneMessageByRole(pane.id, "assistant", {
+            ...(turnExtras ?? {}),
+            timestamp: completedAt,
+          });
         } else {
           addPaneMessageIfSessionActive(
             pane.id,
@@ -5944,12 +6606,24 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             chatProvider,
             chatModel,
             undefined,
-            sugExtras,
+            { ...(turnExtras ?? {}), timestamp: completedAt },
           );
           streamCommittedRef.current = true;
         }
+      } else if (trimmedFull && !isThinkingPlaceholderText(full) && streamCommittedRef.current) {
+        if (turnExtras) {
+          useAppStore.getState().mergeLastPaneMessageByRole(pane.id, "assistant", {
+            ...turnExtras,
+            timestamp: completedAt,
+          });
+        } else {
+          stampLastAssistantCompletedAt();
+        }
       }
     } catch (error) {
+      if (isContinuation) {
+        clearResumeInFlight(requestSessionId);
+      }
       if (!(error instanceof DOMException && error.name === "AbortError")) {
         addPaneMessageIfSessionActive(pane.id, "tool", `❌ 请求失败: ${String(error)}`, "meta");
       }
@@ -6053,6 +6727,93 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     // empty session never appears in the history sidebar with an id-only title.
   };
 
+  resumeInNewSessionRef.current = () => {
+    const draft = buildBudgetResumeDraft(pane.messages ?? []);
+    createNewTopic(false, pane.sessionMode ?? "daily_office");
+    setBudgetExceededInfo(null);
+    setInput(draft);
+  };
+
+  const insertGlobalSearchFileReference = useCallback(
+    async (filePath: string, mode: "current" | "new") => {
+      const trimmed = filePath.trim();
+      if (!trimmed) return;
+
+      if (mode === "new") {
+        setContextFiles({});
+        clearPaneMessages(pane.id);
+        setPaneContextInherited(pane.id, false);
+        setPaneSessionId(pane.id, "");
+        clearPaneAwaitingFreshSession(pane.id);
+        markPaneAwaitingFreshSession(pane.id);
+      }
+
+      const fileName = fileNameFromPath(trimmed);
+      let content = `[文件引用] ${trimmed}`;
+      try {
+        const preview = await window.agenticxDesktop.systemSearchPreview(trimmed);
+        if (preview.ok) {
+          if (preview.kind === "text" && preview.content) {
+            content = preview.content.slice(0, TEXT_ATTACHMENT_LIMIT);
+          } else if (preview.kind === "metadata" && preview.content) {
+            content = preview.content.slice(0, TEXT_ATTACHMENT_LIMIT);
+          } else if (preview.kind === "image") {
+            content = `[图片: ${fileName}]`;
+          }
+        }
+      } catch {
+        // keep fallback content
+      }
+
+      setContextFiles((prev) => ({
+        ...prev,
+        [trimmed]: {
+          name: fileName,
+          size: content.length,
+          mimeType: "text/plain",
+          status: "ready",
+          content,
+          sourcePath: trimmed,
+          referenceToken: true,
+        },
+      }));
+
+      const base = mode === "new" ? "" : extractComposerText();
+      const { next, tokenNames } = buildFileMentionAppend(base, fileName);
+      setComposerText(next, { tokenNames });
+      focusComposerEnd();
+    },
+    [
+      clearPaneMessages,
+      extractComposerText,
+      focusComposerEnd,
+      initSession,
+      pane.id,
+      setComposerText,
+      setPaneContextInherited,
+      setPaneSessionId,
+    ]
+  );
+
+  useEffect(() => {
+    const onReference = (event: Event) => {
+      const detail = (event as CustomEvent<GlobalSearchReferenceFileDetail>).detail;
+      if (!detail || detail.paneId !== pane.id) return;
+      void insertGlobalSearchFileReference(detail.filePath, detail.mode);
+    };
+    const onWorkspaceAdded = (event: Event) => {
+      const detail = (event as CustomEvent<{ paneId?: string }>).detail;
+      if (!detail?.paneId || detail.paneId !== pane.id) return;
+      setTaskspaceAutoRefreshKey((k) => k + 1);
+    };
+    window.addEventListener(GLOBAL_SEARCH_REFERENCE_FILE, onReference);
+    window.addEventListener(GLOBAL_SEARCH_WORKSPACE_ADDED, onWorkspaceAdded);
+    return () => {
+      window.removeEventListener(GLOBAL_SEARCH_REFERENCE_FILE, onReference);
+      window.removeEventListener(GLOBAL_SEARCH_WORKSPACE_ADDED, onWorkspaceAdded);
+    };
+  }, [insertGlobalSearchFileReference, pane.id]);
+
   const maxTaskspaceWidth = paneWidth > 0 ? Math.max(240, Math.floor(paneWidth * 0.4)) : 480;
   const minTaskspaceWidth = 220;
   const maxSpawnsWidth = paneWidth > 0 ? Math.max(240, Math.floor(paneWidth * 0.42)) : 420;
@@ -6070,16 +6831,25 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
   const overlaySpawnsWidth = clampOverlayAside(spawnsWidth, minSpawnsWidth);
 
   useEffect(() => {
-    setTaskspaceWidth((prev) => Math.min(maxTaskspaceWidth, Math.max(minTaskspaceWidth, prev)));
-  }, [maxTaskspaceWidth]);
+    setTaskspaceWidth((prev) => {
+      const next = Math.min(maxTaskspaceWidth, Math.max(minTaskspaceWidth, prev));
+      return next === prev ? prev : next;
+    });
+  }, [maxTaskspaceWidth, minTaskspaceWidth]);
 
   useEffect(() => {
-    setSpawnsWidth((prev) => Math.min(maxSpawnsWidth, Math.max(minSpawnsWidth, prev)));
-  }, [maxSpawnsWidth]);
+    setSpawnsWidth((prev) => {
+      const next = Math.min(maxSpawnsWidth, Math.max(minSpawnsWidth, prev));
+      return next === prev ? prev : next;
+    });
+  }, [maxSpawnsWidth, minSpawnsWidth]);
 
   useEffect(() => {
-    setHistoryWidth((prev) => Math.min(maxHistoryWidth, Math.max(minHistoryWidth, prev)));
-  }, [maxHistoryWidth]);
+    setHistoryWidth((prev) => {
+      const next = Math.min(maxHistoryWidth, Math.max(minHistoryWidth, prev));
+      return next === prev ? prev : next;
+    });
+  }, [maxHistoryWidth, minHistoryWidth]);
 
   useEffect(() => {
     try {
@@ -6296,19 +7066,27 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
     else if (p.historyOpen) keep = "history";
     else if (p.membersPanelOpen) keep = "members";
     else keep = "spawns";
-    useAppStore.setState((s) => ({
-      panes: s.panes.map((row) =>
-        row.id !== p.id
-          ? row
-          : {
-              ...row,
-              taskspacePanelOpen: keep === "workspace",
-              historyOpen: keep === "history",
-              membersPanelOpen: keep === "members",
-              spawnsColumnOpen: keep === "spawns",
-            }
-      ),
-    }));
+    const desired = {
+      taskspacePanelOpen: keep === "workspace",
+      historyOpen: keep === "history",
+      membersPanelOpen: keep === "members",
+      spawnsColumnOpen: keep === "spawns",
+    };
+    useAppStore.setState((s) => {
+      const row = s.panes.find((r) => r.id === p.id);
+      if (!row) return s;
+      if (
+        row.taskspacePanelOpen === desired.taskspacePanelOpen &&
+        row.historyOpen === desired.historyOpen &&
+        row.membersPanelOpen === desired.membersPanelOpen &&
+        row.spawnsColumnOpen === desired.spawnsColumnOpen
+      ) {
+        return s;
+      }
+      return {
+        panes: s.panes.map((r) => (r.id !== p.id ? r : { ...r, ...desired })),
+      };
+    });
   }, [
     compactSidePanels,
     pane.id,
@@ -6572,21 +7350,36 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                 重试
               </button>
             </div>
+          ) : pane.loadingMessages && pane.sessionId ? (
+            <div className="mx-auto flex h-full min-h-0 w-full max-w-4xl flex-col justify-center gap-4 px-2 py-6">
+              <div className="text-center text-xs text-text-faint animate-pulse">正在加载会话…</div>
+              <div className="flex flex-col gap-3">
+                {[0, 1, 2].map((row) => (
+                  <div key={row} className="flex animate-pulse gap-2.5">
+                    <div className="h-8 w-8 shrink-0 rounded-full bg-surface-hover" />
+                    <div
+                      className="h-14 flex-1 rounded-xl bg-surface-hover"
+                      style={{ maxWidth: row === 1 ? "72%" : "84%" }}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
           ) : (!pane.sessionId && !isGroupPane && !isAutomationTaskPane) ||
             (pane.sessionId && visibleMessages.length === 0) ? (
             <div className="flex h-full flex-col items-center justify-center gap-5 px-4 text-center text-xs">
               <img
                 src={machiEmptyState}
-                alt="Machi Empty State"
+                alt={`${APP_DISPLAY_NAME} Empty State`}
                 className="w-[13.2rem] max-w-[42vw] select-none opacity-[0.85] theme-invert-logo"
                 draggable={false}
               />
-              <div className="space-y-1.5 select-none">
-                <div className="text-[15px] font-medium text-text-primary tracking-wide">
-                  Machi
+              <div className="space-y-2 select-none">
+                <div className="text-[22px] font-semibold text-text-primary tracking-[0.24em]">
+                  {APP_DISPLAY_NAME.toUpperCase()}
                 </div>
-                <div className="text-text-faint tracking-wider uppercase text-[11px]">
-                  Orchestrated by Machi · Executed by AgenticX
+                <div className="text-text-faint tracking-[0.22em] uppercase text-[12px]">
+                  {APP_TAGLINE}
                 </div>
               </div>
               {isAutomationTaskPane && automationTaskErrorHint ? (
@@ -6729,7 +7522,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
             onRemove={(id) => removePendingMessage(paneId, id)}
             onSendNow={sendQueuedMessageNow}
           />
-          {(sessionExecutionState === "running" || stallState === "stall" || sessionUnattended) && (
+          {(sessionExecutionState === "running" || stallState === "stall" || sessionUnattended || budgetExceededInfo) && (
             <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] text-text-muted">
               <span className="rounded-full bg-surface-panel/75 px-2 py-0.5">
                 {currentModelLabel}
@@ -6743,10 +7536,25 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                   ? ` · ${lastToolProgress.name}${lastToolProgress.sec > 0 ? ` ${lastToolProgress.sec}s` : ""}`
                   : ""}
               </span>
-              {sessionUnattended && unattendedGlobalEnabled ? (
-                <span className="rounded-full bg-violet-500/10 px-2 py-0.5 text-violet-200">
-                  无人值守 · 续跑 {autoNudgeCount}/{unattendedMaxContinuations}
+              {contextLoopStats ? (
+                <span className="rounded-full bg-surface-panel/75 px-2 py-0.5 text-text-muted">
+                  context: {(contextLoopStats.tool_result_tokens_session / 1000).toFixed(1)}k ·{" "}
+                  {contextLoopStats.round} rounds · {contextLoopStats.archived_tool_calls} archived
                 </span>
+              ) : null}
+              {sessionUnattended && unattendedGlobalEnabled && !budgetExceededInfo ? (
+                <span className="rounded-full bg-violet-500/10 px-2 py-0.5 text-violet-200">
+                  无人值守 · 续跑 {unattendedContinueCount}/{unattendedMaxContinuations}
+                </span>
+              ) : null}
+              {budgetExceededInfo ? (
+                <button
+                  type="button"
+                  onClick={() => resumeInNewSessionRef.current()}
+                  className="rounded-full bg-rose-500/15 px-2 py-0.5 text-rose-200 transition hover:bg-rose-500/25"
+                >
+                  已达预算上限 · 续跑无效
+                </button>
               ) : null}
               {unattendedGlobalEnabled ? (
                 <button
@@ -6766,7 +7574,16 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               ) : null}
             </div>
           )}
+          {voiceInputHint ? (
+            <div className="mb-2 flex justify-center px-1">
+              <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-3 py-1 text-[12px] text-amber-100/95">
+                <span aria-hidden>!</span>
+                <span className="truncate">{voiceInputHint}</span>
+              </span>
+            </div>
+          ) : null}
           <div className="agx-pane-composer-body agx-theme-focus-ring relative rounded-2xl border border-transparent bg-surface-card transition-all duration-300 ease-out">
+            <VoicePttOverlay text={pttLiveText} visible={pttActive} />
             {visibleAttachmentEntries.length > 0 ? (
               <div className="flex flex-wrap gap-2 px-3 pt-3">
                 {visibleAttachmentEntries.map(([key, file]) => (
@@ -6817,6 +7634,41 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
               onBlur={() => {
                 imeComposingRef.current = false;
               }}
+              onDragOver={(e) => {
+                if (e.dataTransfer?.types?.includes("Files")) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  try {
+                    e.dataTransfer.dropEffect = "copy";
+                  } catch {}
+                }
+              }}
+              onDragEnter={(e) => {
+                if (e.dataTransfer?.types?.includes("Files")) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                }
+              }}
+              onDrop={(e) => {
+                const dt = e.dataTransfer;
+                if (!dt) return;
+                const files = dt.files ? Array.from(dt.files) : [];
+                if (files.length === 0) return;
+                e.preventDefault();
+                e.stopPropagation();
+                let showedVisionToast = false;
+                for (const file of files) {
+                  if (isImageFile(file) && isKnownNonVisionChatModel(chatProvider, chatModel)) {
+                    if (!showedVisionToast) {
+                      setAttachToastOpen(true);
+                      showedVisionToast = true;
+                    }
+                    continue;
+                  }
+                  const key = `${file.name}:${file.size}:${file.lastModified}`;
+                  parseLocalFile(file, key);
+                }
+              }}
               onPaste={(e) => {
                 const dt = e.clipboardData;
                 const raw = extractClipboardImageFiles(dt);
@@ -6855,8 +7707,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                 const isImeComposing =
                   e.nativeEvent.isComposing ||
                   imeComposingRef.current ||
-                  e.key === "Process" ||
-                  e.keyCode === 229;
+                  (e.key !== "Enter" && (e.key === "Process" || e.keyCode === 229));
                 if (isImeComposing) return;
                 if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") {
                   e.preventDefault();
@@ -7072,6 +7923,7 @@ export function ChatPane({ paneId, focused, onFocus, onOpenConfirm }: Props) {
                    * 后端 `interruptSession` 对任意 session_id 生效。 */
                   streaming={showStopButton}
                   recording={recording}
+                  transcribing={voiceTranscribing}
                   onSend={() => {
                     lastComposerEnterAtRef.current = 0;
                     void sendChat(extractComposerText());

@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
-import { Ban, ChevronDown, ChevronRight, Clock3, Loader2 } from "lucide-react";
+import { Ban, ChevronDown, ChevronRight, Loader2 } from "lucide-react";
+import { AutomationTaskIcon } from "./icons/AutomationTaskIcon";
 import { useAppStore, type Avatar, type GroupChat } from "../store";
+import { APP_DISPLAY_NAME, APP_VERSION, META_AGENT_DISPLAY_NAME } from "../constants/branding";
 import { DEFAULT_META_AVATAR_URL } from "../constants/meta-avatar";
 import { getRememberedSessionForAvatar } from "../utils/avatar-last-session";
 import { avatarBgClass, avatarDotColor, groupColorByIndex } from "../utils/avatar-color";
@@ -12,8 +14,13 @@ import {
 } from "../utils/group-editor-utils";
 import { AvatarCreateDialog } from "./AvatarCreateDialog";
 import { AvatarSettingsPanel } from "./AvatarSettingsPanel";
+import { GlobalSearchTrigger } from "./global-search/GlobalSearchTrigger";
 import { TaskFormPanel } from "./automation/TaskFormPanel";
 import type { AutomationTask } from "./automation/types";
+import {
+  loadSidebarSectionHeights,
+  saveSidebarSectionHeights,
+} from "../utils/sidebar-section-heights";
 
 function avatarInitials(name: string): string {
   const parts = name.trim().split(/\s+/);
@@ -72,6 +79,12 @@ type ContextMenuState =
 type GroupContextMenuState = { x: number; y: number; groupId: string } | null;
 type AutomationContextMenuState = { x: number; y: number; taskId: string } | null;
 
+/** Fixed width so meta-agent (1 item) and avatar (3 items) menus align visually. */
+const SIDEBAR_CONTEXT_MENU_CLASS =
+  "fixed z-[200] w-[120px] rounded-md border border-border bg-surface-base py-1 shadow-2xl";
+const SIDEBAR_CONTEXT_MENU_ITEM_CLASS =
+  "w-full whitespace-nowrap px-3 py-1.5 text-left text-[13px] transition";
+
 export function AvatarSidebar() {
   const avatars = useAppStore((s) => s.avatars);
   const activeAvatarId = useAppStore((s) => s.activeAvatarId);
@@ -104,12 +117,36 @@ export function AvatarSidebar() {
   // restart), we render a loading hint instead of "暂无分身/群聊", which
   // would otherwise be misleading because we simply haven't fetched yet
   // (issue #11).
+  const corePreloadAttempted = useAppStore((s) => s.corePreloadAttempted);
+  const avatarCount = useAppStore((s) => s.avatars.length);
   const [avatarsLoaded, setAvatarsLoaded] = useState(false);
   const [groupsLoaded, setGroupsLoaded] = useState(false);
-  const [avatarsHeight, setAvatarsHeight] = useState<number | null>(null);
-  const [groupsHeight, setGroupsHeight] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (corePreloadAttempted || avatarCount > 0) {
+      setAvatarsLoaded(true);
+    }
+  }, [corePreloadAttempted, avatarCount]);
+  const [avatarsHeight, setAvatarsHeight] = useState<number | null>(() => {
+    const saved = loadSidebarSectionHeights();
+    return saved.avatarsHeight;
+  });
+  const [groupsHeight, setGroupsHeight] = useState<number | null>(() => {
+    const saved = loadSidebarSectionHeights();
+    return saved.groupsHeight;
+  });
   const avatarsContainerRef = useRef<HTMLDivElement>(null);
   const groupsContainerRef = useRef<HTMLDivElement>(null);
+  const avatarsHeightRef = useRef<number | null>(avatarsHeight);
+  const groupsHeightRef = useRef<number | null>(groupsHeight);
+
+  useEffect(() => {
+    avatarsHeightRef.current = avatarsHeight;
+  }, [avatarsHeight]);
+
+  useEffect(() => {
+    groupsHeightRef.current = groupsHeight;
+  }, [groupsHeight]);
   const [settingsPanel, setSettingsPanel] = useState<
     | { mode: "avatar"; avatarId: string }
     | { mode: "machi" }
@@ -449,7 +486,7 @@ export function AvatarSidebar() {
           });
           return;
         }
-        // Lazy session: first real send in ChatPane will createSession (align Machi meta pane).
+        // Lazy session: first real send in ChatPane will createSession (align Near meta pane).
       } finally {
         openingRef.current = false;
       }
@@ -631,7 +668,7 @@ export function AvatarSidebar() {
     const groupPanes = panes.filter((item) => item.avatarId === groupPaneId);
     const nonGroupPanes = panes.filter((item) => item.avatarId !== groupPaneId);
     if (nonGroupPanes.length === 0 && groupPanes.length > 0) {
-      addPane(null, "Machi", "");
+      addPane(null, META_AGENT_DISPLAY_NAME, "");
     }
     groupPanes.forEach((item) => removePane(item.id));
     setGroups(groups.filter((g) => g.id !== group.id));
@@ -672,6 +709,10 @@ export function AvatarSidebar() {
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      saveSidebarSectionHeights({
+        avatarsHeight: avatarsHeightRef.current,
+        groupsHeight: groupsHeightRef.current,
+      });
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -695,6 +736,10 @@ export function AvatarSidebar() {
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
+      saveSidebarSectionHeights({
+        avatarsHeight: avatarsHeightRef.current,
+        groupsHeight: groupsHeightRef.current,
+      });
     };
     window.addEventListener("mousemove", onMove);
     window.addEventListener("mouseup", onUp);
@@ -705,14 +750,13 @@ export function AvatarSidebar() {
       <aside className="flex h-full w-full flex-col bg-surface-sidebar">
         {/* macOS traffic-light safe zone */}
         <div className="drag-region h-[38px] shrink-0" />
-        {/* Meta-Agent entry */}
+        {/* Meta-Agent entry — WorkBuddy-style brand row */}
         <button
-          className={`mx-2 mb-1 flex items-center gap-2.5 rounded-[10px] px-2.5 py-2 text-left transition-all ${
-            activeAvatarId === null
-              ? "bg-surface-card text-text-strong"
-              : "text-text-muted hover:bg-surface-card hover:text-text-strong"
+          className={`group flex w-full items-center gap-2.5 px-4 py-2.5 text-left transition-colors ${
+            activeAvatarId === null ? "" : "hover:bg-surface-hover"
           }`}
-          onClick={() => void openOrFocusPane(null, "Machi")}
+          aria-current={activeAvatarId === null ? "page" : undefined}
+          onClick={() => void openOrFocusPane(null, META_AGENT_DISPLAY_NAME)}
           onContextMenu={(e) => {
             e.preventDefault();
             setGroupContextMenu(null);
@@ -722,14 +766,20 @@ export function AvatarSidebar() {
         >
           <img
             src={metaAvatarUrl.trim() || DEFAULT_META_AVATAR_URL}
-            alt="Machi"
-            className="h-8 w-8 shrink-0 rounded-full object-cover"
+            alt={APP_DISPLAY_NAME}
+            className="h-8 w-8 shrink-0 rounded-[7px] object-cover"
           />
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-[15px] font-medium">Machi</div>
-            {/* <div className="truncate text-xs text-text-faint">全局调度</div> */}
+          <div className="flex min-w-0 items-baseline gap-1.5">
+            <span className="truncate text-[20px] font-bold leading-none text-text-strong">
+              {APP_DISPLAY_NAME}
+            </span>
+            <span className="shrink-0 text-[11px] font-medium leading-none text-text-faint">
+              {APP_VERSION}
+            </span>
           </div>
         </button>
+
+        <GlobalSearchTrigger />
 
         <div className="flex-1 flex flex-col py-1 min-h-0">
           {/* Avatar list */}
@@ -769,7 +819,9 @@ export function AvatarSidebar() {
                 </div>
               )}
               {sortedAvatars.map((avatar) => {
-                const isActive = activeAvatarId === avatar.id;
+                const isActive = panes.some(
+                  (item) => item.avatarId === avatar.id && item.id === activePaneId,
+                );
                 const hasPane = panes.some((item) => item.avatarId === avatar.id);
                 return (
                   <div key={avatar.id}>
@@ -973,7 +1025,7 @@ export function AvatarSidebar() {
                           {isRunning ? (
                             <Loader2 className="h-4 w-4 animate-spin text-emerald-400" />
                           ) : (
-                            <Clock3 className="h-4 w-4 text-text-muted" />
+                            <AutomationTaskIcon className="h-4 w-4 text-text-muted" />
                           )}
                           {hasPane && (
                             <span className="absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-surface-sidebar bg-emerald-500" />
@@ -1015,7 +1067,7 @@ export function AvatarSidebar() {
       {contextMenu && (
         <div
           ref={menuRef}
-          className="fixed z-50 min-w-[120px] rounded-lg border border-border bg-surface-panel py-1 shadow-xl"
+          className={SIDEBAR_CONTEXT_MENU_CLASS}
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
           {[
@@ -1036,7 +1088,7 @@ export function AvatarSidebar() {
           ].map((item) => (
             <button
               key={item.id}
-              className={`w-full px-3 py-2 text-left text-[13px] transition ${
+              className={`${SIDEBAR_CONTEXT_MENU_ITEM_CLASS} ${
                 item.id === "delete"
                   ? "text-rose-400 hover:bg-rose-500/10"
                   : "text-text-muted hover:bg-surface-hover"
@@ -1052,11 +1104,11 @@ export function AvatarSidebar() {
       {groupContextMenu && (
         <div
           ref={groupMenuRef}
-          className="fixed z-50 min-w-[180px] rounded-lg border border-border bg-surface-panel py-1 shadow-xl"
+          className={SIDEBAR_CONTEXT_MENU_CLASS}
           style={{ left: groupContextMenu.x, top: groupContextMenu.y }}
         >
           <button
-            className="w-full px-3 py-2 text-left text-[13px] text-text-muted transition hover:bg-surface-hover"
+            className={`${SIDEBAR_CONTEXT_MENU_ITEM_CLASS} text-text-muted hover:bg-surface-hover`}
             onClick={() => void handleGroupContextAction("view")}
           >
             查看群聊
@@ -1067,12 +1119,12 @@ export function AvatarSidebar() {
       {automationContextMenu && (
         <div
           ref={automationMenuRef}
-          className="fixed z-50 min-w-[120px] rounded-lg border border-border bg-surface-panel py-1 shadow-xl"
+          className={SIDEBAR_CONTEXT_MENU_CLASS}
           style={{ left: automationContextMenu.x, top: automationContextMenu.y }}
         >
           <button
             type="button"
-            className="w-full px-3 py-2 text-left text-[13px] text-text-muted transition hover:bg-surface-hover"
+            className={`${SIDEBAR_CONTEXT_MENU_ITEM_CLASS} text-text-muted hover:bg-surface-hover`}
             onClick={() => {
               const { taskId } = automationContextMenu;
               setAutomationContextMenu(null);

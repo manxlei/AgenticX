@@ -40,6 +40,11 @@ def get_runtime_value(path: str, default: Any) -> Any:
         return default
 
 
+def live_reattach_enabled() -> bool:
+    """When True, chat SSE uses per-session event hub + reattach endpoint."""
+    return bool(get_runtime_value("runtime.live_reattach_enabled", False))
+
+
 def load_unattended_config() -> dict[str, Any]:
     """Load runtime.unattended.* with conservative defaults."""
     enabled = bool(get_runtime_value("runtime.unattended.enabled", False))
@@ -217,9 +222,6 @@ def prepare_continue(
   """
     session = managed.studio_session
     state = (execution_state or getattr(managed, "execution_state", "idle") or "idle").strip()
-
-    if state == "running" and source == "desktop_manual":
-        return False, "", get_continuation_round(session), {}
 
     if not skip_dedupe and should_dedupe_continue(session, reason):
         _log.info("continuation deduped session=%s reason=%s", managed.session_id, reason)

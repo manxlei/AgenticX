@@ -1,10 +1,18 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, type KeyboardEventHandler } from "react";
 import { useAppStore, type Message, type QueuedMessage } from "../store";
-import { getProviderDisplayName } from "../utils/provider-display";
+import { formatModelOptionLabel } from "../utils/model-display";
+import { collectSelectableModelOptions, isModelSelectable } from "../utils/model-options";
 import { SubAgentPanel } from "./SubAgentPanel";
 import { interruptOnInterimResult, interruptTtsOnUserSpeech } from "../voice/interrupt";
 import { speak } from "../voice/tts";
-import { startRecording, stopRecording } from "../voice/stt";
+import {
+  appendDictationText,
+  cancelDictation,
+  startDictation,
+  type SttPhase,
+} from "../voice/stt";
+import { useVoicePushToTalk } from "../hooks/useVoicePushToTalk";
+import { VoicePttOverlay } from "./VoicePttOverlay";
 import { CommandPalette } from "./CommandPalette";
 import { QuickActions } from "./QuickActions";
 import { ShortcutHints } from "./ShortcutHints";
@@ -46,6 +54,14 @@ import { ChatImAvatar, ImBubble } from "./messages/ImBubble";
 import { TerminalLine } from "./messages/TerminalLine";
 import { CleanBlock } from "./messages/CleanBlock";
 import { MessageQueuePanel } from "./messages/MessageQueuePanel";
+import {
+  accumulateReferenceTurn,
+  applyFinalReferencePayload,
+  referenceExtrasFromTurn,
+} from "../utils/search-reference-sse";
+import { mergeSearchedQueries, type SearchReference } from "../types/search-references";
+
+const SEARCH_REFERENCE_TOOLS = new Set(["web_search", "knowledge_search"]);
 const EMPTY_QUEUE: QueuedMessage[] = [];
 
 /** Matches {@link useAppStore.getState().updateMessageByToolCallId} `patch` argument. */
@@ -86,6 +102,9 @@ function formatToolResultMessage(toolNameRaw: unknown, resultRaw: unknown): { co
   const toolName = String(toolNameRaw ?? "tool");
   const resultText = String(resultRaw ?? "");
   if (toolName === "check_resources") {
+    return { content: "", silent: true };
+  }
+  if (SEARCH_REFERENCE_TOOLS.has(toolName)) {
     return { content: "", silent: true };
   }
   if (toolName === "delegate_to_avatar") {
@@ -256,8 +275,7 @@ function ModelBadge({ provider, model }: { provider?: string; model?: string }) 
   const providers = useAppStore((s) => s.settings.providers);
   if (!model) return null;
   const entry = provider ? providers[provider] : undefined;
-  const provLabel = provider ? getProviderDisplayName(provider, entry) : "";
-  const label = provLabel ? `${provLabel}/${model}` : model;
+  const label = provider ? formatModelOptionLabel(provider, model, entry) : model;
   return (
     <span className="mb-1 inline-block rounded bg-surface-card px-1.5 py-0.5 text-[10px] text-text-subtle">
       {label}
@@ -361,6 +379,17 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
   const addSubAgentEvent = useAppStore((s) => s.addSubAgentEvent);
   const setSelectedSubAgent = useAppStore((s) => s.setSelectedSubAgent);
   const [input, setInput] = useState("");
+  const [voiceRecording, setVoiceRecording] = useState(false);
+  const [voiceTranscribing, setVoiceTranscribing] = useState(false);
+  const [voiceInputHint, setVoiceInputHint] = useState("");
+  const dictationSessionRef = useRef<{ stop: () => void; cancel: () => void } | null>(null);
+  useEffect(() => {
+    return () => {
+      dictationSessionRef.current?.cancel();
+      dictationSessionRef.current = null;
+      cancelDictation();
+    };
+  }, []);
   const [streaming, setStreaming] = useState(false);
   const [streamedAssistantText, setStreamedAssistantText] = useState("");
   const [streamingModel, setStreamingModel] = useState<{ provider: string; model: string } | null>(null);
@@ -467,28 +496,17 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
 
   const canSend = useMemo(() => !!(apiBase && sessionId), [apiBase, sessionId]);
 
-  const stallModelOptions = useMemo(() => {
-    const result: { provider: string; model: string; label: string }[] = [];
-    for (const [provName, entry] of Object.entries(settings.providers)) {
-      if (entry.enabled === false) continue;
-      if (!entry.apiKey) continue;
-      const provLabel = getProviderDisplayName(provName, entry);
-      if (entry.models.length > 0) {
-        for (const m of entry.models) {
-          result.push({ provider: provName, model: m, label: `${provLabel}/${m}` });
-        }
-      } else if (entry.model) {
-        result.push({ provider: provName, model: entry.model, label: `${provLabel}/${entry.model}` });
-      }
-    }
-    return result;
-  }, [settings.providers]);
+  const stallModelOptions = useMemo(
+    () => collectSelectableModelOptions(settings.providers),
+    [settings.providers],
+  );
 
   const currentModelLabel = useMemo(() => {
     if (!activeModel) return "未选模型";
     if (!activeProvider) return activeModel;
+    if (!isModelSelectable(activeProvider, activeModel, settings.providers)) return "未选模型";
     const entry = settings.providers[activeProvider];
-    return `${getProviderDisplayName(activeProvider, entry)}/${activeModel}`;
+    return formatModelOptionLabel(activeProvider, activeModel, entry);
   }, [activeModel, activeProvider, settings.providers]);
 
   const showStopButton = shouldShowStopButton({
@@ -989,7 +1007,10 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
     activeRequestIdRef.current = requestId;
     const isCurrentRequest = () => activeRequestIdRef.current === requestId;
     let insertAfterCursor = opts?.insertAfterId;
-    const appendAssistantMessage = (content: string, extras?: Partial<Pick<Message, "suggestedQuestions">>) => {
+    const appendAssistantMessage = (
+      content: string,
+      extras?: Partial<Pick<Message, "suggestedQuestions" | "references" | "searchedQueries">>,
+    ) => {
       if (insertAfterCursor) {
         insertAfterCursor = insertMessageAfter(insertAfterCursor, {
           role: "assistant",
@@ -1084,6 +1105,8 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
       let full = "";
       let cumulativeFull = "";
       let pendingSuggestedQuestions: string[] = [];
+      let pendingReferences: SearchReference[] = [];
+      let pendingSearchedQueries: string[] = [];
       let buffer = "";
       while (true) {
         if (!isCurrentRequest()) return;
@@ -1154,6 +1177,11 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               const toolNameStr = String(payload.data?.name ?? "tool");
               const toolArgs = (payload.data?.arguments ?? payload.data?.args ?? {}) as Record<string, unknown>;
               const toolCallId = String(payload.data?.tool_call_id ?? payload.data?.id ?? "").trim();
+              if (SEARCH_REFERENCE_TOOLS.has(toolNameStr)) {
+                const q = String(toolArgs.query ?? "").trim();
+                if (q) pendingSearchedQueries = mergeSearchedQueries(pendingSearchedQueries, [q]);
+                continue;
+              }
               if (eventAgentId === "meta" && toolNameStr === "cc_bridge_start") {
                 const modeHint = parseCcBridgeModeFromPayload(toolArgs);
                 if (modeHint === "headless") {
@@ -1204,6 +1232,16 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
             }
             if (payload.type === "tool_result") {
               const toolName = payload.data?.name ?? "tool";
+              if (SEARCH_REFERENCE_TOOLS.has(String(toolName))) {
+                const accumulated = accumulateReferenceTurn(
+                  pendingReferences,
+                  pendingSearchedQueries,
+                  payload.data,
+                );
+                pendingReferences = accumulated.references;
+                pendingSearchedQueries = accumulated.queries;
+                continue;
+              }
               let resultObjForCc: Record<string, unknown> | null = null;
               const resultRaw = payload.data?.result;
               if (typeof resultRaw === "string") {
@@ -1301,6 +1339,13 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               pendingSuggestedQuestions = Array.isArray(sqRaw)
                 ? sqRaw.map((x: unknown) => String(x).trim()).filter(Boolean).slice(0, 3)
                 : [];
+              const appliedRefs = applyFinalReferencePayload(
+                pendingReferences,
+                pendingSearchedQueries,
+                payload.data,
+              );
+              pendingReferences = appliedRefs.references;
+              pendingSearchedQueries = appliedRefs.queries;
               const finalText = String(payload.data?.text ?? "");
               if (finalText) {
                 if (finalText.startsWith(cumulativeFull)) {
@@ -1380,7 +1425,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               const count = Number(payload.data?.compacted_count ?? 0) || 0;
               const reactive = Boolean(payload.data?.reactive);
               const note = buildCompactionNoticeText(count, reactive);
-              addMessage("tool", note, eventAgentId || "meta", undefined, undefined, undefined, undefined, {
+              addMessage("tool", note, eventAgentId || "meta", undefined, undefined, undefined, {
                 noticeKind: reactive ? "compaction_reactive" : "compaction_proactive",
               });
             }
@@ -1425,7 +1470,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
                 if (isWarning) {
                   const noticeKind =
                     detector === "compactor_circuit_breaker" ? "compactor_cb" : "budget_compress";
-                  addMessage("tool", errText, "meta", undefined, undefined, undefined, undefined, {
+                  addMessage("tool", errText, "meta", undefined, undefined, undefined, {
                     noticeKind,
                   });
                 } else {
@@ -1444,19 +1489,21 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
       }
 
       const trimmedFull = full.trim();
+      const refExtras = referenceExtrasFromTurn(pendingReferences, pendingSearchedQueries);
       const sugExtras =
         pendingSuggestedQuestions.length > 0
           ? { suggestedQuestions: pendingSuggestedQuestions.slice(0, 3) }
           : undefined;
+      const turnExtras = refExtras || sugExtras ? { ...refExtras, ...sugExtras } : undefined;
       if (isCurrentRequest() && trimmedFull && !isThinkingPlaceholderText(full) && !streamCommittedRef.current) {
         const mid = lastMidStreamAssistantCommitRef.current;
         if (mid !== null && trimmedFull === mid) {
           streamCommittedRef.current = true;
-          if (sugExtras) {
-            mergeLastMessageByRole("assistant", sugExtras);
+          if (turnExtras) {
+            mergeLastMessageByRole("assistant", turnExtras);
           }
         } else {
-          appendAssistantMessage(full, sugExtras);
+          appendAssistantMessage(full, turnExtras);
           streamCommittedRef.current = true;
         }
         void speak(full);
@@ -1627,8 +1674,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
     const isImeComposing =
       event.nativeEvent.isComposing ||
       imeComposingRef.current ||
-      event.key === "Process" ||
-      event.keyCode === 229;
+      (event.key !== "Enter" && (event.key === "Process" || event.keyCode === 229));
     if (isImeComposing) return;
     if (!isLite && event.altKey && event.key === "ArrowUp") {
       event.preventDefault();
@@ -1733,13 +1779,68 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
     }
   };
 
+  const applyVoiceTranscript = useCallback((text: string) => {
+    setInput((prev) => appendDictationText(prev, text));
+  }, []);
+
+  const { pttActive, pttLiveText, cancelPtt } = useVoicePushToTalk({
+    enabled: canSend,
+    composerEmpty: !input.trim(),
+    apiBase,
+    apiToken,
+    language: "zh-CN",
+    onCommit: applyVoiceTranscript,
+    onError: (message) => setVoiceInputHint(message),
+  });
+
+  useEffect(() => () => cancelPtt(), [cancelPtt]);
+
   const onMicClick = () => {
+    cancelPtt();
+    if (voiceRecording || voiceTranscribing) {
+      dictationSessionRef.current?.stop();
+      dictationSessionRef.current = null;
+      setVoiceRecording(false);
+      setVoiceTranscribing(false);
+      setStatus("idle");
+      return;
+    }
+    setVoiceInputHint("");
     setStatus("listening");
-    void startRecording(
-      async (text) => { setStatus("processing"); await send(text); },
-      (interim) => interruptOnInterimResult(interim)
-    );
-    window.setTimeout(() => { stopRecording(); }, 5000);
+    void startDictation(
+      {
+        onPhase: (phase: SttPhase) => {
+          setVoiceRecording(phase === "recording");
+          setVoiceTranscribing(phase === "transcribing");
+          if (phase === "transcribing") setStatus("processing");
+          if (phase === "idle") setStatus("idle");
+          if (phase === "recording") setStatus("listening");
+        },
+        onInterim: (interim) => {
+          if (!interim.trim()) return;
+          setVoiceInputHint(interim.trim());
+          interruptOnInterimResult(interim);
+        },
+        onFinal: (text) => {
+          dictationSessionRef.current = null;
+          setVoiceRecording(false);
+          setVoiceTranscribing(false);
+          setVoiceInputHint("");
+          setStatus("idle");
+          setInput((prev) => appendDictationText(prev, text));
+        },
+        onError: (message) => {
+          setVoiceInputHint(message);
+        },
+      },
+      {
+        apiBase,
+        apiToken,
+        language: "zh",
+      }
+    ).then((session) => {
+      dictationSessionRef.current = session;
+    });
   };
 
   return (
@@ -1826,7 +1927,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
               onClick={async () => {
                 const r = await window.agenticxDesktop.confirmDialog({
                   title: "退出官网账号",
-                  message: "确定要清除本机已保存的 Machi 官网登录状态吗？",
+                  message: "确定要清除本机已保存的 Near 官网登录状态吗？",
                   confirmText: "退出",
                   destructive: true,
                 });
@@ -1870,7 +1971,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
                   setLoginBusy(false);
                 }
               }}
-              title="登录 Machi 官网账号"
+              title="登录 Near 官网账号"
             >
               {loginBusy ? "登录中..." : "登录"}
             </button>
@@ -1898,7 +1999,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
                     <MessageRenderer
                       message={m}
                       assistantBadge={!isLite && m.role === "assistant" ? <ModelBadge provider={m.provider} model={m.model} /> : undefined}
-                      assistantName="Machi"
+                      assistantName="Near"
                       imAssistantVisual={
                         m.role === "assistant" && reactWorkCol ? "compact-inline" : "default"
                       }
@@ -1966,7 +2067,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
                 <ImBubble
                   message={{ id: "__stream__", role: "assistant", content: streamedAssistantText || "" }}
                   badge={!isLite && streamingModel ? <ModelBadge provider={streamingModel.provider} model={streamingModel.model} /> : undefined}
-                  assistantName="Machi"
+                  assistantName="Near"
                 />
               )}
             </div>
@@ -2030,7 +2131,17 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
           ) : null}
         </div>
         {isLite && <QuickActions onSend={(text) => { void send(text); }} />}
-        <div className="mx-auto flex max-w-2xl items-end gap-2">
+        {voiceInputHint ? (
+          <div className="mx-auto mb-2 flex max-w-2xl justify-center">
+            <span className="inline-flex max-w-full items-center gap-1.5 rounded-full border border-amber-500/35 bg-amber-500/10 px-3 py-1 text-[12px] text-amber-100/95">
+              <span aria-hidden>!</span>
+              <span className="truncate">{voiceInputHint}</span>
+            </span>
+          </div>
+        ) : null}
+        <div className="relative mx-auto max-w-2xl">
+          <VoicePttOverlay text={pttLiveText} visible={pttActive} />
+          <div className="flex items-end gap-2">
           <textarea
             value={input}
             onChange={(e) => {
@@ -2062,7 +2173,13 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
             disabled={!canSend && !streaming}
             className="min-h-[40px] max-h-[120px] flex-1 resize-none rounded-xl border border-border bg-surface-card px-3 py-2.5 text-sm outline-none transition placeholder:text-text-faint focus:border-cyan-500/50"
           />
-          <button className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border text-lg transition hover:bg-surface-hover" onClick={onMicClick} title="语音输入">🎙</button>
+          <button
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-border text-lg transition hover:bg-surface-hover"
+            onClick={onMicClick}
+            title={voiceTranscribing ? "识别中" : voiceRecording ? "停止录音" : "语音输入"}
+          >
+            {voiceTranscribing ? "…" : "🎙"}
+          </button>
           {showStopButton ? (
             <div className="flex items-center gap-2">
               <button className="flex h-10 shrink-0 items-center rounded-xl bg-rose-500 px-4 text-sm font-medium text-white transition hover:bg-rose-400" onClick={stopStreaming}>中断</button>
@@ -2088,6 +2205,7 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
           ) : (
             <button className="flex h-10 shrink-0 items-center rounded-xl bg-btnPrimary px-4 text-sm font-medium text-btnPrimary-text transition hover:bg-btnPrimary-hover disabled:opacity-40 disabled:hover:bg-btnPrimary" disabled={!canSend || !input.trim()} onClick={() => void send()}>发送</button>
           )}
+          </div>
         </div>
         {!isLite && <ShortcutHints />}
       </div>
@@ -2130,20 +2248,10 @@ export function ChatView({ onOpenConfirm, mode = "pro" }: Props) {
 
 function ModelPickerDropdown({ onSelect, onClose }: { onSelect: (p: string, m: string) => void; onClose: () => void }) {
   const settings = useAppStore((s) => s.settings);
-  const options = useMemo(() => {
-    const result: { provider: string; model: string; label: string }[] = [];
-    for (const [provName, entry] of Object.entries(settings.providers)) {
-      if (entry.enabled === false) continue;
-      if (!entry.apiKey) continue;
-      const provLabel = getProviderDisplayName(provName, entry);
-      if (entry.models.length > 0) {
-        for (const m of entry.models) result.push({ provider: provName, model: m, label: `${provLabel} | ${m}` });
-      } else if (entry.model) {
-        result.push({ provider: provName, model: entry.model, label: `${provLabel} | ${entry.model}` });
-      }
-    }
-    return result;
-  }, [settings.providers]);
+  const options = useMemo(
+    () => collectSelectableModelOptions(settings.providers, " | "),
+    [settings.providers],
+  );
 
   if (options.length === 0) {
     return <div className="px-3 py-4 text-center text-xs text-text-faint">请先在设置中配置 Provider 和模型</div>;

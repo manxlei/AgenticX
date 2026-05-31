@@ -1,5 +1,43 @@
 import { contextBridge, ipcRenderer } from "electron";
 
+function parseArgvFlag(prefix: string, fallback: string): string {
+  for (const arg of process.argv) {
+    if (arg.startsWith(prefix)) {
+      try {
+        return decodeURIComponent(arg.slice(prefix.length));
+      } catch {
+        return arg.slice(prefix.length);
+      }
+    }
+  }
+  return fallback;
+}
+
+const injectedBackendScope = parseArgvFlag("--agx-backend-scope=", "local");
+const injectedConnectionMode =
+  parseArgvFlag("--agx-connection-mode=", "local") === "remote" ? "remote" : "local";
+
+/** Live query from main process (argv injection can be stale if window opened early). */
+function queryBackendScopeSync(): string {
+  try {
+    const v = ipcRenderer.sendSync("agx-query-backend-scope") as unknown;
+    if (typeof v === "string" && v.trim()) return v.trim();
+  } catch {
+    // fall through
+  }
+  return injectedBackendScope;
+}
+
+function queryConnectionModeSync(): "local" | "remote" {
+  try {
+    const v = ipcRenderer.sendSync("agx-query-connection-mode") as unknown;
+    if (v === "remote" || v === "local") return v;
+  } catch {
+    // fall through
+  }
+  return injectedConnectionMode;
+}
+
 async function desktopApiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   try {
     const base = (await ipcRenderer.invoke("get-api-base")) as string;
@@ -22,13 +60,21 @@ async function desktopApiFetch<T>(path: string, init?: RequestInit): Promise<T> 
 }
 
 contextBridge.exposeInMainWorld("agenticxDesktop", {
-  version: "0.2.0",
+  version: "0.2.4",
   getApiBase: async (): Promise<string> => ipcRenderer.invoke("get-api-base"),
   getApiAuthToken: async (): Promise<string> => ipcRenderer.invoke("get-api-auth-token"),
   platform: async (): Promise<string> => ipcRenderer.invoke("get-platform"),
   syncTitleBarOverlay: async (theme: "dark" | "light" | "dim") =>
     ipcRenderer.invoke("sync-title-bar-overlay", theme) as Promise<{ ok: boolean; skipped?: boolean; error?: string }>,
   getConnectionMode: async (): Promise<"local" | "remote"> => ipcRenderer.invoke("get-connection-mode"),
+  getBackendScopeSync: (): string => queryBackendScopeSync(),
+  getConnectionModeSync: (): "local" | "remote" => queryConnectionModeSync(),
+  onConnectionModeChanged: (callback: () => void): (() => void) => {
+    const handler = () => callback();
+    ipcRenderer.on("agx-connection-mode-changed", handler);
+    return () => ipcRenderer.removeListener("agx-connection-mode-changed", handler);
+  },
+  appRelaunch: async (): Promise<{ ok: boolean }> => ipcRenderer.invoke("app-relaunch"),
   focusModeEnter: async (): Promise<{ ok: boolean; alreadyActive?: boolean; error?: string }> =>
     ipcRenderer.invoke("focus-mode-enter"),
   focusModeExit: async (): Promise<{ ok: boolean; alreadyInactive?: boolean; error?: string }> =>
@@ -449,6 +495,15 @@ contextBridge.exposeInMainWorld("agenticxDesktop", {
   loadSkillDetail: async (args: { name: string }) => ipcRenderer.invoke("load-skill-detail", args),
   refreshSkills: async () => ipcRenderer.invoke("refresh-skills"),
   getSkillSettings: async () => ipcRenderer.invoke("get-skill-settings"),
+  getGuardSettings: async () => ipcRenderer.invoke("get-guard-settings"),
+  putGuardSettings: async (payload: { version?: number; scan_mode?: string; llm_verify?: boolean }) =>
+    ipcRenderer.invoke("put-guard-settings", payload),
+  guardScanSkill: async (payload: {
+    skill_path?: string;
+    markdown?: string;
+    skill_name?: string;
+    mode?: string;
+  }) => ipcRenderer.invoke("guard-scan-skill", payload),
   putSkillSettings: async (payload: {
     presetPaths: Array<{ id: string; enabled: boolean }>;
     customPaths: string[];
@@ -540,4 +595,55 @@ contextBridge.exposeInMainWorld("agenticxDesktop", {
     ipcRenderer.on("agx-account-login-timeout", handler);
     return () => ipcRenderer.removeListener("agx-account-login-timeout", handler);
   },
+  updateSplashStage: async (stage: string) =>
+    ipcRenderer.invoke("update-splash-stage", stage) as Promise<{ ok: boolean }>,
+  getSplashPreloadEnabled: async () =>
+    ipcRenderer.invoke("get-splash-preload-enabled") as Promise<{ enabled: boolean }>,
+  preloadCoreData: async (payload: { avatarId?: string; sessionId?: string }) =>
+    ipcRenderer.invoke("preload-core-data", payload),
+  startupRendererReady: async (): Promise<{ ok: boolean; duplicate?: boolean }> =>
+    ipcRenderer.invoke("startup:renderer-ready") as Promise<{ ok: boolean; duplicate?: boolean }>,
+
+  systemSearch: async (payload: {
+    query: string;
+    category?: "all" | "documents" | "applications" | "images" | "folders" | "videos";
+  }) =>
+    ipcRenderer.invoke("system-search", payload) as Promise<{
+      ok: boolean;
+      items: Array<{
+        path: string;
+        name: string;
+        ext: string;
+        kind: "folder" | "document" | "application" | "image" | "video" | "other";
+        size: number;
+        mtime: number;
+      }>;
+      error?: string;
+      warning?: string;
+      timedOut?: boolean;
+      engine?: string;
+    }>,
+  systemSearchPreview: async (filePath: string) =>
+    ipcRenderer.invoke("system-search:preview", filePath) as Promise<{
+      ok: boolean;
+      kind: "text" | "image" | "metadata";
+      content?: string;
+      fileUrl?: string;
+      truncated?: boolean;
+      error?: string;
+    }>,
+  systemSearchOpen: async (filePath: string) =>
+    ipcRenderer.invoke("system-search:open", filePath) as Promise<{ ok: boolean; error?: string }>,
+  systemSearchReveal: async (filePath: string) =>
+    ipcRenderer.invoke("system-search:reveal", filePath) as Promise<{ ok: boolean; error?: string }>,
+  systemSearchGetInfo: async (filePath: string) =>
+    ipcRenderer.invoke("system-search:get-info", filePath) as Promise<{ ok: boolean; error?: string }>,
+  systemSearchOpenWith: async (filePath: string) =>
+    ipcRenderer.invoke("system-search:open-with", filePath) as Promise<{
+      ok: boolean;
+      hint?: string;
+      error?: string;
+    }>,
+  openExternal: async (url: string) =>
+    ipcRenderer.invoke("open-external", url) as Promise<{ ok: boolean; error?: string }>,
 });

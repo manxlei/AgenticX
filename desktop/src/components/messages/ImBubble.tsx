@@ -1,27 +1,24 @@
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, MouseEvent as ReactMouseEvent } from "react";
-import ReactMarkdown from "react-markdown";
-import { Bookmark, Copy, LayoutList, Quote, RotateCcw, Share2, Pencil, X, ArrowUp, ArrowRight } from "lucide-react";
+import { Bookmark, Copy, LayoutList, Quote, RotateCcw, Share2, Pencil, X, ArrowUp, ArrowRight, AlertTriangle } from "lucide-react";
 import type { Message, MessageAttachment } from "../../store";
 import { AttachmentCard } from "./AttachmentCard";
 import { ReasoningBlock } from "./ReasoningBlock";
+import { ReferencesCard } from "./ReferencesCard";
 import { parseReasoningContent } from "./reasoning-parser";
 import { getContainedSelectionText } from "../../utils/favorite-selection";
 import { HoverTip } from "../ds/HoverTip";
-import {
-  chatMarkdownComponents,
-  chatRehypePlugins,
-  chatRemarkPlugins,
-  chatUrlTransform,
-  normalizeChatMarkdownContent,
-  MarkdownContext,
-} from "./markdown-components";
+import { CitationMarkdownBody } from "./CitationMarkdownBody";
 import { renderUserMessageInlineBody } from "./user-message-inline";
 import {
   getAssistantActionStyle,
   getAssistantTextClassName,
   getAssistantTextStyle,
 } from "./im-layout";
+import { resolveMetaDisplayName } from "../../utils/display-name";
+import { avatarBgClass } from "../../utils/avatar-color";
+import { shouldShowAssistantIconButtons } from "../../utils/im-bubble-actions";
+import { MessageTimestamp } from "./MessageTimestamp";
 
 type Props = {
   message: Message;
@@ -51,6 +48,20 @@ type Props = {
   onFollowupClick?: (text: string) => void;
   /** Suppress in-bubble chips; used when parent renders them outside a unified ReAct container. */
   omitSuggestedQuestions?: boolean;
+  /** Render-only hint when this assistant reply was cut off by session token budget. */
+  budgetIncompleteHint?: boolean;
+  /** Group chat: show avatar + display name on every bubble (WeChat-style). */
+  showSenderIdentity?: boolean;
+  /** Group member avatars use rounded square; user stays circular. */
+  senderAvatarVariant?: "circle" | "rounded-square";
+  /** Fallback tint when no imageUrl (avatar id for color hash). */
+  senderAvatarId?: string;
+  /** When true, suppress action buttons on the last assistant bubble while the session is busy/stalled. */
+  sessionBusy?: boolean;
+  isLastAssistantInPane?: boolean;
+  /** Replace animated streaming dots with a stalled indicator on the __stream__ placeholder. */
+  streamStalled?: boolean;
+  streamStalledSeconds?: number;
 };
 
 /** Cycling 1→3 dots for group-chat typing rows (name shown in header only). */
@@ -66,6 +77,19 @@ function TypingDots() {
     <span className="inline-block min-w-[1em] tabular-nums" aria-hidden>
       {".".repeat(count)}
     </span>
+  );
+}
+
+function StalledStreamIndicator({ silentSeconds }: { silentSeconds: number }) {
+  return (
+    <div
+      className="inline-flex items-center gap-1.5 py-1.5 text-xs text-amber-300/90"
+      aria-live="polite"
+      aria-label="任务已停滞"
+    >
+      <AlertTriangle className="h-3.5 w-3.5 shrink-0" aria-hidden />
+      <span>{silentSeconds > 0 ? `已停滞 ${silentSeconds}s` : "已停滞"}</span>
+    </div>
   );
 }
 
@@ -94,24 +118,40 @@ function StreamingDots() {
 }
 
 /** Shared with ReAct block shell so top-of-stack avatar matches IM bubbles. */
-export function ChatImAvatar({ label, imageUrl }: { label: string; imageUrl?: string }) {
+export function ChatImAvatar({
+  label,
+  imageUrl,
+  variant = "circle",
+  avatarId,
+}: {
+  label: string;
+  imageUrl?: string;
+  variant?: "circle" | "rounded-square";
+  avatarId?: string;
+}) {
   const char = label.slice(0, 1) || "?";
+  const rounded = variant === "rounded-square" ? "rounded-[6px]" : "rounded-full";
   if (imageUrl) {
     return (
       <img
         src={imageUrl}
         alt={label}
-        className="h-8 w-8 shrink-0 rounded-full object-cover"
+        className={`h-8 w-8 shrink-0 object-cover ${rounded}`}
       />
     );
   }
+  const tintClass = avatarId ? `${avatarBgClass(avatarId)} text-white` : "";
   return (
     <div
-      className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-bold"
-      style={{
-        background: "var(--chat-im-avatar-bg)",
-        color: "var(--text-strong)",
-      }}
+      className={`flex h-8 w-8 shrink-0 items-center justify-center text-xs font-bold ${rounded} ${tintClass}`}
+      style={
+        avatarId
+          ? undefined
+          : {
+              background: "var(--chat-im-avatar-bg)",
+              color: "var(--text-strong)",
+            }
+      }
     >
       {char}
     </div>
@@ -139,6 +179,14 @@ export function ImBubble({
   noBubbleBorder = false,
   onFollowupClick,
   omitSuggestedQuestions = false,
+  budgetIncompleteHint = false,
+  showSenderIdentity = false,
+  senderAvatarVariant = "circle",
+  senderAvatarId,
+  sessionBusy = false,
+  isLastAssistantInPane = false,
+  streamStalled = false,
+  streamStalledSeconds = 0,
 }: Props) {
   const isUser = message.role === "user";
   const displayName = isUser ? (userName || "我") : (assistantName || "AI");
@@ -155,6 +203,7 @@ export function ImBubble({
     (assistantVisual === "compact-inline" || assistantVisual === "compact-inline-with-actions") &&
     !isGroupTyping &&
     !isMetaPendingWork;
+  const showIdentityRail = showSenderIdentity && !compactAssistant;
   const hideActions = compactAssistant && assistantVisual !== "compact-inline-with-actions";
   const parsed = !isUser ? parseReasoningContent(message.content) : null;
   const hasThinkTag = parsed?.hasReasoningTag ?? false;
@@ -218,7 +267,7 @@ export function ImBubble({
   const formatForwardSender = (sender?: string) => {
     const raw = String(sender || "").trim();
     if (!raw) return "AI";
-    return raw.toLowerCase() === "meta" ? "Machi" : raw;
+    return resolveMetaDisplayName(raw.toLowerCase() === "meta" ? null : raw);
   };
 
   useEffect(() => {
@@ -263,18 +312,30 @@ export function ImBubble({
     : undefined;
   const assistantActionStyle = getAssistantActionStyle({ inReActRow: compactAssistant });
   const USER_BUBBLE_GUTTER_PX = 14;
+  const groupIdentityLayout = showIdentityRail && !compactAssistant;
+  const headerBadge = groupIdentityLayout && !isUser ? badge : null;
+  const contentBadge = headerBadge ? null : badge;
+  const userBubbleGutterPx = groupIdentityLayout && isUser ? 0 : USER_BUBBLE_GUTTER_PX;
   const userBubbleStyle = isUser
     ? {
         ...bubbleStyle,
-        marginLeft: USER_BUBBLE_GUTTER_PX,
-        marginRight: USER_BUBBLE_GUTTER_PX,
+        marginLeft: userBubbleGutterPx,
+        marginRight: userBubbleGutterPx,
         width: "fit-content",
-        maxWidth: `calc(100% - ${USER_BUBBLE_GUTTER_PX * 2}px)`,
+        maxWidth: `calc(100% - ${userBubbleGutterPx * 2}px)`,
       }
     : bubbleStyle;
 
-  const assistantIconButtons =
-    !hideActions && !isUser ? (
+  const assistantIconButtons = shouldShowAssistantIconButtons({
+    hideActions,
+    isUser,
+    isStreaming,
+    isGroupTyping,
+    isMetaPendingWork,
+    hasBody,
+    sessionBusy,
+    isLastAssistantInPane,
+  }) ? (
       <>
         <HoverTip label="复制">
           <button
@@ -346,7 +407,9 @@ export function ImBubble({
 
   return (
     <div
-      className={`group relative flex min-w-0 items-start gap-2${isStreaming ? " !mt-1" : ""}`}
+      className={`group relative flex min-w-0 items-start gap-2${isStreaming ? " !mt-1" : ""}${
+        groupIdentityLayout && !isUser ? " pl-4" : ""
+      }`}
       onContextMenu={openContextMenu}
     >
       {selectable ? (
@@ -365,9 +428,30 @@ export function ImBubble({
           </svg>
         </button>
       ) : null}
+      {groupIdentityLayout && isUser ? <div className="min-h-px min-w-0 flex-1" aria-hidden /> : null}
+      {groupIdentityLayout && !isUser ? (
+        <div className="mt-0.5 shrink-0 self-start">
+          <ChatImAvatar
+            label={displayName}
+            imageUrl={avatarUrl}
+            variant={senderAvatarVariant}
+            avatarId={senderAvatarId}
+          />
+        </div>
+      ) : null}
       <div
-        className={`flex min-w-0 flex-1 flex-col ${isUser ? "items-end" : "items-start"}`}
+        className={`flex min-w-0 flex-col ${isUser ? "items-end" : "items-start"}${groupIdentityLayout && isUser ? " w-auto max-w-[calc(100%-2.5rem)] shrink-0" : " min-w-0 flex-1"}`}
       >
+        {groupIdentityLayout && isUser ? (
+          <div className="mb-1 w-full min-w-0 text-right">
+            <span className="max-w-full truncate text-[12px] font-medium text-text-muted">{displayName}</span>
+          </div>
+        ) : groupIdentityLayout && !isUser ? (
+          <div className="mb-0.5 flex max-w-full items-center gap-2 px-3 text-[12px] font-medium text-text-muted">
+            <span className="min-w-0 truncate">{displayName}</span>
+            {headerBadge ? <span className="shrink-0">{headerBadge}</span> : null}
+          </div>
+        ) : null}
         {isEditing ? (
           <div className="flex w-full max-w-3xl items-end gap-2">
             <button
@@ -430,7 +514,11 @@ export function ImBubble({
                   ? "relative min-w-0 w-full overflow-x-auto overflow-y-visible px-3 py-0 text-[var(--agx-chat-im-body-font-size)] leading-relaxed"
                   : isUser
                     ? "agx-im-user-bubble relative min-w-0 w-fit max-w-full overflow-x-auto overflow-y-visible rounded-xl border px-3 py-3 text-[var(--agx-chat-im-body-font-size)] leading-relaxed rounded-tr-[4px]"
-                    : "relative min-w-0 w-full overflow-x-auto overflow-y-visible px-3 pt-3 pb-0 text-[var(--agx-chat-im-body-font-size)] leading-relaxed"
+                    : groupIdentityLayout
+                      ? "relative min-w-0 w-full overflow-x-auto overflow-y-visible px-3 pt-1 pb-0 text-[var(--agx-chat-im-body-font-size)] leading-relaxed"
+                      : (message.references?.length ?? 0) > 0
+                        ? "relative min-w-0 w-full overflow-x-auto overflow-y-visible px-3 pt-1 pb-0 text-[var(--agx-chat-im-body-font-size)] leading-relaxed"
+                        : "relative min-w-0 w-full overflow-x-auto overflow-y-visible px-3 pt-3 pb-0 text-[var(--agx-chat-im-body-font-size)] leading-relaxed"
               }
               style={compactAssistant && noBubbleBorder ? undefined : userBubbleStyle}
             >
@@ -445,7 +533,7 @@ export function ImBubble({
                 </div>
               ) : null}
               <div ref={msgContentRef} className="msg-content min-w-0 break-words">
-                {badge}
+                {contentBadge}
                 {message.quotedContent ? (
                   <div className="mb-2 rounded-md border border-border bg-surface-panel/70 px-2 py-1 text-xs text-text-faint">
                     <span className="line-clamp-2">{message.quotedContent}</span>
@@ -481,6 +569,12 @@ export function ImBubble({
                   </span>
                 ) : (
                   <>
+                    {!isUser && (message.references?.length ?? 0) > 0 ? (
+                      <ReferencesCard
+                        references={message.references ?? []}
+                        searchedQueries={message.searchedQueries}
+                      />
+                    ) : null}
                     {!isUser && isStreaming && hasThinkTag ? (
                       <ReasoningBlock
                         text={parsed?.reasoning ?? ""}
@@ -490,7 +584,11 @@ export function ImBubble({
                       <ReasoningBlock text={parsed.reasoning} />
                     ) : null}
                     {!isUser && isStreaming && !hasBody && (!hasThinkTag || reasoningClosed) ? (
-                      <StreamingDots />
+                      streamStalled ? (
+                        <StalledStreamIndicator silentSeconds={streamStalledSeconds} />
+                      ) : (
+                        <StreamingDots />
+                      )
                     ) : null}
                     {hasBody ? (
                       isUser ? (
@@ -499,21 +597,12 @@ export function ImBubble({
                         </div>
                       ) : (
                         <div className={assistantTextClassName} style={assistantTextStyle}>
-                          <MarkdownContext.Provider
-                            value={{
-                              isStreaming,
-                              onQuoteText: (text) => onQuoteMessage?.(message, text),
-                            }}
-                          >
-                            <ReactMarkdown
-                              remarkPlugins={chatRemarkPlugins}
-                              rehypePlugins={chatRehypePlugins}
-                              components={chatMarkdownComponents}
-                              urlTransform={chatUrlTransform}
-                            >
-                              {normalizeChatMarkdownContent(bodyText, { isStreaming })}
-                            </ReactMarkdown>
-                          </MarkdownContext.Provider>
+                          <CitationMarkdownBody
+                            content={bodyText}
+                            references={message.references}
+                            isStreaming={isStreaming}
+                            onQuoteText={(text) => onQuoteMessage?.(message, text)}
+                          />
                         </div>
                       )
                     ) : null}
@@ -521,10 +610,16 @@ export function ImBubble({
                 )}
               </div>
             </div>
+            {budgetIncompleteHint ? (
+              <p className="-mt-0.5 mb-1 px-3 text-[11px] leading-relaxed text-text-faint">
+                此回复因会话预算上限被截停，未完成
+              </p>
+            ) : null}
             {showAssistantFollowups && assistantIconButtons ? (
               <div className="mb-6 -mt-0.5 flex min-w-0 flex-col gap-2 self-stretch">
                 <div className="flex w-fit flex-wrap items-center gap-0.5 text-text-faint" style={assistantActionStyle}>
                   {assistantIconButtons}
+                  <MessageTimestamp ts={message.timestamp} align="left" />
                 </div>
                 <div className="flex min-w-0 flex-col items-start gap-1.5 self-stretch" style={assistantActionStyle}>{assistantFollowupChipButtons}</div>
               </div>
@@ -533,6 +628,7 @@ export function ImBubble({
             ) : null}
             {hideActions ? null : isUser ? (
               <div className="mt-0.5 flex w-full flex-wrap items-center justify-end gap-0.5 pb-0 leading-none pr-2 text-text-faint">
+                <MessageTimestamp ts={message.timestamp} align="right" />
                 <HoverTip label="复制">
                   <button
                     type="button"
@@ -596,18 +692,31 @@ export function ImBubble({
                   </button>
                 </HoverTip>
               </div>
-            ) : showAssistantFollowups ? null : (
+            ) : showAssistantFollowups || !assistantIconButtons ? null : (
               <div className="-mt-0.5 mb-6 min-w-0 self-stretch">
-                <div className="flex w-fit max-w-full flex-wrap items-center gap-0.5 text-text-faint" style={assistantActionStyle}>{assistantIconButtons}</div>
+                <div className="flex w-fit max-w-full flex-wrap items-center gap-0.5 text-text-faint" style={assistantActionStyle}>
+                  {assistantIconButtons}
+                  <MessageTimestamp ts={message.timestamp} align="left" />
+                </div>
               </div>
             )}
           </>
         )}
       </div>
+      {groupIdentityLayout && isUser ? (
+        <div className="mt-0.5 shrink-0 self-start">
+          <ChatImAvatar
+            label={displayName}
+            imageUrl={avatarUrl}
+            variant={senderAvatarVariant}
+            avatarId={senderAvatarId ?? "user-self"}
+          />
+        </div>
+      ) : null}
       {menuOpen && !compactAssistant ? (
         <div
           ref={menuRef}
-          className="fixed z-[80] w-36 rounded-lg border border-border bg-surface-panel p-1 shadow-2xl"
+          className="fixed z-[80] w-36 rounded-lg border border-border bg-surface-base p-1 shadow-2xl"
           style={{ left: menuPos.x, top: menuPos.y }}
         >
           <button

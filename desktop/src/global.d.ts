@@ -234,6 +234,34 @@ type SkillSettingsResult = {
   disabled_skills?: string[];
   error?: string;
 };
+type GuardSettingsResult = {
+  ok: boolean;
+  version?: number;
+  scan_mode?: string;
+  llm_verify?: boolean;
+  scan_timeout_seconds?: number;
+  error?: string;
+};
+type GuardScanResult = {
+  ok: boolean;
+  scan?: {
+    skill_name?: string;
+    verdict?: string;
+    score?: number;
+    grade?: string;
+    tier?: string;
+    pattern_set_version?: string;
+    findings?: Array<{
+      pattern_name: string;
+      severity?: string;
+      matched_text?: string;
+      file_path?: string;
+      line_number?: number;
+      category?: string;
+    }>;
+  };
+  error?: string;
+};
 type SkillDetailResult = {
   ok: boolean;
   name: string;
@@ -328,10 +356,18 @@ declare global {
       platform: () => Promise<string>;
       syncTitleBarOverlay: (theme: "dark" | "light" | "dim") => Promise<{ ok: boolean; skipped?: boolean; error?: string }>;
       getConnectionMode: () => Promise<"local" | "remote">;
+      getBackendScopeSync: () => string;
+      getConnectionModeSync: () => "local" | "remote";
+      onConnectionModeChanged: (callback: () => void) => () => void;
+      appRelaunch: () => Promise<{ ok: boolean }>;
       focusModeEnter: () => Promise<{ ok: boolean; alreadyActive?: boolean; error?: string }>;
       focusModeExit: () => Promise<{ ok: boolean; alreadyInactive?: boolean; error?: string }>;
       loadRemoteServer: () => Promise<{ enabled: boolean; url: string; token: string }>;
-      saveRemoteServer: (payload: { enabled: boolean; url: string; token: string }) => Promise<{ ok: boolean; restart_required?: boolean }>;
+      saveRemoteServer: (payload: { enabled: boolean; url: string; token: string }) => Promise<{
+        ok: boolean;
+        restart_required?: boolean;
+        mode_changed?: boolean;
+      }>;
       testRemoteServer: (payload: { url: string; token: string }) => Promise<{ ok: boolean; status?: number; error?: string }>;
       loadGatewayIm: () => Promise<{
         enabled: boolean;
@@ -453,12 +489,17 @@ declare global {
         unattended_stall_continue_after_seconds?: number;
         unattended_auto_resume_exhausted?: boolean;
         unattended_auto_resume_interrupted?: boolean;
+        max_tokens_per_session?: number;
+        max_tokens_per_turn?: number;
+        live_reattach_enabled?: boolean;
         error?: string;
       }>;
       saveRuntimeConfig: (payload: {
         max_tool_rounds?: number;
         auto_resume_on_exhaustion?: boolean;
         max_auto_resumes?: number;
+        max_tokens_per_session?: number;
+        max_tokens_per_turn?: number;
         stall_detect_silence_seconds?: number;
         stall_auto_nudge_enabled?: boolean;
         stall_auto_nudge_after_seconds?: number;
@@ -578,6 +619,29 @@ declare global {
       }>;
       onAgxAccountChanged: (cb: (payload: { email: string; displayName: string }) => void) => () => void;
       onAgxAccountLoginTimeout: (cb: () => void) => () => void;
+      updateSplashStage: (
+        stage:
+          | "initializing"
+          | "backend-starting"
+          | "backend-waiting"
+          | "pinging-remote"
+          | "loading-ui"
+          | "preloading-core"
+          | "restoring-session"
+          | "ready"
+      ) => Promise<{ ok: boolean }>;
+      getSplashPreloadEnabled: () => Promise<{ enabled: boolean }>;
+      preloadCoreData: (payload: {
+        avatarId?: string;
+        sessionId?: string;
+      }) => Promise<{
+        ok: boolean;
+        avatars: { ok: boolean; avatars: AvatarItem[] };
+        sessions: { ok: boolean; sessions: Array<Record<string, unknown>> };
+        taskspaces: { ok: boolean; workspaces: TaskspaceItem[]; error?: string };
+        messages: { ok: boolean; messages: Array<Record<string, unknown>>; error?: string };
+      }>;
+      startupRendererReady: () => Promise<{ ok: boolean; duplicate?: boolean }>;
       loadMetaSoul: () => Promise<{ ok: boolean; content: string; error?: string }>;
       saveMetaSoul: (payload: { content: string }) => Promise<{ ok: boolean; error?: string }>;
       loadAvatarSoul: (payload: { avatarId: string }) => Promise<{ ok: boolean; content: string; error?: string }>;
@@ -775,6 +839,18 @@ declare global {
       loadSkillDetail: (args: { name: string }) => Promise<SkillDetailResult>;
       refreshSkills: () => Promise<SkillRefreshResult>;
       getSkillSettings: () => Promise<SkillSettingsResult>;
+      getGuardSettings: () => Promise<GuardSettingsResult>;
+      putGuardSettings: (payload: {
+        version?: number;
+        scan_mode?: string;
+        llm_verify?: boolean;
+      }) => Promise<GuardSettingsResult>;
+      guardScanSkill: (payload: {
+        skill_path?: string;
+        markdown?: string;
+        skill_name?: string;
+        mode?: string;
+      }) => Promise<GuardScanResult>;
       putSkillSettings: (payload: {
         presetPaths: Array<{ id: string; enabled: boolean }>;
         customPaths: string[];
@@ -822,6 +898,42 @@ declare global {
       terminalKill: (id: string) => Promise<{ ok: boolean }>;
       onTerminalData: (cb: (payload: { id: string; data: string }) => void) => () => void;
       onTerminalExit: (cb: (payload: { id: string }) => void) => () => void;
+
+      systemSearch: (payload: {
+        query: string;
+        category?: "all" | "documents" | "applications" | "images" | "folders" | "videos";
+      }) => Promise<{
+        ok: boolean;
+        items: Array<{
+          path: string;
+          name: string;
+          ext: string;
+          kind: "folder" | "document" | "application" | "image" | "video" | "other";
+          size: number;
+          mtime: number;
+        }>;
+        error?: string;
+        warning?: string;
+        timedOut?: boolean;
+        engine?: string;
+      }>;
+      systemSearchPreview: (filePath: string) => Promise<{
+        ok: boolean;
+        kind: "text" | "image" | "metadata";
+        content?: string;
+        fileUrl?: string;
+        truncated?: boolean;
+        error?: string;
+      }>;
+      systemSearchOpen: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
+      systemSearchReveal: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
+      systemSearchGetInfo: (filePath: string) => Promise<{ ok: boolean; error?: string }>;
+      systemSearchOpenWith: (filePath: string) => Promise<{
+        ok: boolean;
+        hint?: string;
+        error?: string;
+      }>;
+      openExternal: (url: string) => Promise<{ ok: boolean; error?: string }>;
     };
   }
 }

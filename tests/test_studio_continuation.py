@@ -9,12 +9,14 @@ from __future__ import annotations
 from agenticx.runtime.stall_policy import (
     StallEvaluateInput,
     evaluate_stall_for_continuation,
+    message_looks_like_assistant_final,
     parse_todo_tool_content,
     should_trigger_incomplete_end_stall,
     todos_completed,
 )
 from agenticx.studio.continuation import (
     format_continuation_notice,
+    mark_continue_attempt,
     prepare_continue,
     resolve_continuation_prompt,
     should_dedupe_continue,
@@ -61,6 +63,35 @@ def test_prepare_continue_appends_tool_notice() -> None:
     assert len(managed.studio_session.chat_history) == 1
 
 
+def test_prepare_continue_manual_running_skip_dedupe() -> None:
+    managed = _FakeManaged()
+    managed.execution_state = "running"
+    ok, prompt, round_n, notice = prepare_continue(
+        managed,
+        reason="stall",
+        source="desktop_manual",
+        execution_state="interrupted",
+        skip_dedupe=True,
+    )
+    assert ok is True
+    assert round_n == 1
+    assert prompt
+    assert notice.get("role") == "tool"
+
+
+def test_prepare_continue_manual_dedupe_bypass() -> None:
+    managed = _FakeManaged()
+    mark_continue_attempt(managed.studio_session, "stall", "desktop_manual")
+    ok, _prompt, _round_n, _notice = prepare_continue(
+        managed,
+        reason="stall",
+        source="desktop_manual",
+        execution_state="interrupted",
+        skip_dedupe=True,
+    )
+    assert ok is True
+
+
 def test_dedupe_continue_within_window() -> None:
     session = _FakeSession()
     should_dedupe_continue(session, "stall")
@@ -88,6 +119,30 @@ def test_channel_c_stall() -> None:
         last_message={"role": "tool", "content": "running..."},
         grace_elapsed_sec=10.0,
     )
+
+
+def test_colon_ending_not_assistant_final() -> None:
+    assert message_looks_like_assistant_final(
+        {"role": "assistant", "content": "继续安装 diagnose:"},
+    ) is False
+    assert message_looks_like_assistant_final(
+        {"role": "assistant", "content": "安装已完成。"},
+    ) is True
+
+
+def test_supervisor_auto_continue_colon_ending_idle() -> None:
+    result = evaluate_stall_for_continuation(
+        StallEvaluateInput(
+            execution_state="idle",
+            sse_active=False,
+            silent_seconds=130.0,
+            stall_detect_silence_seconds=90,
+            last_message={"role": "assistant", "content": "继续安装 diagnose:"},
+            session_age_seconds=30.0,
+        )
+    )
+    assert result.should_auto_continue is True
+    assert result.continue_reason == "stall"
 
 
 def test_supervisor_auto_continue_interrupted() -> None:

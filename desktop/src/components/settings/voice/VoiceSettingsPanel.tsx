@@ -1,6 +1,15 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from "react";
+import { Eye, EyeOff } from "lucide-react";
 import { Panel } from "../../ds/Panel";
+import { META_AGENT_DISPLAY_NAME } from "../../../constants/branding";
 import { useAppStore } from "../../../store";
+import {
+  formatPttShortcutLabel,
+  listPttShortcutPresets,
+  loadPttShortcutPreset,
+  savePttShortcutPreset,
+  type PttShortcutPreset,
+} from "../../../voice/ptt-config";
 
 type VoiceForm = {
   provider: string;
@@ -46,7 +55,7 @@ function emptyVoiceForm(): VoiceForm {
       resource_id: "volc.speech.dialog",
       voice_type: "zh_female_vv_jupiter_bigtts",
       model: "1.2.1.1",
-      bot_name: "Machi",
+      bot_name: META_AGENT_DISPLAY_NAME,
       system_role: "",
       speaking_style: "",
     },
@@ -95,6 +104,39 @@ export type VoiceSettingsPanelHandle = {
   persist: () => Promise<{ ok: boolean; error?: string }>;
 };
 
+function SecretInput({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  placeholder?: string;
+}) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="relative mt-1">
+      <input
+        type={visible ? "text" : "password"}
+        autoComplete="off"
+        placeholder={placeholder}
+        className="w-full rounded-md border border-border bg-surface-panel py-1 pl-2 pr-11 text-sm text-text-primary"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+      <button
+        type="button"
+        tabIndex={-1}
+        aria-label={visible ? "隐藏密钥" : "显示密钥"}
+        className="absolute right-1.5 top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-md text-text-faint transition hover:bg-surface-hover hover:text-text-subtle"
+        onClick={() => setVisible((v) => !v)}
+      >
+        {visible ? <EyeOff className="h-4 w-4 shrink-0" aria-hidden /> : <Eye className="h-4 w-4 shrink-0" aria-hidden />}
+      </button>
+    </div>
+  );
+}
+
 /** 灵巧模式语音：Realtime Provider、凭证与麦克风选择（服务端落盘 ~/.agenticx/config.yaml `voice:`） */
 export const VoiceSettingsPanel = forwardRef<VoiceSettingsPanelHandle>(function VoiceSettingsPanel(_props, ref) {
   const apiBase = useAppStore((s) => s.apiBase);
@@ -108,6 +150,7 @@ export const VoiceSettingsPanel = forwardRef<VoiceSettingsPanelHandle>(function 
   const [probeMsg, setProbeMsg] = useState("");
   const [draft, setDraft] = useState<VoiceForm>(emptyVoiceForm);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [pttShortcutPreset, setPttShortcutPreset] = useState<PttShortcutPreset>(() => loadPttShortcutPreset());
   const draftRef = useRef(draft);
   const loadingRef = useRef(loading);
   draftRef.current = draft;
@@ -180,7 +223,7 @@ export const VoiceSettingsPanel = forwardRef<VoiceSettingsPanelHandle>(function 
           resource_id: String(db.resource_id || "volc.speech.dialog"),
           voice_type: String(db.voice_type || "zh_female_vv_jupiter_bigtts"),
           model: String(db.model || "1.2.1.1"),
-          bot_name: String(db.bot_name || "Machi"),
+          bot_name: String(db.bot_name || META_AGENT_DISPLAY_NAME),
           system_role: String(db.system_role || ""),
           speaking_style: String(db.speaking_style || ""),
         },
@@ -295,7 +338,7 @@ export const VoiceSettingsPanel = forwardRef<VoiceSettingsPanelHandle>(function 
   return (
     <Panel title="语音">
       <p className="mb-4 text-[11px] leading-relaxed text-text-faint">
-        灵巧模式胶囊走 Meta-Agent（Machi）：对话轮次归档到当前元智能体会话，`metadata.source = voice-focus`。
+        灵巧模式胶囊走 Meta-Agent（Near）：对话轮次归档到当前元智能体会话，`metadata.source = voice-focus`。
         实时链路按使用量计费——OpenAI Realtime 与豆包/火山均需自备账号与密钥。国内调用 OpenAI 需自行配置可访问代理的{" "}
         <code className="text-text-subtle">base_url</code>。请使用窗口<strong>底部</strong>的「保存」将本页写入{" "}
         <code className="text-text-subtle">~/.agenticx/config.yaml</code>（本页不再提供重复保存按钮）。
@@ -379,17 +422,42 @@ export const VoiceSettingsPanel = forwardRef<VoiceSettingsPanelHandle>(function 
           </button>
         </div>
 
+        <fieldset className="space-y-2 rounded-md border border-border p-3">
+          <legend className="px-1 text-xs text-text-subtle">聊天输入 · 按住说话</legend>
+          <label className="block text-sm text-text-primary">
+            快捷键
+            <select
+              className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1.5 text-sm text-text-primary"
+              value={pttShortcutPreset}
+              onChange={(e) => {
+                const preset = e.target.value as PttShortcutPreset;
+                setPttShortcutPreset(preset);
+                savePttShortcutPreset(preset);
+              }}
+            >
+              {listPttShortcutPresets().map((preset) => (
+                <option key={preset} value={preset}>
+                  {formatPttShortcutLabel(preset)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="text-[11px] leading-relaxed text-text-faint">
+            按住快捷键开始说话，松开后把识别文字写入输入框草稿（不自动发送）。默认{" "}
+            <span className="text-text-muted">{formatPttShortcutLabel("ctrl+space")}</span>
+            。macOS 的 Fn 键无法在应用内捕获，请改用组合键。
+          </p>
+        </fieldset>
+
         {draft.provider === "openai_realtime" ? (
           <div className="space-y-2 border-t border-border pt-3">
             <div className="text-text-subtle text-xs uppercase tracking-wide">OpenAI Realtime</div>
             <label className="block">
               API Key
-              <input
-                type="password"
+              <SecretInput
                 placeholder="仅在覆盖时填写；留空保持不变"
-                className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1 text-sm text-text-primary"
                 value={draft.openai_realtime.api_key}
-                onChange={(e) => setDraft((d) => ({ ...d, openai_realtime: { ...d.openai_realtime, api_key: e.target.value } }))}
+                onChange={(api_key) => setDraft((d) => ({ ...d, openai_realtime: { ...d.openai_realtime, api_key } }))}
               />
             </label>
             <label className="block">
@@ -434,9 +502,9 @@ export const VoiceSettingsPanel = forwardRef<VoiceSettingsPanelHandle>(function 
         ) : (
           <div className="space-y-2 border-t border-border pt-3">
             <div className="text-text-subtle text-xs uppercase tracking-wide">豆包 / 火山</div>
-            <div className="rounded-md border border-yellow-600/40 bg-yellow-500/10 px-3 py-2 text-xs text-yellow-300">
+            <p className="text-xs text-amber-500">
               豆包模式下，语音采集走实时链路，工具执行（含 MCP/CLI）由本地 Meta 运行时桥接处理；若系统语音不可用，将仅返回文本结果。
-            </div>
+            </p>
             <label className="block">
               App ID
               <input
@@ -452,30 +520,26 @@ export const VoiceSettingsPanel = forwardRef<VoiceSettingsPanelHandle>(function 
             </label>
             <label className="block">
               Access Key
-              <input
-                type="password"
+              <SecretInput
                 placeholder="仅在覆盖时填写"
-                className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1 text-sm text-text-primary"
                 value={draft.doubao_realtime.access_key}
-                onChange={(e) =>
+                onChange={(access_key) =>
                   setDraft((d) => ({
                     ...d,
-                    doubao_realtime: { ...d.doubao_realtime, access_key: e.target.value },
+                    doubao_realtime: { ...d.doubao_realtime, access_key },
                   }))
                 }
               />
             </label>
             <label className="block">
               Secret Key（可选）
-              <input
-                type="password"
+              <SecretInput
                 placeholder="部分账号需要填写"
-                className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1 text-sm text-text-primary"
                 value={draft.doubao_realtime.secret_key}
-                onChange={(e) =>
+                onChange={(secret_key) =>
                   setDraft((d) => ({
                     ...d,
-                    doubao_realtime: { ...d.doubao_realtime, secret_key: e.target.value },
+                    doubao_realtime: { ...d.doubao_realtime, secret_key },
                   }))
                 }
               />
@@ -543,7 +607,7 @@ export const VoiceSettingsPanel = forwardRef<VoiceSettingsPanelHandle>(function 
               Bot Name（角色称呼，仅 O 版本生效，≤20 字）
               <input
                 maxLength={20}
-                placeholder="Machi"
+                placeholder="Near"
                 className="mt-1 w-full rounded-md border border-border bg-surface-panel px-2 py-1 text-sm text-text-primary"
                 value={draft.doubao_realtime.bot_name}
                 onChange={(e) =>

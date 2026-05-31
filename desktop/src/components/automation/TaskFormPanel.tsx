@@ -4,7 +4,7 @@ import { FrequencyPicker } from "./FrequencyPicker";
 import type { AutomationTask, AutomationFrequency } from "./types";
 import { deleteAutomationTaskWithConfirm } from "../../utils/automation-delete";
 import { useAppStore } from "../../store";
-import { getProviderDisplayName } from "../../utils/provider-display";
+import { collectSelectableModelOptions, isModelSelectable } from "../../utils/model-options";
 
 function encodeLlm(provider: string, model: string): string {
   return `${provider}:${model}`;
@@ -59,21 +59,18 @@ export function TaskFormPanel({ initial, onSave, onCancel, onAfterDelete }: Prop
   });
 
   const llmOptions = useMemo(() => {
-    const result: { value: string; label: string }[] = [];
-    for (const [provName, entry] of Object.entries(settings.providers)) {
-      if (entry.enabled === false) continue;
-      if (!entry.apiKey) continue;
-      const provLabel = getProviderDisplayName(provName, entry);
-      if (entry.models.length > 0) {
-        for (const m of entry.models) {
-          result.push({ value: encodeLlm(provName, m), label: `${provLabel}/${m}` });
-        }
-      } else if (entry.model) {
-        result.push({ value: encodeLlm(provName, entry.model), label: `${provLabel}/${entry.model}` });
-      }
-    }
-    return result;
+    return collectSelectableModelOptions(settings.providers).map((row) => ({
+      value: encodeLlm(row.provider, row.model),
+      label: row.label,
+    }));
   }, [settings.providers]);
+
+  useEffect(() => {
+    const decoded = decodeLlm(llmValue.trim());
+    if (!decoded) return;
+    if (isModelSelectable(decoded.provider, decoded.model, settings.providers)) return;
+    setLlmValue("");
+  }, [llmValue, settings.providers]);
 
   const pickWorkspaceFolder = useCallback(async () => {
     setWsHint("");
@@ -316,7 +313,7 @@ export function TaskFormPanel({ initial, onSave, onCancel, onAfterDelete }: Prop
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
               rows={4}
-              placeholder="描述 Machi 应该执行的任务..."
+              placeholder="描述 Near 应该执行的任务..."
               className="mt-1 w-full resize-y rounded-md border border-border bg-surface-card px-3 py-2 text-sm text-text-primary placeholder:text-text-faint focus:border-text-subtle focus:outline-none"
             />
           </label>

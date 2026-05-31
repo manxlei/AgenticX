@@ -1,4 +1,4 @@
-import { PanelRightClose, ListChecks, MessageSquareMore, Smartphone } from "lucide-react";
+import { ChevronRight, PanelRightClose, ListChecks, MessageSquareMore, Smartphone } from "lucide-react";
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useAppStore, type ChatPane, type Message } from "../store";
@@ -7,6 +7,13 @@ import { mapLoadedSessionMessage, type LoadedSessionMessage } from "../utils/ses
 import { getVisibleBoundSession, isSessionVisibleInPane } from "../utils/session-history-logic";
 import { clearPaneLazyInheritParent, markPaneAwaitingFreshSession } from "../utils/pane-fresh-session";
 import { FeishuBadge } from "./FeishuBadge";
+import { META_AGENT_DISPLAY_NAME } from "../constants/branding";
+import { resolveMetaDisplayName } from "../utils/display-name";
+import { avatarPreloadKey } from "../utils/splash-preload-core";
+import { FitText } from "./ui/FitText";
+
+/** Cursor-style per-group pagination: show this many rows per group, "... More" reveals another page. */
+const HISTORY_GROUP_PAGE_SIZE = 6;
 
 function timeAgo(ts: number): string {
   const diff = Date.now() / 1000 - ts;
@@ -43,12 +50,43 @@ type SessionContextMenu = {
   item: SessionRow;
 };
 
+type HistoryGroupKey =
+  | "pinned"
+  | "today"
+  | "yesterday"
+  | "previous7Days"
+  | "previous30Days"
+  | "older"
+  | "archived";
+
 type GroupedSessions = {
   pinned: SessionRow[];
   today: SessionRow[];
+  yesterday: SessionRow[];
   previous7Days: SessionRow[];
+  previous30Days: SessionRow[];
   older: SessionRow[];
+  archived: SessionRow[];
 };
+
+function sortRowsByActivityDesc(rows: SessionRow[]): SessionRow[] {
+  return [...rows].sort(
+    (a, b) => getSessionActivityTimestamp(b) - getSessionActivityTimestamp(a)
+  );
+}
+
+function resolveGroupVisibleCount(
+  groupKey: string,
+  itemCount: number,
+  searchActive: boolean,
+  visibleCounts: Record<string, number>
+): number {
+  if (searchActive || itemCount <= 0) return itemCount;
+  const expanded = visibleCounts[groupKey];
+  const page =
+    typeof expanded === "number" && expanded > 0 ? expanded : HISTORY_GROUP_PAGE_SIZE;
+  return Math.min(itemCount, page);
+}
 
 function getSessionCreatedTimestamp(row: SessionRow): number {
   const created = Number(row.created_at ?? 0);
@@ -58,10 +96,17 @@ function getSessionCreatedTimestamp(row: SessionRow): number {
   return 0;
 }
 
+/** Last activity time — used for Today / Previous 7 days grouping and list ordering. */
+function getSessionActivityTimestamp(row: SessionRow): number {
+  const updated = Number(row.updated_at ?? 0);
+  if (Number.isFinite(updated) && updated > 0) return updated;
+  return getSessionCreatedTimestamp(row);
+}
+
 function sortSessionRows(rows: SessionRow[]): SessionRow[] {
   return [...rows].sort((a, b) => {
     if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-    const tsDiff = getSessionCreatedTimestamp(b) - getSessionCreatedTimestamp(a);
+    const tsDiff = getSessionActivityTimestamp(b) - getSessionActivityTimestamp(a);
     if (tsDiff !== 0) return tsDiff;
     return b.session_id.localeCompare(a.session_id);
   });
@@ -170,6 +215,13 @@ function buildHighlightTermsFromQuery(query: string): string[] {
   return Array.from(terms);
 }
 
+function isSessionIdOnlyHistoryLabel(item: SessionRow): boolean {
+  const raw = (item.session_name || "").trim();
+  if (raw && !isPlaceholderSessionTitle(raw)) return false;
+  const label = sessionHistoryLabel(item);
+  return /^·[0-9a-f]{6,8}$/i.test(label.trim());
+}
+
 function normalizeSessionRows(input: unknown): SessionRow[] {
   if (!Array.isArray(input)) return [];
   const rows: SessionRow[] = [];
@@ -188,7 +240,7 @@ function normalizeSessionRows(input: unknown): SessionRow[] {
       avatar_id: avatarId,
       avatar_name: avatarName,
       session_name: sessionName,
-      updated_at: Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : Date.now() / 1000,
+      updated_at: Number.isFinite(updatedAtRaw) && updatedAtRaw > 0 ? updatedAtRaw : 0,
       created_at: Number.isFinite(createdAtRaw) && createdAtRaw > 0 ? createdAtRaw : undefined,
       pinned: Boolean(row.pinned),
       archived: Boolean(row.archived),
@@ -209,12 +261,34 @@ function normalizeSessionRows(input: unknown): SessionRow[] {
 
 export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onClose, tintColor }: Props) {
   const sessionCatalogRevision = useAppStore((s) => s.sessionCatalogRevision);
+  const sessionHistoryHints = useAppStore((s) => s.sessionHistoryHints);
+  const clearSessionHistoryHint = useAppStore((s) => s.clearSessionHistoryHint);
   const setPaneSessionId = useAppStore((s) => s.setPaneSessionId);
   const setPaneSessionMode = useAppStore((s) => s.setPaneSessionMode);
   const setPaneMessages = useAppStore((s) => s.setPaneMessages);
+  const setPaneLoadingMessages = useAppStore((s) => s.setPaneLoadingMessages);
+  const getCachedSessionMessages = useAppStore((s) => s.getCachedSessionMessages);
+  const cacheSessionMessages = useAppStore((s) => s.cacheSessionMessages);
+  const dropCachedSessionMessages = useAppStore((s) => s.dropCachedSessionMessages);
   const setPaneHistorySearchTerms = useAppStore((s) => s.setPaneHistorySearchTerms);
   const addPane = useAppStore((s) => s.addPane);
-  const [sessions, setSessions] = useState<SessionRow[]>([]);
+  const corePreloadAttempted = useAppStore((s) => s.corePreloadAttempted);
+  const preloadedSessionsKey = avatarPreloadKey(pane.avatarId ?? null);
+  const preloadedSessionsRaw = useAppStore(
+    (s) => s.preloadedSessionsByAvatarKey[preloadedSessionsKey]
+  );
+
+  const initialSessionsFromPreload = (): SessionRow[] => {
+    if (!corePreloadAttempted || preloadedSessionsRaw === undefined) return [];
+    return normalizeSessionRows(preloadedSessionsRaw).filter((row) =>
+      isSessionVisibleInPane(row, pane.avatarId ?? null)
+    );
+  };
+
+  const [sessionsLoadAttempted, setSessionsLoadAttempted] = useState(
+    () => corePreloadAttempted && preloadedSessionsRaw !== undefined
+  );
+  const [sessions, setSessions] = useState<SessionRow[]>(initialSessionsFromPreload);
   const [feishuBoundSessionId, setFeishuBoundSessionId] = useState<string | null>(null);
   const [wechatBoundSessionId, setWechatBoundSessionId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -225,6 +299,12 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
   const [selectedSessionIds, setSelectedSessionIds] = useState<string[]>([]);
   const [batchDeleting, setBatchDeleting] = useState(false);
   const [sessionSearchQuery, setSessionSearchQuery] = useState("");
+  const [groupVisibleCounts, setGroupVisibleCounts] = useState<Partial<Record<HistoryGroupKey, number>>>(
+    {}
+  );
+  const [collapsedGroups, setCollapsedGroups] = useState<Partial<Record<HistoryGroupKey, boolean>>>(
+    {}
+  );
   const [messageSearchSnippets, setMessageSearchSnippets] = useState<Record<string, string>>({});
   const messageSearchReq = useRef(0);
   const contextMenuRef = useRef<HTMLDivElement | null>(null);
@@ -244,7 +324,7 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
     el.style.top = `${top}px`;
   }, [contextMenu]);
 
-  const title = useMemo(() => (pane.avatarName || "Machi").trim(), [pane.avatarName]);
+  const title = useMemo(() => resolveMetaDisplayName(pane.avatarName), [pane.avatarName]);
 
   const feishuMarkedSessionId = useMemo(() => {
     if (isAutomationPaneAvatarId(pane.avatarId)) return null;
@@ -287,8 +367,30 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
     messageSearchSnippets,
   ]);
 
+  const sessionsWithHints = useMemo(() => {
+    if (Object.keys(sessionHistoryHints).length === 0) return sessionsMatchingSearch;
+    const mapped = sessionsMatchingSearch.map((item) => {
+      const hint = sessionHistoryHints[item.session_id];
+      if (!hint) return item;
+      // Once the backend's updated_at has caught up to this optimistic turn, trust
+      // the real backend execution_state (idle / interrupted / failed). Forcing
+      // "running" purely on hint existence leaves a stranded spinner whenever the
+      // separate clearing pass in loadSessions misses (panel closed, interrupted
+      // turn, pane switch, etc.) — the exact "answered but still spinning" bug.
+      const apiActivity = Number(item.updated_at ?? 0);
+      const backendCaughtUp = apiActivity >= hint.activityAt - 2;
+      return {
+        ...item,
+        updated_at: Math.max(apiActivity, hint.activityAt),
+        execution_state:
+          !backendCaughtUp && hint.running ? "running" : item.execution_state,
+      };
+    });
+    return sortSessionRows(mapped);
+  }, [sessionsMatchingSearch, sessionHistoryHints]);
+
   const groupedSessions = useMemo<GroupedSessions>(() => {
-    const pool = sessionsMatchingSearch;
+    const pool = sessionsWithHints;
     const specialIds = new Set<string>();
     if (feishuMarkedSessionId) specialIds.add(feishuMarkedSessionId);
     if (wechatMarkedSessionId) specialIds.add(wechatMarkedSessionId);
@@ -297,29 +399,49 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
       : pool;
     const now = new Date();
     const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime() / 1000;
+    const startYesterday = startToday - 24 * 3600;
     const startPrevious7Days = startToday - 7 * 24 * 3600;
+    const startPrevious30Days = startToday - 30 * 24 * 3600;
     const grouped: GroupedSessions = {
       pinned: [],
       today: [],
+      yesterday: [],
       previous7Days: [],
+      previous30Days: [],
       older: [],
+      archived: [],
     };
     for (const item of visibleSessions) {
+      if (item.archived) {
+        grouped.archived.push(item);
+        continue;
+      }
       if (item.pinned) {
         grouped.pinned.push(item);
         continue;
       }
-      const createdAt = getSessionCreatedTimestamp(item);
-      if (createdAt >= startToday) {
+      const activityAt = getSessionActivityTimestamp(item);
+      if (activityAt >= startToday) {
         grouped.today.push(item);
-      } else if (createdAt >= startPrevious7Days) {
+      } else if (activityAt >= startYesterday) {
+        grouped.yesterday.push(item);
+      } else if (activityAt >= startPrevious7Days) {
         grouped.previous7Days.push(item);
+      } else if (activityAt >= startPrevious30Days) {
+        grouped.previous30Days.push(item);
       } else {
         grouped.older.push(item);
       }
     }
+    grouped.pinned = sortRowsByActivityDesc(grouped.pinned);
+    grouped.today = sortRowsByActivityDesc(grouped.today);
+    grouped.yesterday = sortRowsByActivityDesc(grouped.yesterday);
+    grouped.previous7Days = sortRowsByActivityDesc(grouped.previous7Days);
+    grouped.previous30Days = sortRowsByActivityDesc(grouped.previous30Days);
+    grouped.older = sortRowsByActivityDesc(grouped.older);
+    grouped.archived = sortRowsByActivityDesc(grouped.archived);
     return grouped;
-  }, [sessionsMatchingSearch, feishuMarkedSessionId, wechatMarkedSessionId]);
+  }, [sessionsWithHints, feishuMarkedSessionId, wechatMarkedSessionId]);
 
   const loadSessions = async () => {
     try {
@@ -330,10 +452,25 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
         isSessionVisibleInPane(row, pane.avatarId ?? null)
       );
       setSessions(rows);
+      setSessionsLoadAttempted(true);
+      for (const row of rows) {
+        const hint = useAppStore.getState().sessionHistoryHints[row.session_id];
+        if (!hint) continue;
+        const apiActivity = Number(row.updated_at ?? 0);
+        const apiRunning = row.execution_state === "running";
+        if (
+          (apiRunning && apiActivity >= hint.activityAt - 2) ||
+          (!apiRunning && apiActivity >= hint.activityAt - 2)
+        ) {
+          clearSessionHistoryHint(row.session_id);
+        }
+      }
       setUnreadSessionIds((prev) => prev.filter((id) => rows.some((r) => r.session_id === id)));
       setSelectedSessionIds((prev) => prev.filter((id) => rows.some((r) => r.session_id === id)));
     } catch (err) {
       console.error("[SessionHistoryPanel] loadSessions error:", err);
+    } finally {
+      setSessionsLoadAttempted(true);
     }
   };
 
@@ -351,7 +488,11 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
   }, [pane.historyOpen, pane.avatarId, pane.sessionId, sessionCatalogRevision]);
 
   useEffect(() => {
-    if (!pane.historyOpen) setSessionSearchQuery("");
+    if (!pane.historyOpen) {
+      setSessionSearchQuery("");
+      setGroupVisibleCounts({});
+      setCollapsedGroups({});
+    }
   }, [pane.historyOpen]);
 
   useEffect(() => {
@@ -514,6 +655,21 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
       return;
     }
 
+    // Fast path: LRU cache hit — render previously-loaded messages instantly,
+    // no IPC, no skeleton (covers the "switch back to a session I just left"
+    // pattern that profile showed at 430ms+ per round trip).
+    const cached = getCachedSessionMessages(sessionId);
+    if (cached && cached.length > 0) {
+      setPaneMessages(targetPaneId, cached);
+      setPaneLoadingMessages(targetPaneId, false);
+      return;
+    }
+
+    // Slow path: clear old messages immediately + show skeleton so users see
+    // an instant switch instead of the previous session's bubbles hanging
+    // around for the full IPC roundtrip.
+    setPaneMessages(targetPaneId, []);
+    setPaneLoadingMessages(targetPaneId, true);
     try {
       const result = await window.agenticxDesktop.loadSessionMessages(sessionId);
       if (result.ok && Array.isArray(result.messages)) {
@@ -521,10 +677,13 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
           mapLoadedSessionMessage(item as LoadedSessionMessage, sessionId, index)
         );
         setPaneMessages(targetPaneId, mapped);
+        cacheSessionMessages(sessionId, mapped);
         return;
       }
     } catch {
       /* fallback below */
+    } finally {
+      setPaneLoadingMessages(targetPaneId, false);
     }
     setPaneMessages(targetPaneId, []);
   };
@@ -554,6 +713,31 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
       if (prev.length >= pool.length && pool.length > 0) return [];
       return pool.map((s) => s.session_id);
     });
+  };
+
+  /**
+   * Clear `pane.sessionId` on any *non-current* pane that still references a deleted session.
+   * Without this, the global subagent-status poll in App.tsx keeps hitting `/api/subagents/status?session_id=<deleted>` → 404 forever.
+   * The current pane is handled separately by the calling delete branch (which may switch to a sibling session).
+   */
+  const clearDeletedSessionRefsInOtherPanes = (deletedIds: Iterable<string>) => {
+    const idSet = new Set<string>();
+    for (const sid of deletedIds) {
+      const trimmed = String(sid || "").trim();
+      if (trimmed) idSet.add(trimmed);
+    }
+    if (idSet.size === 0) return;
+    const allPanes = useAppStore.getState().panes;
+    for (const p of allPanes) {
+      if (p.id === pane.id) continue;
+      const psid = String(p.sessionId || "").trim();
+      if (psid && idSet.has(psid)) {
+        markPaneAwaitingFreshSession(p.id);
+        clearPaneLazyInheritParent(p.id);
+        setPaneSessionId(p.id, "");
+        setPaneMessages(p.id, []);
+      }
+    }
   };
 
   const deleteSelectedSessions = async () => {
@@ -632,6 +816,11 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
         });
         window.alert(`有 ${failed.length} 个会话删除失败，已自动保留。你可以再次尝试删除。`);
       }
+      const failedSetForRefs = new Set(failed);
+      const successfullyDeleted = targets.filter((sid) => !failedSetForRefs.has(sid));
+      // Clear stale references in other panes so their syncSubAgents poll stops 404'ing.
+      clearDeletedSessionRefsInOtherPanes(successfullyDeleted);
+      dropCachedSessionMessages(successfullyDeleted);
       const activeDeleted = targets.includes(pane.sessionId);
       await loadSessions();
       if (activeDeleted) {
@@ -665,7 +854,7 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
     const active = item.session_id === pane.sessionId;
     const label = (labelOverride || sessionHistoryLabel(item)).trim() || sessionHistoryLabel(item);
     const unread = unreadSessionIds.includes(item.session_id);
-    const createdAt = getSessionCreatedTimestamp(item) || Date.now() / 1000;
+    const activityAt = getSessionActivityTimestamp(item) || Date.now() / 1000;
     const isRunning = item.execution_state === "running";
     const isInterrupted = item.execution_state === "interrupted";
     const feishuMarked = feishuMarkedSessionId === item.session_id;
@@ -676,7 +865,7 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
       imBadgeScope === "feishu-only" ? false : wechatMarked;
     const rowTitle = selectMode
       ? "点击勾选会话"
-      : `${label}\n${timeAgo(createdAt)} · 双击重命名 / 右键菜单`;
+      : `${label}\n${timeAgo(activityAt)} · 双击重命名 / 右键菜单`;
     return (
       <div key={item.session_id} className="mb-1 px-2">
         {editingId === item.session_id ? (
@@ -795,19 +984,81 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
     );
   };
 
-  const renderGroup = (groupTitle: string, items: SessionRow[]) => {
+  const toggleHistoryGroupCollapsed = (groupKey: HistoryGroupKey) => {
+    setCollapsedGroups((prev) => {
+      const willCollapse = !prev[groupKey];
+      if (willCollapse) {
+        setGroupVisibleCounts((counts) => {
+          const { [groupKey]: _removed, ...rest } = counts;
+          return rest;
+        });
+      }
+      return { ...prev, [groupKey]: willCollapse };
+    });
+  };
+
+  const renderGroup = (groupTitle: string, groupKey: HistoryGroupKey, items: SessionRow[]) => {
     if (items.length === 0) return null;
+    const searchActive = Boolean(sessionSearchTrim);
+    const collapsed = !searchActive && collapsedGroups[groupKey] === true;
+    const visibleCount = resolveGroupVisibleCount(
+      groupKey,
+      items.length,
+      searchActive,
+      groupVisibleCounts
+    );
+    const visibleItems = items.slice(0, visibleCount);
+    const hiddenCount = items.length - visibleCount;
+    const showMore = !searchActive && !collapsed && hiddenCount > 0;
     return (
-      <div className="mb-1.5">
-        <div className="agx-session-history-group-title px-2 py-1.5 text-[11px] font-semibold uppercase tracking-[0.08em] text-text-faint">
-          {groupTitle}
-        </div>
-        {items.map((item) =>
-          renderSessionItem(
-            item,
-            sessionSearchTrim ? messageSearchSnippets[item.session_id] : undefined
-          )
-        )}
+      <div className="mb-1" data-history-group={groupKey}>
+        <button
+          type="button"
+          className="agx-session-history-group-title flex w-full items-center gap-1 rounded-lg px-2 py-1.5 text-left text-[11px] font-semibold uppercase tracking-[0.08em] text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
+          onClick={() => toggleHistoryGroupCollapsed(groupKey)}
+          aria-expanded={!collapsed}
+          title={collapsed ? `展开 ${groupTitle}` : `折叠 ${groupTitle}`}
+        >
+          <ChevronRight
+            className={`h-3.5 w-3.5 shrink-0 transition-transform duration-150 ${collapsed ? "" : "rotate-90"}`}
+            strokeWidth={2}
+            aria-hidden
+          />
+          <span className="min-w-0 flex-1 truncate">{groupTitle}</span>
+          {collapsed ? (
+            <span className="shrink-0 text-[10px] font-normal normal-case tracking-normal text-text-faint">
+              {items.length}
+            </span>
+          ) : null}
+        </button>
+        {!collapsed ? (
+          <>
+            {visibleItems.map((item) =>
+              renderSessionItem(
+                item,
+                sessionSearchTrim ? messageSearchSnippets[item.session_id] : undefined
+              )
+            )}
+            {showMore ? (
+              <div className="px-2 pb-0.5">
+                <button
+                  type="button"
+                  className="agx-session-history-more flex w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left text-[12px] font-normal text-text-faint transition hover:bg-surface-hover hover:text-text-muted"
+                  onClick={() =>
+                    setGroupVisibleCounts((prev) => ({
+                      ...prev,
+                      [groupKey]: visibleCount + HISTORY_GROUP_PAGE_SIZE,
+                    }))
+                  }
+                  title={`再展开 ${Math.min(hiddenCount, HISTORY_GROUP_PAGE_SIZE)} 个会话`}
+                >
+                  <span className="leading-none tracking-[0.12em]">…</span>
+                  <span>More</span>
+                </button>
+              </div>
+            ) : null}
+          </>
+        ) : null}
       </div>
     );
   };
@@ -881,7 +1132,7 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
       return;
     }
     if (action === "open_new_tab") {
-      const paneId = addPane(item.avatar_id ?? null, item.avatar_name || "Machi", item.session_id);
+      const paneId = addPane(item.avatar_id ?? null, item.avatar_name || META_AGENT_DISPLAY_NAME, item.session_id);
       const terms = buildHighlightTermsFromQuery(sessionSearchTrim);
       await switchSession(item.session_id, paneId, terms);
       return;
@@ -918,6 +1169,9 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
       if (!confirmed) return;
       const result = await api.deleteSession(item.session_id);
       if (result.ok) {
+        // Clear stale references in other panes so their syncSubAgents poll stops 404'ing.
+        clearDeletedSessionRefsInOtherPanes([item.session_id]);
+        dropCachedSessionMessages(item.session_id);
         await loadSessions();
         if (pane.sessionId === item.session_id) {
           const next = sessions.find((row) => row.session_id !== item.session_id);
@@ -976,8 +1230,11 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
     showWechatBindSection ||
     groupedSessions.pinned.length +
       groupedSessions.today.length +
+      groupedSessions.yesterday.length +
       groupedSessions.previous7Days.length +
-      groupedSessions.older.length >
+      groupedSessions.previous30Days.length +
+      groupedSessions.older.length +
+      groupedSessions.archived.length >
       0;
 
   return (
@@ -986,11 +1243,13 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
       style={tintColor ? { backgroundColor: tintColor } : undefined}
     >
       <div className="flex flex-col">
-        <div className="flex items-center justify-between px-3 py-2">
-          <div className="flex items-center gap-1.5 text-[13px] font-medium text-text-strong" title={title}>
-            历史对话
+        <div className="flex min-w-0 items-center gap-1 px-3 py-2">
+          <div className="min-w-0 flex-1 font-medium text-text-strong">
+            <FitText maxSize={13} minSize={10} title={title}>
+              历史对话
+            </FitText>
           </div>
-          <div className="flex items-center gap-0.5">
+          <div className="flex shrink-0 items-center gap-0.5">
             {!selectMode ? (
               <button
                 className="agx-topbar-btn !px-[5px]"
@@ -1005,32 +1264,39 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
             ) : (
               <>
                 <button
-                  className="agx-topbar-btn"
+                  className="agx-topbar-btn min-w-0 max-w-[4.5rem] shrink px-1.5"
                   onClick={toggleSelectAll}
                   disabled={batchDeleting}
                   title="全选或取消全选"
                 >
-                  {selectedSessionIds.length >= sessionsMatchingSearch.length && sessionsMatchingSearch.length > 0
-                    ? "取消全选"
-                    : "全选"}
+                  <FitText maxSize={12} minSize={9}>
+                    {selectedSessionIds.length >= sessionsMatchingSearch.length && sessionsMatchingSearch.length > 0
+                      ? "取消全选"
+                      : "全选"}
+                  </FitText>
                 </button>
                 <button
-                  className="agx-topbar-btn text-rose-400 hover:text-rose-500"
+                  className="agx-topbar-btn min-w-0 max-w-[4.75rem] shrink px-1.5 text-rose-400 hover:text-rose-500"
                   onClick={() => void deleteSelectedSessions()}
                   disabled={batchDeleting || selectedSessionIds.length === 0}
                   title={selectedSessionIds.length > 0 ? `删除 ${selectedSessionIds.length} 个会话` : "先勾选会话"}
                 >
-                  {batchDeleting ? "删除中..." : `删除${selectedSessionIds.length > 0 ? ` (${selectedSessionIds.length})` : ""}`}
+                  <FitText maxSize={12} minSize={9}>
+                    {batchDeleting ? "删除中..." : `删除${selectedSessionIds.length > 0 ? ` (${selectedSessionIds.length})` : ""}`}
+                  </FitText>
                 </button>
                 <button
-                  className="agx-topbar-btn"
+                  className="agx-topbar-btn min-w-0 max-w-[3rem] shrink px-1.5"
                   onClick={() => {
                     setSelectMode(false);
                     setSelectedSessionIds([]);
                   }}
                   disabled={batchDeleting}
+                  title="取消多选"
                 >
-                  取消
+                  <FitText maxSize={12} minSize={9}>
+                    取消
+                  </FitText>
                 </button>
               </>
             )}
@@ -1058,11 +1324,19 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
           />
         </div>
       </div>
-      <div className="agx-session-history-scroll min-h-0 flex-1 overflow-y-auto pl-2 pr-[2px] pb-2 pt-0.5">
+      <div className="agx-session-history-scroll min-h-0 flex-1 overflow-y-auto pl-2 pr-[2px] pb-6 pt-0.5">
         {sessions.length === 0 ? (
-          <div className="rounded border border-dashed border-border p-3 text-center text-[13px] text-text-faint">
-            暂无会话
-          </div>
+          !sessionsLoadAttempted ? (
+            <div className="space-y-2 px-2 py-1">
+              {[0, 1, 2, 3].map((i) => (
+                <div key={i} className="h-9 animate-pulse rounded-md bg-surface-hover" />
+              ))}
+            </div>
+          ) : (
+            <div className="rounded border border-dashed border-border p-3 text-center text-[13px] text-text-faint">
+              暂无会话
+            </div>
+          )
         ) : !searchHasAnyMatch ? (
           <div className="rounded border border-dashed border-border p-3 text-center text-[13px] text-text-faint">
             未找到匹配会话
@@ -1121,10 +1395,13 @@ export const SessionHistoryPanel = memo(function SessionHistoryPanel({ pane, onC
                 )}
               </div>
             ) : null}
-            {renderGroup("Pinned", groupedSessions.pinned)}
-            {renderGroup("Today", groupedSessions.today)}
-            {renderGroup("Previous 7 days", groupedSessions.previous7Days)}
-            {renderGroup("Older", groupedSessions.older)}
+            {renderGroup("Pinned", "pinned", groupedSessions.pinned)}
+            {renderGroup("Today", "today", groupedSessions.today)}
+            {renderGroup("Yesterday", "yesterday", groupedSessions.yesterday)}
+            {renderGroup("Last 7 days", "previous7Days", groupedSessions.previous7Days)}
+            {renderGroup("Last 30 days", "previous30Days", groupedSessions.previous30Days)}
+            {renderGroup("Older", "older", groupedSessions.older)}
+            {renderGroup("Archived", "archived", groupedSessions.archived)}
           </>
         )}
       </div>

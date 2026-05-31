@@ -3,6 +3,13 @@ import { create } from "zustand";
 import { isSettingsTab } from "./settings-tab";
 import type { SettingsTab } from "./settings-tab";
 import { clearPaneAwaitingFreshSession } from "./utils/pane-fresh-session";
+import { readScopedLocalStorage, writeScopedLocalStorage } from "./utils/backend-scope";
+import { META_AGENT_DISPLAY_NAME } from "./constants/branding";
+import {
+  coerceSelectableModel,
+  reconcilePaneModelsWithSettings as reconcilePaneModelsPure,
+} from "./utils/model-options";
+import type { SearchReference } from "./types/search-references";
 
 export type UiStatus = "idle" | "listening" | "processing";
 export type MsgRole = "user" | "assistant" | "tool";
@@ -125,6 +132,8 @@ export type ChatPane = {
   historySearchTerms: string[];
   /** Harness mode for this pane's session (code_dev vs daily_office). */
   sessionMode?: "code_dev" | "daily_office";
+  /** True while messages are being fetched after a session switch (shows skeleton). */
+  loadingMessages?: boolean;
 };
 
 /** Lifecycle for merged tool_call + tool_result rows in chat (desktop Meta pane). */
@@ -135,7 +144,8 @@ export type ContextNoticeKind =
   | "budget_compress"
   | "compactor_cb"
   | "compaction_reactive"
-  | "compaction_proactive";
+  | "compaction_proactive"
+  | "budget_exceeded";
 
 export type Message = {
   id: string;
@@ -166,8 +176,16 @@ export type Message = {
   toolStreamLines?: string[];
   /** Parsed from model `<followups>` block; shown as chips after reply completes. */
   suggestedQuestions?: string[];
+  /** web_search / knowledge_search references for this assistant turn. */
+  references?: SearchReference[];
+  /** Distinct search queries used in this assistant turn. */
+  searchedQueries?: string[];
   /** Renders as flat ContextNoticeLine instead of ToolCallCard. */
   noticeKind?: ContextNoticeKind;
+  /** Token budget exceeded metadata for BudgetExceededCard rendering. */
+  budgetSource?: string;
+  budgetCurrent?: number;
+  budgetMax?: number;
 };
 
 /** Extras allowed on tool messages from `addPaneMessage` / `addMessage`. */
@@ -184,6 +202,9 @@ export type MessageToolExtras = Pick<
   | "inlineConfirm"
   | "suggestedQuestions"
   | "noticeKind"
+  | "budgetSource"
+  | "budgetCurrent"
+  | "budgetMax"
 >;
 
 export type ForwardedHistoryItem = {
@@ -335,7 +356,7 @@ type AppState = {
   focusExitScrollBottomPaneId: string | null;
   clearFocusExitScrollBottomPaneId: () => void;
   theme: ThemeMode;
-  /** Machi 官网账号登录状态（与 AccountTab / Topbar 共享，首屏和事件回调同步）。 */
+  /** Near 官网账号登录状态（与 AccountTab / Topbar 共享，首屏和事件回调同步）。 */
   agxAccount: { loggedIn: boolean; email: string; displayName: string };
   chatStyle: ChatStyle;
   themeColor: ThemeColor;
@@ -345,19 +366,29 @@ type AppState = {
   userAvatarUrl: string;
   /** Free-text user preference/style injected into every agent system prompt. Max 500 chars. */
   userPreference: string;
-  /** Custom avatar for Meta-Agent (Machi). */
+  /** Custom avatar for Meta-Agent (Near). */
   metaAvatarUrl: string;
   confirmStrategy: ConfirmStrategy;
   mcpServers: McpServer[];
   avatars: Avatar[];
   activeAvatarId: string | null;
   avatarSessions: SessionItem[];
+  /** True after splash preload attempt (success or timeout). */
+  corePreloadAttempted: boolean;
+  /** Sessions list prefetched at startup, keyed by avatar id ("" = Meta). */
+  preloadedSessionsByAvatarKey: Record<string, unknown[]>;
+  /** Taskspaces prefetched at startup for the active session. */
+  preloadedTaskspacesBySessionId: Record<string, Taskspace[]>;
   groups: GroupChat[];
   panes: ChatPane[];
   activePaneId: string;
   /** Incremented when local session list should refresh (e.g. new session created). SessionHistoryPanel subscribes. */
   sessionCatalogRevision: number;
   bumpSessionCatalogRevision: () => void;
+  /** Optimistic last-activity hints so history sidebar moves to Today on send. */
+  sessionHistoryHints: Record<string, { activityAt: number; running: boolean }>;
+  markSessionHistoryActive: (sessionId: string) => void;
+  clearSessionHistoryHint: (sessionId: string) => void;
   /** After merge-forward, target pane runs one normal /api/chat with this text (cleared when consumed). */
   forwardAutoReply: {
     paneId: string;
@@ -389,6 +420,8 @@ type AppState = {
   setStatus: (status: UiStatus) => void;
   setActiveModel: (provider: string, model: string) => void;
   setPaneModel: (paneId: string, provider: string, model: string) => void;
+  /** Migrate pane/global picks that are no longer in the visible model catalog. */
+  reconcilePaneModels: () => { changedPaneIds: string[]; activeChanged: boolean };
   setUserMode: (mode: "pro" | "lite") => void;
   setOnboardingCompleted: (v: boolean) => void;
   setCommandPaletteOpen: (v: boolean) => void;
@@ -409,6 +442,12 @@ type AppState = {
   setConfirmStrategy: (v: ConfirmStrategy) => void;
   setMcpServers: (servers: McpServer[]) => void;
   setAvatars: (avatars: Avatar[]) => void;
+  applyCorePreloadBundle: (payload: {
+    sessionsKey: string;
+    sessions: unknown[];
+    taskspacesKey?: string;
+    taskspaces?: Taskspace[];
+  }) => void;
   setActiveAvatarId: (id: string | null) => void;
   setAvatarSessions: (sessions: SessionItem[]) => void;
   setGroups: (groups: GroupChat[]) => void;
@@ -438,6 +477,8 @@ type AppState = {
         | "forwardedHistory"
         | "inlineConfirm"
         | "suggestedQuestions"
+        | "references"
+        | "searchedQueries"
       >
     > &
       Partial<MessageToolExtras>
@@ -468,6 +509,11 @@ type AppState = {
   setPaneSessionId: (paneId: string, sessionId: string, modelHint?: { provider?: string; model?: string }) => void;
   setPaneSessionMode: (paneId: string, mode: "code_dev" | "daily_office") => void;
   setPaneMessages: (paneId: string, messages: Message[]) => void;
+  setPaneLoadingMessages: (paneId: string, loading: boolean) => void;
+  /** Per-session messages cache (LRU). Lets repeat session switches skip the IPC roundtrip. */
+  getCachedSessionMessages: (sessionId: string) => Message[] | undefined;
+  cacheSessionMessages: (sessionId: string, messages: Message[]) => void;
+  dropCachedSessionMessages: (sessionId: string | Iterable<string>) => void;
   setPaneHistorySearchTerms: (paneId: string, terms: string[]) => void;
   togglePaneHistory: (paneId: string) => void;
   /** @deprecated Prefer cycleSidePanel / openSidePanel */
@@ -506,6 +552,8 @@ type AppState = {
         | "timestamp"
         | "forwardedHistory"
         | "inlineConfirm"
+        | "references"
+        | "searchedQueries"
       >
     > &
       Partial<MessageToolExtras>
@@ -552,7 +600,7 @@ function makeDefaultPane(): ChatPane {
   return {
     id: "pane-meta",
     avatarId: null,
-    avatarName: "Machi",
+    avatarName: META_AGENT_DISPLAY_NAME,
     sessionId: "",
     modelProvider: "",
     modelName: "",
@@ -570,8 +618,16 @@ function makeDefaultPane(): ChatPane {
     activeTerminalTabId: null,
     sessionTokens: { input: 0, output: 0 },
     historySearchTerms: [],
+    loadingMessages: false,
   };
 }
+
+/** Per-session messages LRU cache shared across panes in this renderer process.
+ *  Reading via Map iteration order works because we delete+re-insert on access
+ *  to bump the entry to the most-recent slot before set().
+ */
+const SESSION_MESSAGE_CACHE_MAX = 10;
+const sessionMessageCache: Map<string, Message[]> = new Map();
 
 const CHAT_STYLE_STORAGE_KEY = "agx-chat-style";
 const THEME_STORAGE_KEY = "agx-theme";
@@ -663,7 +719,7 @@ function toNonNegativeInt(raw: unknown): number {
 
 function readSessionTokenCache(): SessionTokenCache {
   try {
-    const raw = window.localStorage.getItem(SESSION_TOKEN_CACHE_KEY);
+    const raw = readScopedLocalStorage(SESSION_TOKEN_CACHE_KEY);
     const parsed = raw ? (JSON.parse(raw) as unknown) : {};
     if (!parsed || typeof parsed !== "object") return {};
     const out: SessionTokenCache = {};
@@ -688,7 +744,7 @@ function writeSessionTokenCache(cache: SessionTokenCache): void {
     const trimmed = entries.slice(0, 500);
     const normalized: SessionTokenCache = {};
     for (const [sid, row] of trimmed) normalized[sid] = row;
-    window.localStorage.setItem(SESSION_TOKEN_CACHE_KEY, JSON.stringify(normalized));
+    writeScopedLocalStorage(SESSION_TOKEN_CACHE_KEY, JSON.stringify(normalized));
   } catch {
     // ignore storage errors
   }
@@ -744,12 +800,37 @@ export const useAppStore = create<AppState>((set, get) => ({
   avatars: [],
   activeAvatarId: null,
   avatarSessions: [],
+  corePreloadAttempted: false,
+  preloadedSessionsByAvatarKey: {},
+  preloadedTaskspacesBySessionId: {},
   groups: [],
   panes: [makeDefaultPane()],
   activePaneId: "pane-meta",
   sessionCatalogRevision: 0,
   bumpSessionCatalogRevision: () =>
     set((state) => ({ sessionCatalogRevision: state.sessionCatalogRevision + 1 })),
+  sessionHistoryHints: {},
+  markSessionHistoryActive: (sessionId) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return;
+    const nowSec = Date.now() / 1000;
+    set((state) => ({
+      sessionHistoryHints: {
+        ...state.sessionHistoryHints,
+        [sid]: { activityAt: nowSec, running: true },
+      },
+    }));
+  },
+  clearSessionHistoryHint: (sessionId) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return;
+    set((state) => {
+      if (!state.sessionHistoryHints[sid]) return state;
+      const next = { ...state.sessionHistoryHints };
+      delete next[sid];
+      return { sessionHistoryHints: next };
+    });
+  },
   forwardAutoReply: null,
   subAgents: [],
   selectedSubAgent: null,
@@ -764,8 +845,25 @@ export const useAppStore = create<AppState>((set, get) => ({
   setActiveModel: (activeProvider, activeModel) => set({ activeProvider, activeModel }),
   setPaneModel: (paneId, provider, model) =>
     set((state) => {
-      const nextProvider = String(provider ?? "").trim();
-      const nextModel = String(model ?? "").trim();
+      const rawProvider = String(provider ?? "").trim();
+      const rawModel = String(model ?? "").trim();
+      let nextProvider = rawProvider;
+      let nextModel = rawModel;
+      if (rawProvider || rawModel) {
+        const coerced = coerceSelectableModel(
+          state.settings.providers,
+          rawProvider,
+          rawModel,
+          rawProvider,
+        );
+        if (coerced) {
+          nextProvider = coerced.provider;
+          nextModel = coerced.model;
+        } else {
+          nextProvider = "";
+          nextModel = "";
+        }
+      }
       const paneExists = state.panes.some((pane) => pane.id === paneId);
       if (!paneExists) return state;
       const nextPanes = state.panes.map((pane) =>
@@ -782,6 +880,37 @@ export const useAppStore = create<AppState>((set, get) => ({
         activeModel: nextModel,
       };
     }),
+  reconcilePaneModels: () => {
+    let changedPaneIds: string[] = [];
+    let activeChanged = false;
+    set((state) => {
+      const result = reconcilePaneModelsPure({
+        panes: state.panes,
+        activePaneId: state.activePaneId,
+        activeProvider: state.activeProvider,
+        activeModel: state.activeModel,
+        providers: state.settings.providers,
+      });
+      changedPaneIds = result.changedPaneIds;
+      activeChanged = result.activeChanged;
+      if (changedPaneIds.length === 0 && !activeChanged) return state;
+      const paneById = new Map(result.panes.map((pane) => [pane.id, pane]));
+      return {
+        panes: state.panes.map((pane) => {
+          const next = paneById.get(pane.id);
+          if (!next) return pane;
+          return {
+            ...pane,
+            modelProvider: next.modelProvider ?? "",
+            modelName: next.modelName ?? "",
+          };
+        }),
+        activeProvider: result.activeProvider,
+        activeModel: result.activeModel,
+      };
+    });
+    return { changedPaneIds, activeChanged };
+  },
   setUserMode: (userMode) => set({ userMode }),
   setOnboardingCompleted: (onboardingCompleted) => set({ onboardingCompleted }),
   setCommandPaletteOpen: (commandPaletteOpen) => set({ commandPaletteOpen }),
@@ -917,6 +1046,24 @@ export const useAppStore = create<AppState>((set, get) => ({
   setConfirmStrategy: (confirmStrategy) => set({ confirmStrategy }),
   setMcpServers: (mcpServers) => set({ mcpServers }),
   setAvatars: (avatars) => set({ avatars }),
+  applyCorePreloadBundle: (payload) =>
+    set((state) => {
+      const sessionsKey = String(payload.sessionsKey ?? "");
+      const nextSessions = { ...state.preloadedSessionsByAvatarKey };
+      if (sessionsKey && Array.isArray(payload.sessions)) {
+        nextSessions[sessionsKey] = payload.sessions;
+      }
+      const nextTaskspaces = { ...state.preloadedTaskspacesBySessionId };
+      const taskspacesKey = String(payload.taskspacesKey ?? "").trim();
+      if (taskspacesKey && Array.isArray(payload.taskspaces)) {
+        nextTaskspaces[taskspacesKey] = payload.taskspaces;
+      }
+      return {
+        corePreloadAttempted: true,
+        preloadedSessionsByAvatarKey: nextSessions,
+        preloadedTaskspacesBySessionId: nextTaskspaces,
+      };
+    }),
   setActiveAvatarId: (activeAvatarId) => set({ activeAvatarId }),
   setAvatarSessions: (avatarSessions) => set({ avatarSessions }),
   setGroups: (groups) => set({ groups }),
@@ -933,13 +1080,33 @@ export const useAppStore = create<AppState>((set, get) => ({
         const avatarProvider = (avatar?.defaultProvider || "").trim();
         const avatarModel = (avatar?.defaultModel || "").trim();
         const defaultProvider = (state.settings.defaultProvider || "").trim();
-        const defaultModel = (state.settings.providers[defaultProvider]?.model || "").trim();
         if (avatarProvider && avatarModel) {
           provider = avatarProvider;
           model = avatarModel;
-        } else if (defaultProvider && defaultModel) {
-          provider = defaultProvider;
-          model = defaultModel;
+        } else {
+          const fallback = coerceSelectableModel(
+            state.settings.providers,
+            defaultProvider,
+            "",
+            defaultProvider,
+          );
+          if (fallback) {
+            provider = fallback.provider;
+            model = fallback.model;
+          }
+        }
+        const coerced = coerceSelectableModel(
+          state.settings.providers,
+          provider,
+          model,
+          provider,
+        );
+        if (coerced) {
+          provider = coerced.provider;
+          model = coerced.model;
+        } else {
+          provider = "";
+          model = "";
         }
         if (provider && model) {
           return {
@@ -955,10 +1122,38 @@ export const useAppStore = create<AppState>((set, get) => ({
         }
         return { activePaneId };
       }
+      const coerced = coerceSelectableModel(
+        state.settings.providers,
+        provider,
+        model,
+        provider,
+      );
+      if (coerced) {
+        provider = coerced.provider;
+        model = coerced.model;
+      } else {
+        provider = "";
+        model = "";
+      }
+      if (!provider || !model) {
+        return { activePaneId };
+      }
+      const paneNeedsPatch =
+        (target.modelProvider || "").trim() !== provider ||
+        (target.modelName || "").trim() !== model;
       return {
         activePaneId,
         activeProvider: provider,
         activeModel: model,
+        ...(paneNeedsPatch
+          ? {
+              panes: state.panes.map((pane) =>
+                pane.id === activePaneId
+                  ? { ...pane, modelProvider: provider, modelName: model }
+                  : pane
+              ),
+            }
+          : {}),
       };
     }),
   hydratePanes: (panes, activePaneId) =>
@@ -968,11 +1163,27 @@ export const useAppStore = create<AppState>((set, get) => ({
       const hasActive = nextPanes.some((p) => p.id === activePaneId);
       const nextActiveId = hasActive ? activePaneId : nextPanes[0]?.id ?? state.activePaneId;
       const active = nextPanes.find((p) => p.id === nextActiveId) ?? nextPanes[0];
-      return {
+      const reconciled = reconcilePaneModelsPure({
         panes: nextPanes,
         activePaneId: nextActiveId,
-        activeProvider: (active?.modelProvider || "").trim(),
-        activeModel: (active?.modelName || "").trim(),
+        activeProvider: (active?.modelProvider || "").trim() || state.activeProvider,
+        activeModel: (active?.modelName || "").trim() || state.activeModel,
+        providers: state.settings.providers,
+      });
+      const paneById = new Map(reconciled.panes.map((pane) => [pane.id, pane]));
+      return {
+        panes: nextPanes.map((pane) => {
+          const next = paneById.get(pane.id);
+          if (!next) return pane;
+          return {
+            ...pane,
+            modelProvider: next.modelProvider ?? pane.modelProvider,
+            modelName: next.modelName ?? pane.modelName,
+          };
+        }),
+        activePaneId: nextActiveId,
+        activeProvider: reconciled.activeProvider,
+        activeModel: reconciled.activeModel,
       };
     }),
   setForwardAutoReply: (forwardAutoReply) => set({ forwardAutoReply }),
@@ -1033,7 +1244,20 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
   addPane: (avatarId, avatarName, sessionId) => {
     const paneId = uid();
-    set((state) => ({
+    set((state) => {
+      const av = avatarId ? state.avatars.find((a) => a.id === avatarId) : null;
+      const rawProvider =
+        (av?.defaultProvider || "").trim() || (state.activeProvider || "").trim();
+      const rawModel = (av?.defaultModel || "").trim() || (state.activeModel || "").trim();
+      const coerced = coerceSelectableModel(
+        state.settings.providers,
+        rawProvider,
+        rawModel,
+        rawProvider,
+      );
+      const modelProvider = coerced?.provider ?? "";
+      const modelName = coerced?.model ?? "";
+      return {
       // New pane should prefer avatar defaults so "click avatar" does not
       // inherit a random model from the currently active pane.
       panes: [
@@ -1043,14 +1267,8 @@ export const useAppStore = create<AppState>((set, get) => ({
           avatarId,
           avatarName,
           sessionId,
-          modelProvider: (() => {
-            const av = avatarId ? state.avatars.find((a) => a.id === avatarId) : null;
-            return (av?.defaultProvider || "").trim() || state.activeProvider;
-          })(),
-          modelName: (() => {
-            const av = avatarId ? state.avatars.find((a) => a.id === avatarId) : null;
-            return (av?.defaultModel || "").trim() || state.activeModel;
-          })(),
+          modelProvider,
+          modelName,
           messages: [],
           historyOpen: false,
           contextInherited: false,
@@ -1068,7 +1286,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         },
       ],
       activePaneId: paneId,
-    }));
+    };
+    });
     return paneId;
   },
   removePane: (paneId) =>
@@ -1083,9 +1302,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       const activePane = nextPanes.find((pane) => pane.id === nextActive) ?? nextPanes[0];
       const provider = (activePane?.modelProvider || "").trim();
       const model = (activePane?.modelName || "").trim();
+      const nextAv = activePane?.avatarId ?? null;
+      const activeAvatarId =
+        nextAv &&
+        !String(nextAv).startsWith("automation:") &&
+        !String(nextAv).startsWith("group:")
+          ? String(nextAv)
+          : null;
       return {
         panes: nextPanes,
         activePaneId: nextActive,
+        activeAvatarId,
         ...(provider && model
           ? { activeProvider: provider, activeModel: model }
           : {}),
@@ -1305,12 +1532,25 @@ export const useAppStore = create<AppState>((set, get) => ({
           if (!resolvedModel) resolvedModel = avatarModel;
         } else {
           const dp = (state.settings.defaultProvider || "").trim();
-          const dm = (state.settings.providers[dp]?.model || "").trim();
-          if (dp && dm) {
-            if (!resolvedProvider) resolvedProvider = dp;
-            if (!resolvedModel) resolvedModel = dm;
+          const fallback = coerceSelectableModel(state.settings.providers, dp, "", dp);
+          if (fallback) {
+            if (!resolvedProvider) resolvedProvider = fallback.provider;
+            if (!resolvedModel) resolvedModel = fallback.model;
           }
         }
+      }
+      const coerced = coerceSelectableModel(
+        state.settings.providers,
+        resolvedProvider,
+        resolvedModel,
+        resolvedProvider,
+      );
+      if (coerced) {
+        resolvedProvider = coerced.provider;
+        resolvedModel = coerced.model;
+      } else {
+        resolvedProvider = "";
+        resolvedModel = "";
       }
       const isActive = state.activePaneId === paneId;
       const nextPanes = state.panes.map((p) => {
@@ -1349,6 +1589,43 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((state) => ({
       panes: state.panes.map((pane) => (pane.id === paneId ? { ...pane, messages } : pane)),
     })),
+  setPaneLoadingMessages: (paneId, loading) =>
+    set((state) => ({
+      panes: state.panes.map((pane) =>
+        pane.id === paneId ? { ...pane, loadingMessages: loading } : pane,
+      ),
+    })),
+  getCachedSessionMessages: (sessionId) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return undefined;
+    const entry = sessionMessageCache.get(sid);
+    if (!entry) return undefined;
+    sessionMessageCache.delete(sid);
+    sessionMessageCache.set(sid, entry);
+    return entry;
+  },
+  cacheSessionMessages: (sessionId, messages) => {
+    const sid = String(sessionId ?? "").trim();
+    if (!sid) return;
+    sessionMessageCache.delete(sid);
+    sessionMessageCache.set(sid, messages);
+    while (sessionMessageCache.size > SESSION_MESSAGE_CACHE_MAX) {
+      const oldest = sessionMessageCache.keys().next().value;
+      if (oldest === undefined) break;
+      sessionMessageCache.delete(oldest);
+    }
+  },
+  dropCachedSessionMessages: (sessionId) => {
+    if (typeof sessionId === "string") {
+      const sid = sessionId.trim();
+      if (sid) sessionMessageCache.delete(sid);
+      return;
+    }
+    for (const item of sessionId) {
+      const sid = String(item ?? "").trim();
+      if (sid) sessionMessageCache.delete(sid);
+    }
+  },
   setPaneHistorySearchTerms: (paneId, terms) =>
     set((state) => ({
       panes: state.panes.map((pane) =>

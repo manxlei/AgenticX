@@ -22,7 +22,6 @@ import {
   Loader2,
   ChevronRight,
   Anchor,
-  Clock,
   User,
   Activity,
   RefreshCw,
@@ -46,6 +45,8 @@ import { shouldDisableMcpToggle } from "../utils/mcp-toggle-state";
 import { ForwardPicker, type ForwardConfirmPayload } from "./ForwardPicker";
 import { QrConnectModal } from "./QrConnectModal";
 import { AutomationTab } from "./automation/AutomationTab";
+import { AutomationTaskIcon } from "./icons/AutomationTaskIcon";
+import { SkillPuzzleIcon } from "./icons/SkillPuzzleIcon";
 import {
   RuntimeConfigSection,
   RUNTIME_MAX_TOOL_ROUNDS,
@@ -59,9 +60,15 @@ import {
   UnattendedConfigSection,
   type UnattendedConfig,
 } from "./automation/UnattendedConfigSection";
+import {
+  TokenBudgetConfigSection,
+  normalizeTokenBudgetConfig,
+  type TokenBudgetConfig,
+} from "./automation/TokenBudgetConfigSection";
 import { AccountTab } from "./AccountTab";
 import { KnowledgeSettings, type KnowledgeSettingsHandle } from "./settings/knowledge/KnowledgeSettings";
 import { getProviderDisplayName, makeCustomOpenAIProviderId } from "../utils/provider-display";
+import { normalizeProviderEntry } from "../utils/model-options";
 import type { SettingsTab } from "../settings-tab";
 import type { MCPDiscoveryHit } from "./settings/mcp/MCPDiscoveryPanel";
 import { MCPMarketplacePanel } from "./settings/mcp/MCPMarketplacePanel";
@@ -77,7 +84,48 @@ import {
   saveSettingsPanelSize,
   type SettingsPanelSize,
 } from "../utils/settings-panel-size";
+import { useScrollbarOnScroll } from "../hooks/useScrollbarOnScroll";
+import {
+  formatBackendChipLabel,
+  getBackendScope,
+  getConnectionModeSync,
+  readScopedLocalStorage,
+  writeScopedLocalStorage,
+} from "../utils/backend-scope";
 export type { SettingsTab } from "../settings-tab";
+
+const MCP_MARKETPLACE_ID_MAP_KEY = "agenticx:mcp:marketplaceIdToNames";
+
+function RemoteBackendHintBanner({ kind = "local-only" }: { kind?: "synced" | "local-only" }) {
+  const mode = getConnectionModeSync();
+  if (mode !== "remote") return null;
+  const host = getBackendScope();
+  const hostLabel = formatBackendChipLabel(host, "remote");
+  if (kind === "synced") {
+    return (
+      <div className="rounded-md border border-border bg-surface-card px-3 py-2.5 text-xs leading-relaxed text-text-subtle">
+        <p>
+          当前为<strong className="text-text-muted">远程模式</strong>，本页配置直接同步到远端{" "}
+          <strong className="text-text-muted">{hostLabel}</strong> 的{" "}
+          <code className="text-[10px] text-text-muted">~/.agenticx/config.yaml</code>，对模型调用立即生效。
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="rounded-md border border-border bg-surface-card px-3 py-2.5 text-xs leading-relaxed text-text-subtle">
+      <p>
+        当前为<strong className="text-text-muted">远程模式</strong>，本页修改写入本机{" "}
+        <code className="text-[10px] text-text-muted">~/.agenticx/config.yaml</code>，但实际加载发生在远端{" "}
+        <strong className="text-text-muted">{hostLabel}</strong>。
+      </p>
+      <p className="mt-1.5 text-text-faint">
+        如需修改远端配置，请直接编辑远端 <code className="text-[10px]">~/.agenticx/config.yaml</code>
+        （此 Tab 的远程同步能力规划中）。
+      </p>
+    </div>
+  );
+}
 
 export type FavoriteForwardContext = {
   sourceSessionId: string;
@@ -676,11 +724,11 @@ const TABS: { id: SettingsTab; label: string; icon: typeof Settings2 }[] = [
   { id: "provider", label: "模型服务", icon: Cpu },
   { id: "mcp", label: "MCP 服务", icon: Plug },
   { id: "tools", label: "工具", icon: Wrench },
-  { id: "skills", label: "技能", icon: Sparkles },
+  { id: "skills", label: "技能", icon: SkillPuzzleIcon },
   // Plan-Id: machi-kb-stage1-local-mvp
   { id: "knowledge", label: "知识库", icon: Library },
   { id: "hooks", label: "钩子", icon: Anchor },
-  { id: "automation", label: "自动化", icon: Clock },
+  { id: "automation", label: "自动化", icon: AutomationTaskIcon },
   { id: "voice", label: "语音", icon: Mic },
   { id: "email", label: "邮件通知", icon: Mail },
   { id: "workspace", label: "工作区", icon: FolderOpen },
@@ -1800,7 +1848,7 @@ const CcBridgeSettingsPanel = forwardRef<CcBridgePanelHandle, Record<string, nev
       <div className="mb-2 space-y-1 text-xs text-text-subtle">
         <p>
           与终端中运行的 <code className="rounded bg-surface-panel px-0.5">agx cc-bridge serve</code>{" "}
-          通信。首次使用会在本机配置中自动生成 token（与 Machi 工具 <code className="rounded bg-surface-panel px-0.5">cc_bridge_*</code>{" "}
+          通信。首次使用会在本机配置中自动生成 token（与 Near 工具 <code className="rounded bg-surface-panel px-0.5">cc_bridge_*</code>{" "}
           一致）。
         </p>
         <p className="text-text-faint">
@@ -1942,6 +1990,9 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
     unattended_auto_resume_exhausted: true,
     unattended_auto_resume_interrupted: true,
   });
+  const [tokenBudget, setTokenBudget] = useState<TokenBudgetConfig>(
+    normalizeTokenBudgetConfig(undefined),
+  );
   const [runtimeLoadError, setRuntimeLoadError] = useState("");
 
   const loadAll = useCallback(async () => {
@@ -2020,6 +2071,12 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
             runtimeResult.unattended_auto_resume_interrupted ?? true,
           ),
         });
+        setTokenBudget(
+          normalizeTokenBudgetConfig({
+            max_tokens_per_session: Number(runtimeResult.max_tokens_per_session),
+            max_tokens_per_turn: Number(runtimeResult.max_tokens_per_turn),
+          }),
+        );
       } else {
         setRuntimeLoadError("读取运行时参数失败，仍可按当前滑块值保存。");
       }
@@ -2108,6 +2165,8 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
           unattended_stall_continue_after_seconds: unattended.unattended_stall_continue_after_seconds,
           unattended_auto_resume_exhausted: unattended.unattended_auto_resume_exhausted,
           unattended_auto_resume_interrupted: unattended.unattended_auto_resume_interrupted,
+          max_tokens_per_session: tokenBudget.max_tokens_per_session,
+          max_tokens_per_turn: tokenBudget.max_tokens_per_turn,
         });
         if (!rtRes?.ok) {
           return {
@@ -2122,7 +2181,7 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
         return bridge.save();
       },
     }),
-    [loading, maxToolRounds, saveBashDefaultTimeout, stallNudge, unattended],
+    [loading, maxToolRounds, saveBashDefaultTimeout, stallNudge, tokenBudget, unattended],
   );
 
   const startInstall = async (tool: ToolStatusItem) => {
@@ -2189,6 +2248,7 @@ const ToolsTab = forwardRef<ToolsTabHandle, Record<string, never>>(function Tool
         onChange={setMaxToolRounds}
         disabled={loading}
       />
+      <TokenBudgetConfigSection value={tokenBudget} onChange={setTokenBudget} disabled={loading} />
       <StallNudgeConfigSection value={stallNudge} onChange={setStallNudge} disabled={loading} />
       <UnattendedConfigSection value={unattended} onChange={setUnattended} disabled={loading} />
       {runtimeLoadError ? (
@@ -2711,7 +2771,7 @@ function SkillsTab() {
           return;
         }
         const sid = created.session_id;
-        const paneId = addPane(null, "Machi", sid);
+        const paneId = addPane(null, "Near", sid);
         setForwardAutoReply({ paneId, sessionId: sid, text });
         closeSettings();
       } catch (e) {
@@ -4383,7 +4443,7 @@ function ComputerUseGeneralPanel() {
       }
       setEnabled(next);
       setMessage(
-        "已保存到本机配置。请完全退出 Machi 后重新打开（勿仅关闭窗口）；内置助手会随应用一起重启并加载新设置。若使用「设置 → 服务器连接」中的远程模式，请在服务器环境同步该配置并重启远端服务。"
+        "已保存到本机配置。请完全退出 Near 后重新打开（勿仅关闭窗口）；内置助手会随应用一起重启并加载新设置。若使用「设置 → 服务器连接」中的远程模式，请在服务器环境同步该配置并重启远端服务。"
       );
     } catch (e) {
       setMessage(e instanceof Error ? e.message : "保存失败。");
@@ -4405,7 +4465,7 @@ function ComputerUseGeneralPanel() {
     <Panel title="桌面操控">
       <p className="mb-3 text-xs text-text-faint">
         写入本机 <code className="text-text-subtle">~/.agenticx/config.yaml</code> 中的{" "}
-        <code className="text-text-subtle">computer_use.enabled</code>。开启后由 Machi 随应用启动的内置助手读取该开关并尝试加载桌面级能力。若对话里仍看不到相关工具，请确认已安装包含该能力的 Machi 版本；修改后需完全退出并重新打开 Machi（远程模式见保存成功后的说明）。
+        <code className="text-text-subtle">computer_use.enabled</code>。开启后由 Near 随应用启动的内置助手读取该开关并尝试加载桌面级能力。若对话里仍看不到相关工具，请确认已安装包含该能力的 Near 版本；修改后需完全退出并重新打开 Near（远程模式见保存成功后的说明）。
       </p>
       <div className="flex items-center justify-between gap-4">
         <span className="text-sm text-text-subtle">
@@ -4495,7 +4555,7 @@ function useTrinityConfig() {
         return;
       }
       setLastSaved(next);
-      setMessage("已保存。完全退出 Machi 后重新打开生效。");
+      setMessage("已保存。完全退出 Near 后重新打开生效。");
     } catch (e) {
       setForm(lastSaved);
       setMessage(e instanceof Error ? e.message : "保存失败。");
@@ -4566,6 +4626,112 @@ function useSkillInstallPolicy() {
   return { loading, saving, nonHighRiskAutoInstall, message, updatePolicy };
 }
 
+function useGuardSettings() {
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [version, setVersion] = useState(1);
+  const [scanMode, setScanMode] = useState("standard");
+  const [message, setMessage] = useState("");
+  const [scanBusy, setScanBusy] = useState(false);
+  const [scanPath, setScanPath] = useState("");
+  const [scanResultMsg, setScanResultMsg] = useState("");
+
+  useEffect(() => {
+    let disposed = false;
+    const load = async () => {
+      setLoading(true);
+      try {
+        const result = await window.agenticxDesktop.getGuardSettings();
+        if (!disposed && result?.ok) {
+          if (typeof result.version === "number") setVersion(result.version);
+          if (result.scan_mode) setScanMode(result.scan_mode);
+        }
+      } catch {
+        if (!disposed) setMessage("读取安全扫描配置失败。");
+      } finally {
+        if (!disposed) setLoading(false);
+      }
+    };
+    void load();
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const saveGuard = useCallback(async (next: { version?: number; scan_mode?: string }) => {
+    setSaving(true);
+    setMessage("");
+    try {
+      const result = await window.agenticxDesktop.putGuardSettings(next);
+      if (!result?.ok) {
+        setMessage(result?.error ? String(result.error) : "保存失败。");
+        return;
+      }
+      if (typeof result.version === "number") setVersion(result.version);
+      if (result.scan_mode) setScanMode(result.scan_mode);
+      setMessage("已保存安全扫描配置。");
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : "保存失败。");
+    } finally {
+      setSaving(false);
+    }
+  }, []);
+
+  const runDeepScan = useCallback(async () => {
+    const p = scanPath.trim();
+    if (!p) {
+      setScanResultMsg("请填写要扫描的技能目录路径。");
+      return;
+    }
+    setScanBusy(true);
+    setScanResultMsg("");
+    try {
+      const result = await window.agenticxDesktop.guardScanSkill({
+        skill_path: p,
+        mode: "full",
+        skill_name: p.split("/").pop() || "skill",
+      });
+      if (!result?.ok || !result.scan) {
+        setScanResultMsg(result?.error ? String(result.error) : "扫描失败。");
+        return;
+      }
+      setScanResultMsg(
+        formatSkillScanSummary({
+          overall: result.scan.verdict || "safe",
+          skills: [
+            {
+              skill_name: result.scan.skill_name || p,
+              verdict: result.scan.verdict || "safe",
+              score: result.scan.score,
+              grade: result.scan.grade,
+              tier: result.scan.tier,
+              findings: result.scan.findings,
+            },
+          ],
+        }),
+      );
+    } catch (e) {
+      setScanResultMsg(e instanceof Error ? e.message : "扫描失败。");
+    } finally {
+      setScanBusy(false);
+    }
+  }, [scanPath]);
+
+  return {
+    loading,
+    saving,
+    version,
+    scanMode,
+    message,
+    scanBusy,
+    scanPath,
+    setScanPath,
+    scanResultMsg,
+    saveGuard,
+    runDeepScan,
+  };
+}
+
 function SkillAdvancedPanel() {
   const { loading: trinityLoading, saving: trinitySaving, form, message: trinityMessage, update } =
     useTrinityConfig();
@@ -4576,9 +4742,22 @@ function SkillAdvancedPanel() {
     message: policyMessage,
     updatePolicy,
   } = useSkillInstallPolicy();
+  const {
+    loading: guardLoading,
+    saving: guardSaving,
+    version: guardVersion,
+    scanMode,
+    message: guardMessage,
+    scanBusy,
+    scanPath,
+    setScanPath,
+    scanResultMsg,
+    saveGuard,
+    runDeepScan,
+  } = useGuardSettings();
 
-  const loading = trinityLoading || policyLoading;
-  const busy = trinitySaving || policySaving;
+  const loading = trinityLoading || policyLoading || guardLoading;
+  const busy = trinitySaving || policySaving || guardSaving;
   const [nudgeDraft, setNudgeDraft] = useState(String(form.learning_nudge_interval));
   const [minCallsDraft, setMinCallsDraft] = useState(String(form.learning_min_tool_calls));
   const [reviewAdvancedOpen, setReviewAdvancedOpen] = useState(false);
@@ -4712,6 +4891,67 @@ function SkillAdvancedPanel() {
           disabled={busy}
           onChange={(next) => void updatePolicy(next)}
         />
+        <div className="mt-4 rounded-lg border border-border bg-surface-panel p-3">
+          <div className="text-sm font-medium text-text-strong">Skill 安全扫描（Guard v2）</div>
+          <p className="mt-1 text-[11px] text-text-faint">
+            扩展安装前扫描引擎；v2 启用分级扫描、评分与更多规则。默认 v1 与历史行为一致。
+          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-sm">
+            <label className="flex items-center gap-2">
+              <span className="text-text-muted">引擎版本</span>
+              <select
+                className="rounded-md border border-border bg-surface-card px-2 py-1 text-sm"
+                value={guardVersion}
+                disabled={busy}
+                onChange={(e) => void saveGuard({ version: Number(e.target.value) })}
+              >
+                <option value={1}>v1（经典）</option>
+                <option value={2}>v2（cls-certify 增强）</option>
+              </select>
+            </label>
+            <label className="flex items-center gap-2">
+              <span className="text-text-muted">扫描模式</span>
+              <select
+                className="rounded-md border border-border bg-surface-card px-2 py-1 text-sm"
+                value={scanMode}
+                disabled={busy || guardVersion < 2}
+                onChange={(e) => void saveGuard({ scan_mode: e.target.value })}
+              >
+                <option value="quick">quick</option>
+                <option value="standard">standard</option>
+                <option value="full">full</option>
+              </select>
+            </label>
+          </div>
+          <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+            <input
+              type="text"
+              className="min-w-0 flex-1 rounded-md border border-border bg-surface-card px-2 py-1.5 text-sm"
+              placeholder="技能目录路径（完整安全扫描）"
+              value={scanPath}
+              disabled={scanBusy}
+              onChange={(e) => setScanPath(e.target.value)}
+            />
+            <button
+              type="button"
+              className="rounded-md border border-border bg-surface-card-strong px-3 py-1.5 text-sm text-text-strong hover:bg-surface-hover disabled:opacity-50"
+              disabled={scanBusy || guardVersion < 2}
+              onClick={() => void runDeepScan()}
+            >
+              {scanBusy ? "扫描中…" : "完整安全扫描"}
+            </button>
+          </div>
+          {guardMessage ? (
+            <div className={`mt-2 text-xs ${guardMessage.startsWith("已保存") ? "text-text-muted" : "text-rose-400"}`}>
+              {guardMessage}
+            </div>
+          ) : null}
+          {scanResultMsg ? (
+            <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded-md bg-surface-card p-2 text-[11px] text-text-subtle">
+              {scanResultMsg}
+            </pre>
+          ) : null}
+        </div>
       </div>
       {trinityMessage ? (
         <div
@@ -4775,6 +5015,9 @@ function formatSkillScanSummary(scan: {
   skills: Array<{
     skill_name: string;
     verdict: string;
+    score?: number;
+    grade?: string;
+    tier?: string;
     findings?: Array<{
       pattern_name: string;
       severity?: string;
@@ -4799,22 +5042,37 @@ function formatSkillScanSummary(scan: {
     destructive_rm: "破坏性操作（rm -rf /）",
     destructive_chmod: "破坏性操作（chmod 777）",
     destructive_sql: "破坏性操作（DROP TABLE）",
+    curl_pipe_shell: "远程脚本管道执行",
+    reverse_shell: "反向 Shell",
+    invisible_unicode: "不可见 Unicode 字符",
+    suspicious_url: "可疑外发 URL",
+    typosquat_dependency: "疑似 typosquat 依赖",
+    dynamic_download_l2: "嵌套动态下载",
+    base64_decode_pipe: "Base64 解码后执行",
   };
+  patternLabel["high_entropy" + "_secret"] = "高熵可疑字符串";
 
   const lines = [
     `安装前扫描 · 总体：${verdictLabel(scan.overall)}`,
   ];
   for (const s of scan.skills) {
+    const meta: string[] = [];
+    if (s.grade) meta.push(`等级 ${s.grade}`);
+    if (typeof s.score === "number") meta.push(`${s.score} 分`);
+    if (s.tier) meta.push(s.tier);
     lines.push(
       `· ${s.skill_name || "skill"}：${verdictLabel(s.verdict)}${
         s.findings?.length ? `（命中 ${s.findings.length} 条规则）` : ""
-      }`
+      }${meta.length ? ` · ${meta.join(" · ")}` : ""}`
     );
     if (s.findings?.length) {
-      for (const f of s.findings) {
+      for (const f of s.findings.slice(0, 8)) {
         const label = patternLabel[f.pattern_name] || f.pattern_name;
         const matched = f.matched_text ? `「${f.matched_text.slice(0, 60)}」` : "";
         lines.push(`  ${sevLabel(f.severity)} ${label}${matched ? " — " + matched : ""}`);
+      }
+      if (s.findings.length > 8) {
+        lines.push(`  … 另有 ${s.findings.length - 8} 条`);
       }
     }
   }
@@ -4948,6 +5206,7 @@ export function SettingsPanel({
     window.addEventListener("mouseup", onUp);
   }, [panelSize.height, panelSize.width]);
   const [active, setActive] = useState(defaultProvider || ALL_PROVIDERS[0]);
+  const providerListScrollRef = useScrollbarOnScroll<HTMLDivElement>();
   const [draft, setDraft] = useState<Record<string, ProviderEntry>>({});
   const [defProv, setDefProv] = useState(defaultProvider);
   const [keyStatus, setKeyStatus] = useState<Record<string, "idle" | "checking" | "ok" | "fail">>({});
@@ -4996,7 +5255,7 @@ export function SettingsPanel({
   } | null>(null);
   const [mcpMarketplaceIdToNames, setMcpMarketplaceIdToNames] = useState<Record<string, string[]>>(() => {
     try {
-      const raw = window.localStorage.getItem("agenticx:mcp:marketplaceIdToNames");
+      const raw = readScopedLocalStorage(MCP_MARKETPLACE_ID_MAP_KEY);
       if (!raw) return {};
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === "object") {
@@ -5242,7 +5501,7 @@ export function SettingsPanel({
           setUserAvatarMessage("已更新我的头像。");
         } else {
           setMetaAvatarUrl(result);
-          setMetaAvatarMessage("已更新 Machi 头像。");
+          setMetaAvatarMessage("已更新 Near 头像。");
         }
       };
       reader.onerror = () => {
@@ -5478,7 +5737,27 @@ export function SettingsPanel({
     }
   };
 
-  const onRemoveModel = (model: string) => updateField("models", current.models.filter((m) => m !== model));
+  const onRemoveModel = (model: string) => {
+    setDraft((prev) => {
+      const prevEntry = prev[active] ?? {
+        apiKey: "",
+        baseUrl: "",
+        model: "",
+        models: [],
+        enabled: false,
+        dropParams: false,
+      };
+      const nextModels = prevEntry.models.filter((m) => m !== model);
+      let nextModel = prevEntry.model;
+      if (nextModel === model || (nextModels.length > 0 && !nextModels.includes(nextModel))) {
+        nextModel = nextModels[0] ?? "";
+      }
+      return {
+        ...prev,
+        [active]: normalizeProviderEntry({ ...prevEntry, models: nextModels, model: nextModel }),
+      };
+    });
+  };
 
   const closeAddModelModal = () => {
     setAddModelModalOpen(false);
@@ -5608,10 +5887,10 @@ export function SettingsPanel({
     }
     const normalized: Record<string, ProviderEntry> = {};
     for (const [name, entry] of Object.entries(draft)) {
-      normalized[name] = { ...entry, baseUrl: normalizeBaseUrl(entry.baseUrl) };
+      normalized[name] = normalizeProviderEntry({ ...entry, baseUrl: normalizeBaseUrl(entry.baseUrl) });
     }
     await onSave({ defaultProvider: defProv, providers: normalized });
-    await window.agenticxDesktop.saveRemoteServer({
+    const remoteSave = await window.agenticxDesktop.saveRemoteServer({
       enabled: serverMode === "remote",
       url: serverUrl.trim().replace(/\/+$/, ""),
       token: serverToken.trim(),
@@ -5628,6 +5907,26 @@ export function SettingsPanel({
       appId: feishuAppId.trim(),
       appSecret: feishuAppSecret.trim(),
     });
+    if (remoteSave.mode_changed) {
+      const restartDlg = await window.agenticxDesktop.confirmDialog({
+        title: "需要重启 Near",
+        message: "连接模式已切换，需要重启 Near 以加载新后端工作区。",
+        detail:
+          "会话、窗格、分身与 MCP 状态将按新后端隔离，不会与上一套后端混用。",
+        confirmText: "立即重启",
+        cancelText: "稍后手动重启",
+      });
+      if (restartDlg.confirmed) {
+        await window.agenticxDesktop.appRelaunch();
+        return;
+      }
+      await window.agenticxDesktop.confirmDialog({
+        title: "请稍后重启",
+        message: "重启后连接模式切换才会生效。",
+        confirmText: "知道了",
+      });
+      return;
+    }
     onClose();
   };
 
@@ -5641,7 +5940,7 @@ export function SettingsPanel({
         : await window.agenticxDesktop.disconnectMcp({ sessionId, name });
       if (result.ok) {
         await onRefreshMcp(sessionId);
-        setMcpMessage(next ? `已连接 ${name}；下次启动 Machi 将自动重连此项。` : `已断开 ${name}，且不再自动连接。`);
+        setMcpMessage(next ? `已连接 ${name}；下次启动 Near 将自动重连此项。` : `已断开 ${name}，且不再自动连接。`);
       } else {
         const detail = String(result.error ?? "未知错误");
         if (detail.includes("连接已取消")) return;
@@ -5937,14 +6236,7 @@ export function SettingsPanel({
   }, [mcpMarketplaceStatus]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(
-        "agenticx:mcp:marketplaceIdToNames",
-        JSON.stringify(mcpMarketplaceIdToNames),
-      );
-    } catch {
-      // ignore quota errors
-    }
+    writeScopedLocalStorage(MCP_MARKETPLACE_ID_MAP_KEY, JSON.stringify(mcpMarketplaceIdToNames));
   }, [mcpMarketplaceIdToNames]);
 
   useEffect(() => {
@@ -6302,7 +6594,7 @@ export function SettingsPanel({
                 </Panel>
                 <Panel title="用户档案">
                   <p className="mb-3 text-[11px] leading-relaxed text-text-subtle">
-                    「你」的身份与展示，以及希望各对话如何围绕你展开（称呼、头像、用户偏好）。全局人格（SOUL）仍在下方 Machi 区块。
+                    「你」的身份与展示，以及希望各对话如何围绕你展开（称呼、头像、用户偏好）。全局人格（SOUL）仍在下方 Near 区块。
                   </p>
                   <label className="block text-sm text-text-muted">
                     我的称呼（用于所有对话）
@@ -6381,16 +6673,16 @@ export function SettingsPanel({
                     {`${userPreference.length}/500 字。会注入每次对话的系统提示，对所有 agent 的回复方式生效。`}
                   </p>
                 </Panel>
-                <Panel title="元智能体（Machi）">
+                <Panel title="元智能体（Near）">
                   <p className="mb-3 text-[11px] leading-relaxed text-text-subtle">
-                    仅 Machi 元智能体：自定义头像与全局人格（SOUL.md）。用户偏好见上方「用户档案」。
+                    仅 Near 元智能体：自定义头像与全局人格（SOUL.md）。用户偏好见上方「用户档案」。
                   </p>
                   <div>
-                    <div className="text-sm text-text-muted">Machi 头像</div>
+                    <div className="text-sm text-text-muted">Near 头像</div>
                     <div className="mt-2 flex items-center gap-3">
                       <img
                         src={effectiveMetaAvatarUrl}
-                        alt="Machi 头像"
+                        alt="Near 头像"
                         className="h-12 w-12 rounded-full border border-border object-cover"
                       />
                       <div className="flex flex-wrap items-center gap-2">
@@ -6413,7 +6705,7 @@ export function SettingsPanel({
                           disabled={!metaAvatarUrl}
                           onClick={() => {
                             setMetaAvatarUrl("");
-                            setMetaAvatarMessage("已恢复默认 Machi 头像。");
+                            setMetaAvatarMessage("已恢复默认 Near 头像。");
                           }}
                         >
                           恢复默认
@@ -6478,8 +6770,16 @@ export function SettingsPanel({
                         : "默认全部自动执行，不再询问（高风险）。"}
                   </div>
                   <p className="mt-2 text-[11px] text-text-faint">
-                    下方「路径 / 命令 / 工具拒绝」修改后，请点击窗口底部「保存」写入 Studio（与失焦保存等效）。未配置远程 URL 时使用本机内置 API；若仍出现 HTTP 404，请升级远端 agenticx 版本或核对服务器地址是否指向当前 Machi 使用的同一 Studio。
+                    下方「路径 / 命令 / 工具拒绝」修改后，请点击窗口底部「保存」写入 Studio（与失焦保存等效）。未配置远程 URL 时使用本机内置 API；若仍出现 HTTP 404，请升级远端 agenticx 版本或核对服务器地址是否指向当前 Near 使用的同一 Studio。
                   </p>
+                  <div className="mt-3 rounded-md border border-amber-500/35 bg-amber-500/10 px-3 py-2.5 text-xs text-text-subtle">
+                    <div className="font-medium text-amber-200/95">凭据安全</div>
+                    <p className="mt-1 leading-relaxed">
+                      API Key、Token、密码<strong className="font-medium text-text-primary">请勿在对话中发送</strong>
+                      ——聊天记录会保存在本机。模型密钥请在侧栏「模型服务」配置；MCP 密钥请在「MCP 服务」安装或编辑时的环境变量中填写（写入{" "}
+                      <code className="text-[10px]">~/.agenticx/mcp.json</code>）。Near 不会要求你在聊天里粘贴密钥来代为配置。
+                    </p>
+                  </div>
                 </Panel>
                 <PermissionsAdvancedPanel ref={permissionsPanelRef} />
                 <WebSearchSettingsPanel />
@@ -6487,16 +6787,21 @@ export function SettingsPanel({
                 <ComputerUseGeneralPanel />
                 <SessionMemoryPanel />
                 <div className="rounded-md border border-border bg-surface-card px-3 py-2.5 text-xs text-text-subtle">
-                  当前版本：AgenticX Desktop v0.2.0
+                  当前版本：AgenticX Desktop v0.2.4
                 </div>
             </div>
 
             {/* === PROVIDER TAB === */}
             {tab === "provider" && (
+              <div className="flex flex-col gap-3">
+                <RemoteBackendHintBanner kind="synced" />
               <div className="flex gap-3">
                 {/* Provider sub-list */}
                 <div className="flex w-[140px] shrink-0 flex-col rounded-md border border-border bg-surface-card">
-                  <div className="max-h-[min(60vh,420px)] space-y-0.5 overflow-y-auto py-1">
+                  <div
+                    ref={providerListScrollRef}
+                    className="agx-scrollbar-on-scroll max-h-[min(60vh,420px)] space-y-0.5 overflow-y-auto py-1"
+                  >
                     {providerNames.map((name) => {
                       const entry = draft[name];
                       const dotClass = providerEffectiveOn(entry) ? "bg-emerald-400" : "bg-rose-400";
@@ -6707,7 +7012,7 @@ export function SettingsPanel({
                           <span>
                             兼容模式：丢弃上游不支持的参数（<code className="text-xs text-text-faint">drop_params</code>）
                             <span className="mt-0.5 block text-xs text-text-faint">
-                              自建 LiteLLM / 部分 OpenAI 兼容网关不支持 <code className="text-[10px]">tool_choice</code> 时需开启；保存后重启本机 <code className="text-[10px]">agx serve</code> 或重开 Machi 后生效。
+                              自建 LiteLLM / 部分 OpenAI 兼容网关不支持 <code className="text-[10px]">tool_choice</code> 时需开启；保存后重启本机 <code className="text-[10px]">agx serve</code> 或重开 Near 后生效。
                             </span>
                           </span>
                         </label>
@@ -7070,18 +7375,23 @@ export function SettingsPanel({
                       </Modal>
                 </div>
               </div>
+              </div>
             )}
 
             {/* === MCP TAB === */}
             {tab === "mcp" && (() => {
               return (
               <div className="space-y-5">
+                <RemoteBackendHintBanner />
                 <div className="space-y-1">
                   <div className="text-sm text-text-subtle">
                     MCP（模型上下文协议）服务为 Agent 扩展外部工具 — 文件系统、数据库、网页搜索等。
                   </div>
                   <div className="text-[11px] text-text-faint">
-                    已连接的 MCP 服务是 Machi <strong>进程级</strong>资源，所有对话共享；Machi 启动时自动恢复上次的连接记录，新建对话不会触发额外连接或断开。
+                    已连接的 MCP 服务是 Near <strong>进程级</strong>资源，所有对话共享；Near 启动时自动恢复上次的连接记录，新建对话不会触发额外连接或断开。
+                  </div>
+                  <div className="text-[11px] text-amber-200/80">
+                    所需 API Key 请在本页安装弹窗或 JSON 的 <code className="text-[10px]">env</code> 中填写，勿在聊天里发送给 Agent。
                   </div>
                 </div>
 
@@ -7411,6 +7721,7 @@ export function SettingsPanel({
             {/* === SKILLS TAB === */}
             {tab === "skills" && (
               <div className="space-y-4">
+                <RemoteBackendHintBanner />
                 <SkillsTab />
                 <SkillAdvancedPanel />
               </div>
@@ -7560,7 +7871,7 @@ export function SettingsPanel({
                   {imTab === "feishu" && (
                     <div className="space-y-3">
                       <p className="text-xs text-text-faint">
-                        无需公网服务器，使用飞书官方 WebSocket 长连接接收消息，Machi 启动后自动在后台运行。
+                        无需公网服务器，使用飞书官方 WebSocket 长连接接收消息，Near 启动后自动在后台运行。
                       </p>
                       <div className="flex items-center justify-between gap-4">
                         <span className="text-sm text-text-subtle">启用飞书机器人</span>
@@ -7601,7 +7912,7 @@ export function SettingsPanel({
                             </div>
                           </label>
                           <p className="text-xs text-text-faint">
-                            保存后 Machi 自动在后台启动飞书长连接，无需额外开终端。
+                            保存后 Near 自动在后台启动飞书长连接，无需额外开终端。
                             飞书应用须开启「机器人」能力，订阅 <code className="rounded bg-surface-hover px-1">im.message.receive_v1</code> 长连接事件。
                           </p>
                         </>
@@ -7613,7 +7924,7 @@ export function SettingsPanel({
                   {imTab === "webhook" && (
                     <div className="space-y-3">
                       <p className="text-xs text-text-faint">
-                        需要公网可访问的服务器部署云端 Gateway，再通过扫码与 Machi 绑定。
+                        需要公网可访问的服务器部署云端 Gateway，再通过扫码与 Near 绑定。
                       </p>
                       <label className="block text-sm text-text-muted">
                         网关地址
@@ -7746,7 +8057,7 @@ export function SettingsPanel({
                         />
                       </label>
                       <p className="mt-1 text-xs text-text-faint">
-                        修改后点底部「保存」统一生效；需重启 Machi / agx serve。
+                        修改后点底部「保存」统一生效；需重启 Near / agx serve。
                       </p>
                     </div>
                   )}
@@ -7757,7 +8068,7 @@ export function SettingsPanel({
                   {wechatStatus === "idle" && !wechatBotId && (
                     <div className="space-y-3">
                       <p className="text-xs text-text-faint">
-                        扫码绑定个人微信，绑定后可在微信中给 Machi 发消息触发 Agent 执行。基于微信官方 iLink 协议。
+                        扫码绑定个人微信，绑定后可在微信中给 Near 发消息触发 Agent 执行。基于微信官方 iLink 协议。
                       </p>
                       <button
                         type="button"
@@ -7958,7 +8269,7 @@ export function SettingsPanel({
                   <p>1. 在云主机上安装 agenticx: <code className="text-text-muted">pip install agenticx</code></p>
                   <p>2. 启动服务: <code className="text-text-muted">agx serve --host 0.0.0.0 --port 8080 --token YOUR_TOKEN</code></p>
                   <p>3. 确保防火墙放行对应端口，生产环境建议配置 HTTPS (Nginx 反向代理)。</p>
-                  <p className="text-text-faint">修改后点底部「保存」统一生效；切换模式需重启 Machi。</p>
+                  <p className="text-text-faint">修改后点底部「保存」统一生效；切换模式需重启 Near。</p>
                 </div>
               </div>
             )}

@@ -2,6 +2,7 @@
 
 import * as React from "react";
 import { useRouter } from "next/navigation";
+import { useTranslations } from "next-intl";
 import { HttpChatClient, MockChatClient } from "@agenticx/sdk-ts";
 import {
   Badge,
@@ -23,7 +24,6 @@ import {
   useUiTheme,
 } from "@agenticx/ui";
 import {
-  Activity,
   ChevronLeft,
   ChevronRight,
   Crown,
@@ -45,7 +45,6 @@ import {
 import { useChatStore } from "@agenticx/feature-chat";
 import { MachiChatView } from "./MachiChatView";
 import { SettingsPanel } from "./settings/SettingsPanel";
-import { usePortalCopy } from "../lib/portal-copy";
 
 type WorkspaceShellProps = {
   userEmail: string;
@@ -56,13 +55,40 @@ type PanelMode = "chat" | "settings";
 type HistorySession = {
   id: string;
   title: string;
-  updatedAt: number;
+  /** 列表排序与分组锚点：对齐 Machi Desktop，仅用创建时间，避免切换 session 时 updated_at 变化导致跳动 */
+  createdAt: number;
 };
 
 const COLLAPSED_KEY = "agenticx-portal-sidebar-collapsed";
 
-function groupHistory(history: HistorySession[]): Array<{ key: string; label: string; items: HistorySession[] }> {
-  const now = Date.now();
+function getSessionCreatedTimestampMs(session: Pick<HistorySession, "createdAt">): number {
+  const created = Number(session.createdAt);
+  return Number.isFinite(created) && created > 0 ? created : 0;
+}
+
+function sortHistorySessions(rows: HistorySession[]): HistorySession[] {
+  return [...rows].sort((a, b) => {
+    const tsDiff = getSessionCreatedTimestampMs(b) - getSessionCreatedTimestampMs(a);
+    if (tsDiff !== 0) return tsDiff;
+    return b.id.localeCompare(a.id);
+  });
+}
+
+function groupHistory(
+  history: HistorySession[],
+  labels: {
+    today: string;
+    yesterday: string;
+    week: string;
+    month: string;
+    older: string;
+  },
+): Array<{ key: string; label: string; items: HistorySession[] }> {
+  const now = new Date();
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startYesterday = startToday - 24 * 3600 * 1000;
+  const startWeek = startToday - 7 * 24 * 3600 * 1000;
+  const startMonth = startToday - 30 * 24 * 3600 * 1000;
   const buckets = {
     today: [] as HistorySession[],
     yesterday: [] as HistorySession[],
@@ -71,25 +97,25 @@ function groupHistory(history: HistorySession[]): Array<{ key: string; label: st
     older: [] as HistorySession[],
   };
   for (const item of history) {
-    const diff = now - item.updatedAt;
-    if (diff < 24 * 3600 * 1000) buckets.today.push(item);
-    else if (diff < 2 * 24 * 3600 * 1000) buckets.yesterday.push(item);
-    else if (diff < 7 * 24 * 3600 * 1000) buckets.week.push(item);
-    else if (diff < 30 * 24 * 3600 * 1000) buckets.month.push(item);
+    const createdAt = getSessionCreatedTimestampMs(item);
+    if (createdAt >= startToday) buckets.today.push(item);
+    else if (createdAt >= startYesterday) buckets.yesterday.push(item);
+    else if (createdAt >= startWeek) buckets.week.push(item);
+    else if (createdAt >= startMonth) buckets.month.push(item);
     else buckets.older.push(item);
   }
   return [
-    { key: "today", label: "今天", items: buckets.today },
-    { key: "yesterday", label: "昨天", items: buckets.yesterday },
-    { key: "week", label: "7 天内", items: buckets.week },
-    { key: "month", label: "30 天内", items: buckets.month },
-    { key: "older", label: "更早", items: buckets.older },
+    { key: "today", label: labels.today, items: buckets.today },
+    { key: "yesterday", label: labels.yesterday, items: buckets.yesterday },
+    { key: "week", label: labels.week, items: buckets.week },
+    { key: "month", label: labels.month, items: buckets.month },
+    { key: "older", label: labels.older, items: buckets.older },
   ].filter((group) => group.items.length > 0);
 }
 
 export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
   const router = useRouter();
-  const t = usePortalCopy();
+  const t = useTranslations("workspace");
   const showAdminEntry = userScopes.includes("admin:enter");
   const { locale, setLocale } = useLocale();
   const { resolved: resolvedTheme, theme, setTheme, toggle: toggleTheme } = useUiTheme();
@@ -104,13 +130,13 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
 
   const history = React.useMemo<HistorySession[]>(
     () =>
-      [...sessions]
-        .map((session) => ({
+      sortHistorySessions(
+        sessions.map((session) => ({
           id: session.id,
           title: session.title,
-          updatedAt: new Date(session.updated_at).getTime(),
-        }))
-        .sort((a, b) => b.updatedAt - a.updatedAt),
+          createdAt: new Date(session.created_at).getTime(),
+        })),
+      ),
     [sessions],
   );
 
@@ -143,10 +169,10 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
   }, []);
 
   const onNewChat = React.useCallback(() => {
-    void createSession({ defaultModel: activeModel || "deepseek-chat", title: t.newChat });
+    void createSession({ defaultModel: activeModel || "deepseek-chat", title: t("newChat") });
     setPanelMode("chat");
     setMobileOpen(false);
-  }, [createSession, activeModel, t.newChat]);
+  }, [createSession, activeModel, t]);
 
   const onSelectSession = React.useCallback((id: string) => {
     void switchSession(id);
@@ -156,17 +182,17 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
 
   const onRenameSession = React.useCallback((id: string) => {
     const current = history.find((item) => item.id === id);
-    const next = window.prompt("重命名会话", current?.title ?? "");
+    const next = window.prompt(t("renameSessionPrompt"), current?.title ?? "");
     if (!next) return;
     void renameSessionInStore(id, next);
-  }, [history, renameSessionInStore]);
+  }, [history, renameSessionInStore, t]);
 
   const onDeleteSession = React.useCallback(
     (id: string) => {
-      if (!window.confirm("删除这条会话？")) return;
+      if (!window.confirm(t("deleteSessionConfirm"))) return;
       void deleteSessionInStore(id);
     },
-    [deleteSessionInStore]
+    [deleteSessionInStore, t],
   );
 
   const onSignOut = React.useCallback(async () => {
@@ -174,7 +200,20 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
     router.replace("/auth");
   }, [router]);
 
-  const grouped = React.useMemo(() => groupHistory(history), [history]);
+  const grouped = React.useMemo(
+    () =>
+      groupHistory(history, {
+        today: t("historyToday"),
+        yesterday: t("historyYesterday"),
+        week: t("historyWeek"),
+        month: t("historyMonth"),
+        older: t("historyOlder"),
+      }),
+    [history, t],
+  );
+
+  const sidebarToggleLabel = collapsed ? t("expandSidebar") : t("collapseSidebar");
+  const languageLabel = locale === "zh" ? t("languageZh") : t("languageEn");
 
   return (
     <TooltipProvider delayDuration={200}>
@@ -205,7 +244,7 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
               {!collapsed && (
                 <div className="min-w-0 flex-1">
                   <div className="truncate text-sm font-semibold">AgenticX</div>
-                  <div className="truncate text-[11px] text-muted-foreground">Workspace</div>
+                  <div className="truncate text-[11px] text-muted-foreground">{t("brandSubtitle")}</div>
                 </div>
               )}
             </div>
@@ -215,7 +254,7 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
                   variant="outline"
                   size="icon-sm"
                   onClick={() => setCollapsed((prev) => !prev)}
-                  aria-label={collapsed ? "展开侧栏" : "收起侧栏"}
+                  aria-label={sidebarToggleLabel}
                   className={[
                     "hidden shrink-0 border-sidebar-border/80 bg-background/60 text-muted-foreground shadow-none hover:bg-muted/80 hover:text-foreground lg:inline-flex",
                     collapsed ? "h-7 w-7" : "h-8 w-8",
@@ -225,7 +264,7 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
                 </Button>
               </TooltipTrigger>
               <TooltipContent side="bottom" className="max-w-[12rem]">
-                {collapsed ? "展开侧栏" : "收起侧栏"}
+                {sidebarToggleLabel}
               </TooltipContent>
             </Tooltip>
           </div>
@@ -234,7 +273,7 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
           <div className={["flex flex-col gap-1.5 p-3", collapsed ? "items-center" : ""].join(" ")}>
             <Button onClick={onNewChat} className={collapsed ? "" : "w-full justify-start"} size={collapsed ? "icon" : "default"}>
               <MessageSquarePlus />
-              {!collapsed && t.newChat}
+              {!collapsed && t("newChat")}
             </Button>
             <Button
               variant={deepResearch ? "default" : "outline"}
@@ -243,7 +282,7 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
               size={collapsed ? "icon" : "default"}
             >
               <Microscope />
-              {!collapsed && t.deepResearch}
+              {!collapsed && t("deepResearch")}
             </Button>
           </div>
 
@@ -253,11 +292,11 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
           <div className="flex-1 overflow-y-auto px-2 py-2">
             {!collapsed ? (
               historyLoading ? (
-                <div className="px-3 py-4 text-xs text-muted-foreground">加载历史…</div>
+                <div className="px-3 py-4 text-xs text-muted-foreground">{t("loadingHistory")}</div>
               ) : grouped.length === 0 ? (
                 <div className="flex h-full flex-col items-center justify-center gap-2 px-3 py-10 text-center text-xs text-muted-foreground">
                   <MessageSquare className="h-5 w-5" />
-                  <span>{t.noHistory}</span>
+                  <span>{t("noHistory")}</span>
                 </div>
               ) : (
                 <div className="space-y-4">
@@ -331,7 +370,7 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
                       <p className="truncate text-sm font-medium">{userEmail}</p>
                       <div className="flex items-center gap-1.5">
                         <Badge variant="soft" className="h-4 text-[10px]">
-                          Enterprise
+                          {t("enterpriseBadge")}
                         </Badge>
                       </div>
                     </div>
@@ -341,25 +380,25 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
               <DropdownMenuContent align="start" side="top" className="w-60">
                 <DropdownMenuLabel>
                   <div className="text-sm font-medium">{userEmail}</div>
-                  <div className="text-xs font-normal text-muted-foreground">Enterprise · admin</div>
+                  <div className="text-xs font-normal text-muted-foreground">{t("enterpriseRole")}</div>
                 </DropdownMenuLabel>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={() => setPanelMode("settings")}>
                   <Settings className="mr-2 h-4 w-4" />
-                  {t.settings}
+                  {t("settings")}
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={toggleTheme}>
                   {resolvedTheme === "dark" ? <Sun className="mr-2 h-4 w-4" /> : <Moon className="mr-2 h-4 w-4" />}
-                  {resolvedTheme === "dark" ? "切换到亮色" : "切换到暗色"}
+                  {resolvedTheme === "dark" ? t("switchToLight") : t("switchToDark")}
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setTheme("system")}>
                   <Monitor className="mr-2 h-4 w-4" />
-                  跟随系统
+                  {t("followSystem")}
                   {theme === "system" ? <span className="ml-auto text-xs text-primary">✓</span> : null}
                 </DropdownMenuItem>
                 <DropdownMenuItem onClick={() => setLocale(locale === "zh" ? "en" : "zh")}>
                   <Languages className="mr-2 h-4 w-4" />
-                  语言：{locale === "zh" ? "中文" : "English"}
+                  {t("languageMenu", { language: languageLabel })}
                 </DropdownMenuItem>
                 {showAdminEntry ? (
                   <DropdownMenuItem
@@ -367,18 +406,18 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
                       window.open(
                         process.env.NEXT_PUBLIC_ADMIN_CONSOLE_URL ?? "http://localhost:3001",
                         "_blank",
-                        "noopener,noreferrer"
+                        "noopener,noreferrer",
                       )
                     }
                   >
                     <LayoutDashboard className="mr-2 h-4 w-4" />
-                    管理后台
+                    {t("adminConsole")}
                   </DropdownMenuItem>
                 ) : null}
                 <DropdownMenuSeparator />
                 <DropdownMenuItem onClick={onSignOut}>
                   <LogOut className="mr-2 h-4 w-4" />
-                  {t.signOut}
+                  {t("signOut")}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -400,7 +439,7 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
               variant="ghost"
               size="icon-sm"
               onClick={() => setMobileOpen((prev) => !prev)}
-              aria-label="打开菜单"
+              aria-label={t("openMenu")}
             >
               <Menu />
             </Button>
@@ -408,7 +447,7 @@ export function WorkspaceShell({ userEmail, userScopes }: WorkspaceShellProps) {
           {panelMode === "settings" && (
             <div className="absolute right-4 top-4 z-30">
               <Button variant="outline" size="sm" onClick={() => setPanelMode("chat")}>
-                {t.backToChat}
+                {t("backToChat")}
               </Button>
             </div>
           )}
@@ -443,6 +482,8 @@ function SessionItem({
   onRename: () => void;
   onDelete: () => void;
 }) {
+  const t = useTranslations("workspace");
+
   return (
     <div
       className={[
@@ -458,7 +499,7 @@ function SessionItem({
           <button
             type="button"
             className="flex h-6 w-6 shrink-0 items-center justify-center rounded-sm text-muted-foreground opacity-0 transition-opacity hover:bg-background/50 hover:text-foreground group-hover/session:opacity-100 data-[state=open]:opacity-100"
-            aria-label="会话操作"
+            aria-label={t("sessionActions")}
             onClick={(event) => event.stopPropagation()}
           >
             <MoreHorizontal className="h-3.5 w-3.5" />
@@ -467,11 +508,11 @@ function SessionItem({
         <DropdownMenuContent align="end" className="w-36">
           <DropdownMenuItem onClick={onRename}>
             <Pencil className="mr-2 h-3.5 w-3.5" />
-            重命名
+            {t("rename")}
           </DropdownMenuItem>
           <DropdownMenuItem onClick={onDelete} className="text-danger focus:text-danger">
             <Trash2 className="mr-2 h-3.5 w-3.5" />
-            删除
+            {t("delete")}
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>

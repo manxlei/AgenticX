@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Gauge, LogIn, LogOut, Moon, PanelLeftOpen, Settings, Sun, User } from "lucide-react";
 import { useAppStore } from "../store";
+import { formatBackendChipLabel, getBackendScope, getConnectionModeSync } from "../utils/backend-scope";
 
 type Props = {
   sidebarCollapsed: boolean;
@@ -17,9 +18,26 @@ export function Topbar({ sidebarCollapsed, onToggleSidebar }: Props) {
 
   const [loginBusy, setLoginBusy] = useState(false);
   const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [backendChipTick, setBackendChipTick] = useState(0);
   const userMenuRef = useRef<HTMLDivElement>(null);
 
   const isDarkLike = theme === "dark" || theme === "dim";
+
+  useEffect(() => {
+    return window.agenticxDesktop?.onConnectionModeChanged?.(() => {
+      setBackendChipTick((n) => n + 1);
+    });
+  }, []);
+
+  // Re-read on each render and when main notifies mode changes.
+  void backendChipTick;
+  const connectionMode = getConnectionModeSync();
+  const backendScope = getBackendScope();
+  const backendChipLabel = formatBackendChipLabel(backendScope, connectionMode);
+  const backendChipTooltip =
+    connectionMode === "remote"
+      ? `当前连接到远程后端 ${backendScope}。到「设置 → 服务器」可切换。`
+      : "当前使用本机 agx serve。到「设置 → 服务器」可切换远程模式。";
 
   const onThemeToggle = () => {
     // Topbar 快速切换仅在 dark/light 之间切换，dim 仍保留在「设置」里可选
@@ -54,7 +72,7 @@ export function Topbar({ sidebarCollapsed, onToggleSidebar }: Props) {
     setUserMenuOpen(false);
     const r = await window.agenticxDesktop.confirmDialog({
       title: "退出官网账号",
-      message: "确定要清除本机已保存的 Machi 官网登录状态吗？",
+      message: "确定要清除本机已保存的 Near 官网登录状态吗？",
       confirmText: "退出",
       destructive: true,
     });
@@ -96,6 +114,18 @@ export function Topbar({ sidebarCollapsed, onToggleSidebar }: Props) {
         >
           <PanelLeftOpen className="h-[18px] w-[18px]" strokeWidth={1.8} />
         </button>
+        <span
+          className="inline-flex max-w-[140px] items-center gap-1.5 rounded-full border border-border bg-surface-card px-2 py-0.5 text-[11px] text-text-subtle"
+          title={backendChipTooltip}
+        >
+          <span
+            className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+              connectionMode === "remote" ? "bg-sky-400" : "bg-emerald-400"
+            }`}
+            aria-hidden
+          />
+          <span className="truncate">{backendChipLabel}</span>
+        </span>
       </div>
       <div className="agx-topbar-right">
         <button
@@ -171,7 +201,7 @@ export function Topbar({ sidebarCollapsed, onToggleSidebar }: Props) {
             className="agx-topbar-btn"
             onClick={() => void onLoginClick()}
             disabled={loginBusy}
-            title="登录 Machi 官网账号"
+            title="登录 Near 官网账号"
             aria-label="登录"
           >
             <LogIn className="h-[18px] w-[18px]" strokeWidth={1.8} />

@@ -33,6 +33,7 @@ from jsonschema import Draft202012Validator
 
 from agenticx.avatar.group_chat import GroupChatRegistry
 from agenticx.avatar.registry import AvatarRegistry
+from agenticx.branding import DEFAULT_META_PRODUCT_LABEL
 from agenticx.cli.config_manager import ConfigManager
 from agenticx.cli.mcp_discovery import detect_all
 from agenticx.hooks import load_discovered_hooks
@@ -84,8 +85,10 @@ from agenticx.studio.protocols import (
 from agenticx.studio.continuation import (
     ContinuationReason,
     ContinuationSource,
+    live_reattach_enabled,
     prepare_continue,
 )
+from agenticx.studio.session_event_hub import BufferedEvent
 from agenticx.studio.session_manager import (
     SessionManager,
     managed_session_binding_matches_avatar_query,
@@ -261,6 +264,55 @@ def _runtime_event_to_sse_lines(event: RuntimeEvent) -> list[str]:
     return lines
 
 
+def _buffered_event_to_sse_lines(buffered: BufferedEvent) -> list[str]:
+    """Serialize a hub-buffered event with monotonic SSE ``id:`` for reattach replay."""
+    if buffered.event is None:
+        return [
+            f"id: {buffered.seq}\n",
+            'data: {"type":"done","data":{}}\n\n',
+        ]
+    lines = [f"id: {buffered.seq}\n"]
+    lines.extend(_runtime_event_to_sse_lines(buffered.event))
+    return lines
+
+
+def _parse_sse_since_seq(
+    last_event_id: str | None,
+    since_query: str | None,
+) -> int:
+    for raw in (since_query, last_event_id):
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            return max(0, int(text))
+        except ValueError:
+            continue
+    return 0
+
+
+def _finalize_chat_runtime(
+    manager: SessionManager,
+    session_id: str,
+    session: Any,
+    *,
+    saw_final: bool,
+    had_runtime_failure: bool,
+) -> None:
+    _flush_taskspace_hint(session_id, session)
+    end_state = _resolve_chat_end_execution_state(
+        manager,
+        session_id,
+        saw_final=saw_final,
+        had_runtime_failure=had_runtime_failure,
+    )
+    manager.clear_interrupt(session_id)
+    manager.set_execution_state(session_id, end_state)
+    manager.persist(session_id)
+
+
 def _extract_cc_bridge_status_event(event_type: str, event_data: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize cc_bridge lifecycle into a stable SSE event for UI/adapters."""
     tool_name = str(event_data.get("name") or "").strip()
@@ -346,35 +398,17 @@ def _extract_cc_bridge_status_event(event_type: str, event_data: dict[str, Any])
 
 
 def _minimax_m2_family_no_vision(model_name: str) -> bool:
-    """MiniMax M2 chat line does not accept image/audio input (vendor docs).
+    """MiniMax M2 chat line does not accept image/audio input (vendor docs)."""
+    from agenticx.llms.vision import _minimax_m2_family_no_vision as _impl
 
-    Applies to MiniMax-M2, M2.1, M2.5, M2.7 and *-highspeed SKUs; exclude ids containing vl/vision.
-    """
-    raw = str(model_name or "").strip().lower()
-    if not raw:
-        return False
-    if "/" in raw:
-        raw = raw.rsplit("/", 1)[-1]
-    if "vl" in raw or "vision" in raw:
-        return False
-    if raw.startswith("minimax-m2"):
-        return True
-    return bool(re.match(r"^m2[.\-_]?\d", raw))
+    return _impl(model_name)
 
 
 def _zhipu_glm5_family_no_vision(model_name: str) -> bool:
-    """GLM-5 chat SKUs on BigModel v4 reject multimodal message parts (image_url).
+    """GLM-5 chat SKUs on BigModel v4 reject multimodal message parts (image_url)."""
+    from agenticx.llms.vision import _zhipu_glm5_family_no_vision as _impl
 
-    Vision-capable ids typically include 4v/5v, vl, or vision; those must stay allowed.
-    """
-    raw = str(model_name or "").strip().lower()
-    if not raw:
-        return False
-    if "/" in raw:
-        raw = raw.rsplit("/", 1)[-1]
-    if "vl" in raw or "vision" in raw or "4v" in raw or "5v" in raw:
-        return False
-    return raw == "glm-5" or raw.startswith("glm-5-")
+    return _impl(model_name)
 
 
 async def _llm_suggest_session_title_job(manager: SessionManager, session_id: str) -> None:
@@ -463,7 +497,7 @@ def _build_automation_runner_system_prompt(
 
     lines: list[str] = [
         "# 定时 / 自动化任务执行器",
-        "你是 Machi 的**定时任务执行器**。本轮用户输入即任务说明（含输出格式、数据来源与失败处理等硬性要求）。",
+        "你是 Near 的**定时任务执行器**。本轮用户输入即任务说明（含输出格式、数据来源与失败处理等硬性要求）。",
         "- **当前是执行阶段，不是建任务阶段**：禁止询问执行频率、日期、时间等调度参数；这些参数已由调度器确定。",
         "## 任务根目录（与 Desktop 配置一致）",
         "- **定义**：用户在自动化设置里填写的 **工作区**；若留空，则为 `~/.agenticx/crontask/<task_id>`（每个定时任务独占一个子目录，与对话一一对应）。",
@@ -986,7 +1020,7 @@ def create_studio_app() -> FastAPI:
     def _modelscope_headers() -> dict[str, str]:
         headers = {
             "Content-Type": "application/json",
-            "User-Agent": "AgenticX/0.3.9",
+            "User-Agent": "AgenticX/0.4.1",
         }
         token = str(os.getenv("MODELSCOPE_API_TOKEN", "")).strip()
         if token:
@@ -2014,7 +2048,7 @@ def create_studio_app() -> FastAPI:
                         provider_name=provider or session.provider_name,
                         model=model or session.model_name,
                     )
-                    meta_leader_label = str(getattr(payload, "meta_leader_display_name", None) or "").strip() or "Machi"
+                    meta_leader_label = str(getattr(payload, "meta_leader_display_name", None) or "").strip() or DEFAULT_META_PRODUCT_LABEL
                     if isinstance(session.scratchpad, dict):
                         session.scratchpad[META_LEADER_LABEL_SCRATCH_KEY] = meta_leader_label
                     router = GroupChatRouter(
@@ -2128,10 +2162,15 @@ def create_studio_app() -> FastAPI:
         event_queue: "asyncio.Queue[RuntimeEvent | None]"
         import asyncio
 
+        use_event_hub = live_reattach_enabled()
+        event_hub = manager.ensure_event_hub(payload.session_id) if use_event_hub else None
         event_queue = asyncio.Queue()
 
         async def _on_team_event(event: RuntimeEvent) -> None:
-            await event_queue.put(event)
+            if event_hub is not None:
+                await event_hub.publish(event)
+            else:
+                await event_queue.put(event)
 
         async def _on_subagent_summary(summary: str, context) -> None:
             agent_id = getattr(context, "agent_id", "unknown")
@@ -2306,176 +2345,248 @@ def create_studio_app() -> FastAPI:
             keep_runtime_after_disconnect = bool(
                 getattr(payload, "keep_runtime_after_disconnect", False)
             )
+            if event_hub is not None:
+                keep_runtime_after_disconnect = True
             client_disconnected = False
+            hub_sub_id: int | None = None
+            hub_sub_q: asyncio.Queue[BufferedEvent] | None = None
+
+            async def _track_runtime_event(event: RuntimeEvent) -> None:
+                nonlocal saw_final, had_runtime_failure
+                if event.agent_id == "meta" and event.type == EventType.TOOL_RESULT.value:
+                    _flush_taskspace_hint(payload.session_id, session)
+                if event.type in ("subagent_started", "subagent_completed", "subagent_error"):
+                    logger.info("[sse] yielding %s agent=%s", event.type, event.agent_id)
+                if event.type == EventType.FINAL.value and event.agent_id == "meta":
+                    saw_final = True
+                    snap = str(getattr(managed, "session_name", None) or "").strip()
+                    if manager.claim_llm_title_slot(payload.session_id, snap):
+                        asyncio.create_task(
+                            _llm_suggest_session_title_job(manager, payload.session_id)
+                        )
+                elif _runtime_error_counts_as_failure(event):
+                    had_runtime_failure = True
+
             try:
                 async def _produce_meta_events() -> None:
-                    setattr(
-                        session,
-                        "bound_avatar_id",
-                        active_avatar_id if is_avatar_session else None,
-                    )
-                    _meta_label = str(getattr(payload, "meta_leader_display_name", None) or "").strip() or "Machi"
-                    if isinstance(session.scratchpad, dict):
-                        session.scratchpad[META_LEADER_LABEL_SCRATCH_KEY] = _meta_label
-                    auto = AutoSolveMode()
-                    effective_input = payload.user_input
-                    quoted_content = str(payload.quoted_content or "").strip()
-                    if quoted_content:
-                        # For non-group sessions, explicitly append quoted snippet so model
-                        # can ground "改这句/这段" style follow-up requests.
-                        effective_input = f"{effective_input}\n\n[用户引用内容]\n{quoted_content}"
-                    if mode == "auto":
-                        enriched = auto.enrich_prompt(payload.user_input)
-                        effective_input = (
-                            f"{enriched['prompt']}\n\n"
-                            f"请直接给出可执行方案并自动推进。\n"
-                            f"原始请求：{payload.user_input}"
+                    nonlocal saw_final, had_runtime_failure
+                    try:
+                        setattr(
+                            session,
+                            "bound_avatar_id",
+                            active_avatar_id if is_avatar_session else None,
                         )
-                    if is_avatar_session:
-                        if is_automation_session:
-                            sys_prompt = _build_automation_runner_system_prompt(
-                                active_avatar_id,
-                                getattr(managed, "taskspaces", None) or [],
-                                str(getattr(session, "workspace_dir", "") or ""),
+                        _meta_label = str(getattr(payload, "meta_leader_display_name", None) or "").strip() or DEFAULT_META_PRODUCT_LABEL
+                        if isinstance(session.scratchpad, dict):
+                            session.scratchpad[META_LEADER_LABEL_SCRATCH_KEY] = _meta_label
+                        auto = AutoSolveMode()
+                        effective_input = payload.user_input
+                        quoted_content = str(payload.quoted_content or "").strip()
+                        if quoted_content:
+                            effective_input = f"{effective_input}\n\n[用户引用内容]\n{quoted_content}"
+                        if mode == "auto":
+                            enriched = auto.enrich_prompt(payload.user_input)
+                            effective_input = (
+                                f"{enriched['prompt']}\n\n"
+                                f"请直接给出可执行方案并自动推进。\n"
+                                f"原始请求：{payload.user_input}"
+                            )
+                        if is_avatar_session:
+                            if is_automation_session:
+                                sys_prompt = _build_automation_runner_system_prompt(
+                                    active_avatar_id,
+                                    getattr(managed, "taskspaces", None) or [],
+                                    str(getattr(session, "workspace_dir", "") or ""),
+                                )
+                            else:
+                                sys_prompt = _build_avatar_direct_prompt()
+                                try:
+                                    from agenticx.runtime.prompts.meta_agent import (
+                                        _build_computer_use_capabilities_block,
+                                    )
+
+                                    _cu_ctx = _build_computer_use_capabilities_block()
+                                    if _cu_ctx:
+                                        sys_prompt += "\n\n" + _cu_ctx
+                                except Exception:
+                                    pass
+                                _ts_ctx = _build_taskspaces_context(
+                                    list(getattr(managed, "taskspaces", None) or [])
+                                )
+                                if _ts_ctx:
+                                    sys_prompt += "\n\n" + _ts_ctx
+                                try:
+                                    from agenticx.cli.studio_skill import get_all_skill_summaries
+                                    from agenticx.runtime.prompts.meta_agent import _build_skills_context
+
+                                    _av_skill_summaries = get_all_skill_summaries(
+                                        bound_avatar_id=active_avatar_id,
+                                    )
+                                    sys_prompt += "\n\n" + _build_skills_context(_av_skill_summaries)
+                                except Exception:
+                                    pass
+                        else:
+                            _u_nickname = str(getattr(payload, "user_nickname", None) or "").strip()
+                            _u_preference = str(getattr(payload, "user_preference", None) or "").strip()
+                            sys_prompt = build_meta_agent_system_prompt(
+                                session,
+                                mode=mode,
+                                taskspaces=managed.taskspaces,
+                                avatar_context=avatar_context,
+                                group_chat=_meta_group_chat_payload(managed),
+                                user_nickname=_u_nickname,
+                                user_preference=_u_preference,
+                            )
+                        user_message_content: Any | None = None
+                        history_user_attachments: list[dict[str, Any]] | None = None
+
+                        async def _runtime_should_stop() -> bool:
+                            if manager.should_interrupt(payload.session_id):
+                                return True
+                            if keep_runtime_after_disconnect:
+                                return False
+                            return await request.is_disconnected()
+
+                        if image_inputs:
+                            content_blocks: list[dict[str, Any]] = [{"type": "text", "text": effective_input}]
+                            for image in image_inputs:
+                                content_blocks.append(
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {"url": image["data_url"]},
+                                    }
+                                )
+                            user_message_content = content_blocks
+                            history_user_attachments = _history_attachments_from_image_inputs(image_inputs)
+                        _turn_cf = (
+                            _normalize_context_files(payload.context_files)
+                            if getattr(payload, "context_files", None)
+                            else {}
+                        )
+                        _cf_hist = _history_attachments_from_context_files(_turn_cf)
+                        if _cf_hist:
+                            if history_user_attachments is None:
+                                history_user_attachments = []
+                            history_user_attachments.extend(_cf_hist)
+                        async for event in runtime.run_turn(
+                            effective_input,
+                            session,
+                            should_stop=_runtime_should_stop,
+                            agent_id="meta",
+                            tools=effective_tools,
+                            system_prompt=sys_prompt,
+                            user_message_content=user_message_content,
+                            history_user_attachments=history_user_attachments,
+                            persist_user_message=not bool(getattr(payload, "skip_user_history", False)),
+                            usage_session_id=payload.session_id,
+                            usage_avatar_id=str(getattr(managed, "avatar_id", "") or ""),
+                        ):
+                            if event_hub is not None:
+                                await _track_runtime_event(event)
+                                await event_hub.publish(event)
+                            else:
+                                await event_queue.put(event)
+                    except Exception as exc:
+                        had_runtime_failure = True
+                        if event_hub is not None:
+                            err_evt = RuntimeEvent(
+                                type=EventType.ERROR.value,
+                                data={"text": f"Runtime error: {exc}"},
+                                agent_id="meta",
+                            )
+                            await event_hub.publish(err_evt)
+                        else:
+                            raise
+                    finally:
+                        if event_hub is not None:
+                            await event_hub.publish_done()
+                            _finalize_chat_runtime(
+                                manager,
+                                payload.session_id,
+                                session,
+                                saw_final=saw_final,
+                                had_runtime_failure=had_runtime_failure,
                             )
                         else:
-                            sys_prompt = _build_avatar_direct_prompt()
-                            try:
-                                from agenticx.runtime.prompts.meta_agent import (
-                                    _build_computer_use_capabilities_block,
-                                )
-
-                                _cu_ctx = _build_computer_use_capabilities_block()
-                                if _cu_ctx:
-                                    sys_prompt += "\n\n" + _cu_ctx
-                            except Exception:
-                                pass
-                            # Same taskspace list as Meta-Agent / Desktop workspace panel (managed.taskspaces).
-                            _ts_ctx = _build_taskspaces_context(
-                                list(getattr(managed, "taskspaces", None) or [])
-                            )
-                            if _ts_ctx:
-                                sys_prompt += "\n\n" + _ts_ctx
-                            try:
-                                from agenticx.cli.studio_skill import get_all_skill_summaries
-                                from agenticx.runtime.prompts.meta_agent import _build_skills_context
-
-                                _av_skill_summaries = get_all_skill_summaries(
-                                    bound_avatar_id=active_avatar_id,
-                                )
-                                sys_prompt += "\n\n" + _build_skills_context(_av_skill_summaries)
-                            except Exception:
-                                pass
-                    else:
-                        _u_nickname = str(getattr(payload, "user_nickname", None) or "").strip()
-                        _u_preference = str(getattr(payload, "user_preference", None) or "").strip()
-                        sys_prompt = build_meta_agent_system_prompt(
-                            session,
-                            mode=mode,
-                            taskspaces=managed.taskspaces,
-                            avatar_context=avatar_context,
-                            group_chat=_meta_group_chat_payload(managed),
-                            user_nickname=_u_nickname,
-                            user_preference=_u_preference,
-                        )
-                    user_message_content: Any | None = None
-                    history_user_attachments: list[dict[str, Any]] | None = None
-                    async def _runtime_should_stop() -> bool:
-                        if manager.should_interrupt(payload.session_id):
-                            return True
-                        if keep_runtime_after_disconnect:
-                            return False
-                        return await request.is_disconnected()
-                    if image_inputs:
-                        content_blocks: list[dict[str, Any]] = [{"type": "text", "text": effective_input}]
-                        for image in image_inputs:
-                            content_blocks.append(
-                                {
-                                    "type": "image_url",
-                                    "image_url": {"url": image["data_url"]},
-                                }
-                            )
-                        user_message_content = content_blocks
-                        history_user_attachments = _history_attachments_from_image_inputs(image_inputs)
-                    _turn_cf = (
-                        _normalize_context_files(payload.context_files)
-                        if getattr(payload, "context_files", None)
-                        else {}
-                    )
-                    _cf_hist = _history_attachments_from_context_files(_turn_cf)
-                    if _cf_hist:
-                        if history_user_attachments is None:
-                            history_user_attachments = []
-                        history_user_attachments.extend(_cf_hist)
-                    async for event in runtime.run_turn(
-                        effective_input,
-                        session,
-                        should_stop=_runtime_should_stop,
-                        agent_id="meta",
-                        tools=effective_tools,
-                        system_prompt=sys_prompt,
-                        user_message_content=user_message_content,
-                        history_user_attachments=history_user_attachments,
-                        persist_user_message=not bool(getattr(payload, "skip_user_history", False)),
-                        usage_session_id=payload.session_id,
-                        usage_avatar_id=str(getattr(managed, "avatar_id", "") or ""),
-                    ):
-                        await event_queue.put(event)
-                    await event_queue.put(None)
+                            await event_queue.put(None)
 
                 runtime_task = asyncio.create_task(_produce_meta_events())
 
-                while True:
-                    if await request.is_disconnected():
-                        if not keep_runtime_after_disconnect:
+                if event_hub is not None:
+                    hub_sub_id, hub_sub_q, _ = event_hub.subscribe()
+                    while True:
+                        if await request.is_disconnected():
+                            client_disconnected = True
                             break
-                        client_disconnected = True
-                    timed_out = False
-                    try:
-                        event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
-                    except asyncio.TimeoutError:
-                        timed_out = True
-                        event = None
-                    if timed_out:
-                        pass
-                    elif event is None:
-                        meta_done = True
-                    else:
-                        if event.agent_id == "meta" and event.type == EventType.TOOL_RESULT.value:
-                            _flush_taskspace_hint(payload.session_id, session)
-                        if event.type in ("subagent_started", "subagent_completed", "subagent_error"):
-                            logger.info("[sse] yielding %s agent=%s", event.type, event.agent_id)
-                        if not client_disconnected:
-                            for line in _runtime_event_to_sse_lines(event):
-                                yield line
-                        if event.type == EventType.FINAL.value and event.agent_id == "meta":
-                            saw_final = True
-                            snap = str(getattr(managed, "session_name", None) or "").strip()
-                            if manager.claim_llm_title_slot(payload.session_id, snap):
-                                asyncio.create_task(
-                                    _llm_suggest_session_title_job(manager, payload.session_id)
-                                )
-                        elif _runtime_error_counts_as_failure(event):
-                            had_runtime_failure = True
-                    if not meta_done:
-                        continue
-                    # Do not block the main chat stream on background sub-agent execution.
-                    # This keeps the main dialogue responsive; users can continue asking
-                    # new questions while sub-agents keep running asynchronously.
-                    if event_queue.empty():
-                        break
+                        try:
+                            buffered = await asyncio.wait_for(hub_sub_q.get(), timeout=0.1)
+                        except asyncio.TimeoutError:
+                            if event_hub.is_runtime_done and hub_sub_q.empty():
+                                yield 'data: {"type":"done","data":{}}\n\n'
+                                break
+                            continue
+                        if buffered.event is None:
+                            yield 'data: {"type":"done","data":{}}\n\n'
+                            break
+                        for line in _buffered_event_to_sse_lines(buffered):
+                            yield line
+                else:
+                    while True:
+                        if await request.is_disconnected():
+                            if not keep_runtime_after_disconnect:
+                                break
+                            client_disconnected = True
+                        timed_out = False
+                        try:
+                            event = await asyncio.wait_for(event_queue.get(), timeout=0.1)
+                        except asyncio.TimeoutError:
+                            timed_out = True
+                            event = None
+                        if timed_out:
+                            pass
+                        elif event is None:
+                            meta_done = True
+                        else:
+                            if event.agent_id == "meta" and event.type == EventType.TOOL_RESULT.value:
+                                _flush_taskspace_hint(payload.session_id, session)
+                            if event.type in ("subagent_started", "subagent_completed", "subagent_error"):
+                                logger.info("[sse] yielding %s agent=%s", event.type, event.agent_id)
+                            if not client_disconnected:
+                                for line in _runtime_event_to_sse_lines(event):
+                                    yield line
+                            if event.type == EventType.FINAL.value and event.agent_id == "meta":
+                                saw_final = True
+                                snap = str(getattr(managed, "session_name", None) or "").strip()
+                                if manager.claim_llm_title_slot(payload.session_id, snap):
+                                    asyncio.create_task(
+                                        _llm_suggest_session_title_job(manager, payload.session_id)
+                                    )
+                            elif _runtime_error_counts_as_failure(event):
+                                had_runtime_failure = True
+                        if not meta_done:
+                            continue
+                        if event_queue.empty():
+                            break
             except Exception as exc:
                 had_runtime_failure = True
                 err = SseEvent(type="error", data={"text": f"Runtime error: {exc}"})
                 if not client_disconnected:
                     yield f"data: {json.dumps(err.model_dump(), ensure_ascii=False)}\n\n"
             finally:
+                if hub_sub_id is not None and event_hub is not None:
+                    event_hub.unsubscribe(hub_sub_id)
                 if runtime_task is not None and not runtime_task.done():
-                    if keep_runtime_after_disconnect and client_disconnected:
+                    if event_hub is not None and client_disconnected:
+                        logger.info(
+                            "[chat] client disconnected, runtime continues (hub) session=%s",
+                            payload.session_id,
+                        )
+                    elif keep_runtime_after_disconnect and client_disconnected:
                         with contextlib.suppress(Exception):
                             await asyncio.wait_for(runtime_task, timeout=1.0)
                     if runtime_task is not None and not runtime_task.done():
-                        runtime_task.cancel()
+                        if event_hub is None or not client_disconnected:
+                            runtime_task.cancel()
                     else:
                         logger.info(
                             "[chat] runtime finished after disconnect session=%s",
@@ -2483,19 +2594,20 @@ def create_studio_app() -> FastAPI:
                         )
                 elif runtime_task is not None and runtime_task.done():
                     task_exc = runtime_task.exception()
-                    if task_exc is not None:
+                    if task_exc is not None and event_hub is None:
                         had_runtime_failure = True
-                _flush_taskspace_hint(payload.session_id, session)
-                end_state = _resolve_chat_end_execution_state(
-                    manager,
-                    payload.session_id,
-                    saw_final=saw_final,
-                    had_runtime_failure=had_runtime_failure,
-                )
-                manager.clear_interrupt(payload.session_id)
-                manager.set_execution_state(payload.session_id, end_state)
-                manager.persist(payload.session_id)
-            if not client_disconnected:
+                if event_hub is None:
+                    _flush_taskspace_hint(payload.session_id, session)
+                    end_state = _resolve_chat_end_execution_state(
+                        manager,
+                        payload.session_id,
+                        saw_final=saw_final,
+                        had_runtime_failure=had_runtime_failure,
+                    )
+                    manager.clear_interrupt(payload.session_id)
+                    manager.set_execution_state(payload.session_id, end_state)
+                    manager.persist(payload.session_id)
+            if not client_disconnected and event_hub is None:
                 yield 'data: {"type":"done","data":{}}\n\n'
 
         return StreamingResponse(_event_stream(), media_type="text/event-stream")
@@ -2524,15 +2636,18 @@ def create_studio_app() -> FastAPI:
 
         exec_state = str(getattr(managed, "execution_state", "idle") or "idle")
         if source == "desktop_manual" and exec_state == "running":
-            async def _still_running() -> AsyncGenerator[str, None]:
-                evt = SseEvent(
-                    type="continuation_rejected",
-                    data={"text": "任务仍在后台执行中，可继续等待或主动中断"},
-                )
-                yield f"data: {json.dumps(evt.model_dump(), ensure_ascii=False)}\n\n"
-                yield 'data: {"type":"done","data":{}}\n\n'
-
-            return StreamingResponse(_still_running(), media_type="text/event-stream")
+            manager.request_interrupt(session_id)
+            # Give the in-flight run loop a brief window to observe the interrupt
+            # flag and exit before we start a new continuation stream; otherwise
+            # two runs race on execution_state / chat_history / tool sequence.
+            for _ in range(20):
+                await asyncio.sleep(0.1)
+                cur = str(getattr(managed, "execution_state", "idle") or "idle")
+                if cur in {"idle", "interrupted"}:
+                    break
+            manager.set_execution_state(session_id, "interrupted")
+            manager.persist(session_id)
+            exec_state = "interrupted"
 
         max_nudge = int(
             __import__("agenticx.studio.continuation", fromlist=["get_runtime_value"]).get_runtime_value(
@@ -2546,6 +2661,7 @@ def create_studio_app() -> FastAPI:
             source=source,  # type: ignore[arg-type]
             execution_state=exec_state,
             max_rounds=max_nudge if source == "desktop_auto_nudge" else None,
+            skip_dedupe=source == "desktop_manual",
         )
         if not ok:
             async def _deduped() -> AsyncGenerator[str, None]:
@@ -2582,6 +2698,91 @@ def create_studio_app() -> FastAPI:
                     yield chunk
 
         return StreamingResponse(_wrapped_stream(), media_type="text/event-stream")
+
+    @app.get("/api/sessions/{session_id}/stream")
+    async def reattach_session_stream(
+        session_id: str,
+        request: Request,
+        since: str | None = Query(default=None),
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> StreamingResponse:
+        """Read-only SSE reattach for a running session (live reattach feature)."""
+        _check_token(x_agx_desktop_token)
+        sid = str(session_id or "").strip()
+        if not sid:
+            raise HTTPException(status_code=400, detail="session_id is required")
+
+        if not live_reattach_enabled():
+            async def _disabled() -> AsyncGenerator[str, None]:
+                err = SseEvent(type="error", data={"text": "live reattach disabled"})
+                yield f"data: {json.dumps(err.model_dump(), ensure_ascii=False)}\n\n"
+                yield 'data: {"type":"done","data":{"reason":"disabled"}}\n\n'
+
+            return StreamingResponse(_disabled(), media_type="text/event-stream")
+
+        managed = manager.get(sid, touch=False)
+        if managed is None:
+            raise HTTPException(status_code=404, detail="session not found")
+
+        hub = manager.get_event_hub(sid)
+
+        async def _reattach_stream() -> AsyncGenerator[str, None]:
+            if hub is None or not hub.is_active:
+                yield 'data: {"type":"done","data":{"reason":"not_running"}}\n\n'
+                return
+
+            since_seq = _parse_sse_since_seq(last_event_id, since)
+            # Subscribe BEFORE replaying so events published during replay land in
+            # the live queue; replay covers (since_seq, sub_seq], live covers > sub_seq.
+            sub_id, sub_q, sub_seq = hub.subscribe()
+            try:
+                oldest = hub.oldest_buffered_seq()
+                if (
+                    since_seq > 0
+                    and oldest is not None
+                    and since_seq < oldest - 1
+                ):
+                    gap_evt = SseEvent(
+                        type="replay_gap",
+                        data={"since": since_seq, "oldest_buffered": oldest},
+                    )
+                    yield f"data: {json.dumps(gap_evt.model_dump(), ensure_ascii=False)}\n\n"
+
+                done_in_replay = False
+                for buffered in hub.replay_since(since_seq):
+                    if buffered.seq > sub_seq:
+                        # Anything newer than the subscription point is delivered
+                        # via the live queue below; avoid double-sending.
+                        break
+                    for line in _buffered_event_to_sse_lines(buffered):
+                        yield line
+                    if buffered.event is None:
+                        done_in_replay = True
+                        break
+                if done_in_replay:
+                    return
+
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        buffered = await asyncio.wait_for(sub_q.get(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        if hub.is_runtime_done:
+                            break
+                        continue
+                    if buffered.seq <= sub_seq:
+                        # Already emitted during replay.
+                        continue
+                    for line in _buffered_event_to_sse_lines(buffered):
+                        yield line
+                    if buffered.event is None:
+                        break
+            finally:
+                hub.unsubscribe(sub_id)
+
+        return StreamingResponse(_reattach_stream(), media_type="text/event-stream")
 
     @app.put("/api/sessions/{session_id}/unattended")
     async def set_session_unattended(
@@ -3470,7 +3671,7 @@ def create_studio_app() -> FastAPI:
             "codegen": "code",
             "lsp_goto_definition": "code", "lsp_find_references": "code", "lsp_hover": "code", "lsp_diagnostics": "code",
             "mcp_connect": "mcp", "mcp_call": "mcp", "mcp_import": "mcp",
-            "skill_use": "skill", "skill_list": "skill", "skill_manage": "skill",
+            "skill_use": "skill", "skill_list": "skill", "skill_manage": "skill", "skill_import_repo": "skill",
             "todo_write": "agent", "scratchpad_write": "agent", "scratchpad_read": "agent",
             "memory_append": "memory", "memory_search": "memory", "session_search": "memory",
             "liteparse": "document",
@@ -4600,6 +4801,105 @@ def create_studio_app() -> FastAPI:
             logger.warning("put_skill_settings error: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    @app.get("/api/skills/guard-settings")
+    async def get_guard_settings(
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        try:
+            from agenticx.skills.guard_config import guard_settings_payload
+
+            return {"ok": True, **guard_settings_payload()}
+        except Exception as exc:
+            logger.warning("get_guard_settings error: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+    @app.put("/api/skills/guard-settings")
+    async def put_guard_settings(
+        payload: dict,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        try:
+            from agenticx.skills.guard_config import guard_settings_payload, persist_guard_settings
+
+            version = payload.get("version")
+            scan_mode = payload.get("scan_mode")
+            llm_verify = payload.get("llm_verify")
+            if version is not None:
+                version = int(version)
+                if version not in (1, 2):
+                    raise HTTPException(status_code=400, detail="version must be 1 or 2")
+            if scan_mode is not None:
+                sm = str(scan_mode).strip().lower()
+                if sm not in {"quick", "standard", "full"}:
+                    raise HTTPException(status_code=400, detail="invalid scan_mode")
+                scan_mode = sm
+            if llm_verify is not None and not isinstance(llm_verify, bool):
+                raise HTTPException(status_code=400, detail="llm_verify must be boolean")
+            persist_guard_settings(
+                version=version,
+                scan_mode=scan_mode,
+                llm_verify=llm_verify,
+            )
+            return {"ok": True, **guard_settings_payload()}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("put_guard_settings error: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.post("/api/skills/guard-scan")
+    async def post_guard_scan(
+        payload: dict,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        """Deep skill security scan by directory path or SKILL.md markdown body."""
+        _check_token(x_agx_desktop_token)
+        skill_path = str(payload.get("skill_path") or "").strip()
+        markdown = payload.get("markdown")
+        skill_name = str(payload.get("skill_name") or "").strip()
+        mode = str(payload.get("mode") or "standard").strip().lower()
+        if mode not in {"quick", "standard", "full"}:
+            raise HTTPException(status_code=400, detail="mode must be quick|standard|full")
+        verify_llm = bool(payload.get("verify_with_llm", False))
+        html_report = bool(payload.get("html_report", False))
+        try:
+            import tempfile
+            from pathlib import Path as _Path
+
+            from agenticx.skills.guard import scan_result_to_payload, scan_skill_deep, scan_skill_markdown_text
+            from agenticx.skills.guard_report import render_html_report
+
+            if markdown is not None:
+                text = str(markdown)
+                if mode == "full":
+                    with tempfile.TemporaryDirectory() as td:
+                        d = _Path(td) / "skill"
+                        d.mkdir()
+                        (d / "SKILL.md").write_text(text, encoding="utf-8")
+                        result = scan_skill_deep(
+                            d, source="community", mode=mode, verify_with_llm=verify_llm,
+                        )
+                else:
+                    result = scan_skill_markdown_text(text, source="community")
+            elif skill_path:
+                p = _Path(skill_path).expanduser()
+                if not p.exists():
+                    raise HTTPException(status_code=400, detail="skill_path not found")
+                result = scan_skill_deep(p, source="community", mode=mode, verify_with_llm=verify_llm)
+            else:
+                raise HTTPException(status_code=400, detail="skill_path or markdown required")
+            out: dict = {"ok": True, "scan": scan_result_to_payload(result, skill_name or skill_path or "skill")}
+            if html_report:
+                out["html"] = render_html_report(result, skill_name=skill_name, skill_path=skill_path)
+            return out
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("post_guard_scan error: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
     # -- Usage dashboard ---------------------------------------------------------
 
     def _usage_parse_range_ms(
@@ -4910,6 +5210,159 @@ def create_studio_app() -> FastAPI:
             }
         except Exception as exc:
             logger.warning("put_permissions error: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # --- Provider config (Desktop remote-mode source of truth) ---
+
+    @app.get("/api/config/providers")
+    async def get_config_providers(
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        """Return provider configuration (providers map + default/active selections).
+
+        Mirrors the shape that Desktop's local ``load-config`` IPC returns for the
+        provider-related fields, so the renderer can transparently swap between
+        local YAML reads and remote API reads in remote mode.
+        """
+        _check_token(x_agx_desktop_token)
+        try:
+            from agenticx.cli.config_manager import ConfigManager
+
+            providers_raw = ConfigManager.get_value("providers") or {}
+            providers: dict[str, Any] = {}
+            if isinstance(providers_raw, dict):
+                for name, entry in providers_raw.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    providers[str(name)] = dict(entry)
+            return {
+                "ok": True,
+                "defaultProvider": str(ConfigManager.get_value("default_provider") or ""),
+                "providers": providers,
+                "activeProvider": str(ConfigManager.get_value("active_provider") or ""),
+                "activeModel": str(ConfigManager.get_value("active_model") or ""),
+            }
+        except Exception as exc:
+            logger.warning("get_config_providers error: %s", exc)
+            return {"ok": False, "providers": {}, "error": str(exc)}
+
+    @app.put("/api/config/providers/{name}")
+    async def put_config_provider(
+        name: str,
+        payload: dict,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        """Upsert a single provider entry by name.
+
+        Body fields are optional; missing fields preserve the previous value
+        (parity with Desktop's local ``save-provider`` IPC semantics).
+        """
+        _check_token(x_agx_desktop_token)
+        try:
+            from agenticx.cli.config_manager import ConfigManager
+
+            cleaned = str(name or "").strip()
+            if not cleaned:
+                raise HTTPException(status_code=400, detail="provider name required")
+            existing = ConfigManager.get_value(f"providers.{cleaned}") or {}
+            if not isinstance(existing, dict):
+                existing = {}
+            entry: dict[str, Any] = dict(existing)
+            for src_key, dst_key in (
+                ("apiKey", "api_key"),
+                ("baseUrl", "base_url"),
+                ("model", "model"),
+                ("models", "models"),
+            ):
+                if src_key in payload and payload[src_key] is not None:
+                    entry[dst_key] = payload[src_key]
+            if "enabled" in payload and isinstance(payload["enabled"], bool):
+                entry["enabled"] = payload["enabled"]
+            elif not isinstance(entry.get("enabled"), bool):
+                entry["enabled"] = True
+            if payload.get("dropParams") is True:
+                entry["drop_params"] = True
+            elif payload.get("dropParams") is False and "drop_params" in entry:
+                del entry["drop_params"]
+            if "displayName" in payload:
+                disp = str(payload.get("displayName") or "").strip()
+                if disp:
+                    entry["display_name"] = disp
+                elif "display_name" in entry:
+                    del entry["display_name"]
+            if "interface" in payload:
+                if payload["interface"] == "openai":
+                    entry["interface"] = "openai"
+                elif "interface" in entry:
+                    del entry["interface"]
+            ConfigManager.set_value(f"providers.{cleaned}", entry)
+            return {"ok": True}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("put_config_provider error name=%s: %s", name, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.delete("/api/config/providers/{name}")
+    async def delete_config_provider(
+        name: str,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        """Remove a provider entry; promotes the first remaining as default if needed."""
+        _check_token(x_agx_desktop_token)
+        try:
+            from agenticx.cli.config_manager import ConfigManager
+
+            cleaned = str(name or "").strip()
+            if not cleaned:
+                raise HTTPException(status_code=400, detail="provider name required")
+            providers_raw = ConfigManager.get_value("providers") or {}
+            if not isinstance(providers_raw, dict):
+                providers_raw = {}
+            providers = {str(k): v for k, v in providers_raw.items() if str(k) != cleaned}
+            ConfigManager.set_value("providers", providers)
+            current_default = str(ConfigManager.get_value("default_provider") or "")
+            if current_default == cleaned:
+                fallback = next(iter(providers.keys())) if providers else ""
+                ConfigManager.set_value("default_provider", fallback)
+            return {"ok": True}
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning("delete_config_provider error name=%s: %s", name, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.put("/api/config/default-provider")
+    async def put_config_default_provider(
+        payload: dict,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        try:
+            from agenticx.cli.config_manager import ConfigManager
+
+            ConfigManager.set_value("default_provider", str(payload.get("name") or "").strip())
+            return {"ok": True}
+        except Exception as exc:
+            logger.warning("put_config_default_provider error: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    @app.put("/api/config/active-model")
+    async def put_config_active_model(
+        payload: dict,
+        x_agx_desktop_token: str | None = Header(default=None),
+    ) -> dict:
+        _check_token(x_agx_desktop_token)
+        try:
+            from agenticx.cli.config_manager import ConfigManager
+
+            if "provider" in payload:
+                ConfigManager.set_value("active_provider", str(payload.get("provider") or "").strip())
+            if "model" in payload:
+                ConfigManager.set_value("active_model", str(payload.get("model") or "").strip())
+            return {"ok": True}
+        except Exception as exc:
+            logger.warning("put_config_active_model error: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     # --- CC Bridge (local Claude Code HTTP) config ---

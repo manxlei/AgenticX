@@ -130,6 +130,8 @@ _CONCURRENCY_SAFE_STUDIO_TOOLS = frozenset(
         "cc_bridge_list",
         "knowledge_search",  # Plan-Id: machi-kb-stage1-local-mvp — read-only vector search.
         "web_search",
+        "web_fetch",
+        "view_image",
     }
 )
 
@@ -355,14 +357,21 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "file_write",
-            "description": "Write full file content; show unified diff and ask confirmation before writing.",
+            "description": (
+                "Write full file content; show unified diff and ask confirmation before writing. "
+                "Use from_path to copy from a local file instead of inline content."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path."},
-                    "content": {"type": "string", "description": "New full content."},
+                    "content": {"type": "string", "description": "New full content (omit when using from_path)."},
+                    "from_path": {
+                        "type": "string",
+                        "description": "Copy content from this local file path (workspace-relative or absolute).",
+                    },
                 },
-                "required": ["path", "content"],
+                "required": ["path"],
                 "additionalProperties": False,
             },
         },
@@ -415,7 +424,10 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "mcp_connect",
-            "description": "Connect one configured MCP server.",
+            "description": (
+                "Connect one configured MCP server. API keys belong in Near Settings → MCP "
+                "(~/.agenticx/mcp.json env) or OS environment—never ask the user to paste secrets in chat."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -578,7 +590,10 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "mcp_import",
-            "description": "Import MCP server configs from external mcp.json into AgenticX workspace config.",
+            "description": (
+                "Import MCP server configs from external mcp.json into AgenticX workspace config. "
+                "Do not collect API keys in chat; user fills env in Settings → MCP."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -628,10 +643,11 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
             "name": "skill_manage",
             "description": (
                 "Create, patch, or delete skills stored under ~/.agenticx/skills/. "
-                "For 'create': provide action + name + content (the full SKILL.md text). "
+                "For 'create': provide action + name + content, or use from_path/from_url "
+                "instead of inline content for large SKILL.md files. "
                 "For 'patch': provide action + name + old_string + new_string. "
                 "For 'delete': provide action + name. "
-                "Sub-paths are supported (e.g. name='ima/notes' creates ~/.agenticx/skills/ima/notes/SKILL.md). "
+                "Sub-paths are supported (e.g. name='ima/notes'). "
                 "IMPORTANT: never call with empty arguments — action and name are always required."
             ),
             "parameters": {
@@ -653,15 +669,69 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
                     "content": {
                         "type": "string",
                         "description": (
-                            "Required for 'create': the full SKILL.md text, starting with a YAML frontmatter block "
-                            "(--- name: ... description: ... ---) followed by the skill body. "
-                            "Must not be empty."
+                            "For 'create': full SKILL.md text with YAML frontmatter. "
+                            "Prefer from_path/from_url for large files instead of inline content."
+                        ),
+                    },
+                    "from_path": {
+                        "type": "string",
+                        "description": (
+                            "For 'create': read SKILL.md from this local path (workspace or ~/.agenticx/). "
+                            "Mutually exclusive with content/from_url."
+                        ),
+                    },
+                    "from_url": {
+                        "type": "string",
+                        "description": (
+                            "For 'create': download SKILL.md from an allowlisted https URL "
+                            "(raw.githubusercontent.com, gist, registry.clawhub.ai). "
+                            "Mutually exclusive with content/from_path."
                         ),
                     },
                     "old_string": {"type": "string", "description": "Required for 'patch': exact substring to find and replace in the existing SKILL.md."},
                     "new_string": {"type": "string", "description": "Required for 'patch': replacement text for old_string."},
                 },
                 "required": ["action", "name"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_import_repo",
+            "description": (
+                "Bulk install skills from a GitHub repository into ~/.agenticx/skills/. "
+                "Use dry_run=true first to list pending skills without writing. "
+                "Preferred for installing many skills (e.g. mattpocock/skills)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "GitHub repo as owner/name (e.g. mattpocock/skills).",
+                    },
+                    "branch": {"type": "string", "description": "Branch name (default main)."},
+                    "path_glob": {
+                        "type": "string",
+                        "description": "Glob for SKILL.md paths in the repo tree (default skills/**/SKILL.md).",
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns to exclude (default deprecated/in-progress).",
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": "If true, only return pending/skipped lists without installing.",
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description": "If true, replace existing skills with the same name.",
+                    },
+                },
+                "required": ["repo"],
                 "additionalProperties": False,
             },
         },
@@ -1116,6 +1186,63 @@ STUDIO_TOOLS: List[Dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": (
+                "Fetch a single web URL and return its readable text content plus a list of "
+                "in-page image URLs. Use this when the user provides a URL whose content you "
+                "need to understand. Returns markdown-ish text (HTML stripped) and a structured "
+                "tail block '[discovered_images]' listing absolute image URLs in source order. "
+                "Combine with view_image when visual content matters. Max page size 2 MB."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Absolute http(s) URL to fetch.",
+                    },
+                    "max_images": {
+                        "type": "integer",
+                        "description": "Cap on how many image URLs to return (default 20, hard max 50).",
+                    },
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "view_image",
+            "description": (
+                "Load an image so the model can visually inspect it in the next turn. Accepts a "
+                "local absolute/relative file path, a http(s) URL (e.g. one returned by "
+                "web_fetch's [discovered_images]), or a data:image/* URL. Use when visual content "
+                "is necessary to answer (e.g. user asked 'describe the first image'). Returns an "
+                "error if the current model is not vision-capable. Each turn caps total attached "
+                "images at 4."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "File path, http(s) URL, or data:image/* URL.",
+                    },
+                    "note": {
+                        "type": "string",
+                        "description": "Optional short label used in the placeholder text (e.g. 'cover image').",
+                    },
+                },
+                "required": ["target"],
+                "additionalProperties": False,
+            },
+        },
+    },
     # ── task_experience tools (group team session cross-task memory) ──────────
     {
         "type": "function",
@@ -1431,8 +1558,8 @@ def _agenticx_desktop_use_dir() -> Path:
 
 def _desktop_use_blocked_message() -> str:
     return (
-        "ERROR: 桌面操控工具未启用。请在 Machi 设置中开启「桌面操控」（写入 ~/.agenticx/config.yaml 的 "
-        "computer_use.enabled）后完全重启 Machi。"
+        "ERROR: 桌面操控工具未启用。请在 Near 设置中开启「桌面操控」（写入 ~/.agenticx/config.yaml 的 "
+        "computer_use.enabled）后完全重启 Near。"
     )
 
 
@@ -2520,12 +2647,26 @@ async def _tool_file_write(
             "ERROR: missing required parameter 'path'. "
             "You must provide a full file path, e.g. file_write(path='/Users/.../file.py', content='...')"
         )
+    from_path_arg = str(arguments.get("from_path", "") or "").strip()
     raw_content = arguments.get("content")
-    if raw_content is None:
+    if from_path_arg:
+        try:
+            src = _resolve_workspace_path(from_path_arg, session, pick_existing=True)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        if not src.is_file():
+            return f"ERROR: from_path not found: {src}"
+        try:
+            new_text = _strip_tool_metadata_noise_lines(src.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            return f"ERROR: read from_path failed: {exc}"
+    elif raw_content is None:
         return (
-            "ERROR: missing required parameter 'content'. "
+            "ERROR: missing required parameter 'content' or 'from_path'. "
             "You must provide file content, e.g. file_write(path='/Users/.../file.py', content='...')"
         )
+    else:
+        new_text = _strip_tool_metadata_noise_lines(str(raw_content))
     try:
         path = _resolve_workspace_path(raw_path, session)
     except ValueError as exc:
@@ -2535,7 +2676,6 @@ async def _tool_file_write(
             "ERROR: direct writes to ~/.agenticx/config.yaml are blocked for safety. "
             "Use update_email_config meta tool for notifications.email.* updates."
         )
-    new_text = _strip_tool_metadata_noise_lines(str(raw_content))
     old_text = ""
     if path.exists():
         if not path.is_file():
@@ -3694,22 +3834,288 @@ def _tool_knowledge_search(
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _tool_web_search(arguments: Dict[str, Any]) -> str:
+def _tool_web_search(arguments: Dict[str, Any], session: Optional["StudioSession"] = None) -> str:
     query = str(arguments.get("query", "")).strip()
     if not query:
         return "ERROR: web_search requires a non-empty query"
     raw_mr = arguments.get("max_results")
     try:
         from agenticx.studio.web_search.service import WebSearchService
+        from agenticx.studio.references import queue_web_search_batch
 
         svc = WebSearchService.from_config()
         mr: int | None = None
         if raw_mr is not None and str(raw_mr).strip() != "":
             mr = int(raw_mr)
         hits = svc.search(query, max_results=mr)
+        if session is not None:
+            queue_web_search_batch(
+                session,
+                query=query,
+                hits=hits,
+                provider=str(svc._cfg.default_provider or "duckduckgo"),
+            )
         return WebSearchService.format_results(hits)
     except Exception as exc:
         return f"ERROR: web_search failed: {exc}"
+
+
+PENDING_VISUAL_ATTACHMENTS_KEY = "__pending_visual_attachments__"
+_WEB_FETCH_MAX_BYTES = 2 * 1024 * 1024
+_WEB_FETCH_BODY_CHAR_LIMIT = 12_000
+_VIEW_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+_VIEW_IMAGE_MAX_PENDING = 4
+_ALLOWED_WEB_FETCH_CONTENT_TYPES = (
+    "text/html",
+    "application/xhtml",
+    "text/plain",
+    "text/markdown",
+)
+
+
+def _httpx_transport_for_url(url: str):
+    import httpx
+
+    host = (urlparse(url).hostname or "").lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        return httpx.AsyncHTTPTransport()
+    return None
+
+
+def _detect_image_mime(data: bytes) -> str | None:
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if len(data) >= 6 and data[:6] in {b"GIF87a", b"GIF89a"}:
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 2 and data[:2] == b"BM":
+        return "image/bmp"
+    return None
+
+
+def _filename_from_url(url: str, mime: str) -> str:
+    path = urlparse(url).path.rsplit("/", 1)[-1].strip()
+    if path and "." in path:
+        return path
+    ext = "png"
+    if "jpeg" in mime or "jpg" in mime:
+        ext = "jpg"
+    elif "webp" in mime:
+        ext = "webp"
+    elif "gif" in mime:
+        ext = "gif"
+    elif "bmp" in mime:
+        ext = "bmp"
+    return f"image.{ext}"
+
+
+def _data_url_from_bytes(data: bytes, mime: str) -> str:
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+def _parse_data_image_url(target: str) -> tuple[bytes, str] | None:
+    raw = str(target or "").strip()
+    if not raw.startswith("data:image/"):
+        return None
+    header, _, payload = raw.partition(",")
+    if not payload:
+        return None
+    mime = header[5:].split(";", 1)[0].strip() or "image/png"
+    try:
+        if ";base64" in header.lower():
+            data = base64.b64decode(payload, validate=False)
+        else:
+            from urllib.parse import unquote_to_bytes
+
+            data = unquote_to_bytes(payload)
+    except Exception:
+        return None
+    return data, mime
+
+
+async def _fetch_http_bytes(url: str, *, timeout: float, max_bytes: int) -> tuple[bytes, str, str]:
+    import httpx
+
+    transport = _httpx_transport_for_url(url)
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=True,
+        transport=transport,
+    ) as client:
+        response = await client.get(url)
+        final_url = str(response.url)
+        if response.status_code != 200:
+            raise ValueError(f"http {response.status_code}")
+        content_type = str(response.headers.get("content-type", "") or "").split(";", 1)[0].strip().lower()
+        data = response.content
+        if len(data) > max_bytes:
+            raise ValueError("too-large")
+        return data, content_type, final_url
+
+
+def _pending_visual_attachments(session: Optional[StudioSession]) -> list[dict[str, Any]]:
+    if session is None:
+        return []
+    scratchpad = getattr(session, "scratchpad", None)
+    if not isinstance(scratchpad, dict):
+        session.scratchpad = {}
+        scratchpad = session.scratchpad
+    pending = scratchpad.get(PENDING_VISUAL_ATTACHMENTS_KEY)
+    if not isinstance(pending, list):
+        pending = []
+        scratchpad[PENDING_VISUAL_ATTACHMENTS_KEY] = pending
+    return pending
+
+
+def _session_vision_capable(session: Optional[StudioSession]) -> bool:
+    from agenticx.llms.vision import is_vision_capable
+
+    provider = str(getattr(session, "provider_name", "") or "")
+    model = str(getattr(session, "model_name", "") or "")
+    return is_vision_capable(provider, model)
+
+
+async def _tool_web_fetch(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    url = str(arguments.get("url", "") or "").strip()
+    if not url:
+        return "ERROR: missing required parameter 'url'"
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return "ERROR: only http(s) URLs are supported"
+    raw_max_images = arguments.get("max_images")
+    try:
+        max_images = int(raw_max_images) if raw_max_images is not None else 20
+    except (TypeError, ValueError):
+        max_images = 20
+    max_images = max(1, min(max_images, 50))
+    try:
+        body, content_type, final_url = await _fetch_http_bytes(
+            url,
+            timeout=15.0,
+            max_bytes=_WEB_FETCH_MAX_BYTES,
+        )
+    except ValueError as exc:
+        reason = str(exc)
+        if reason == "too-large":
+            return "ERROR: page exceeds 2MB limit"
+        if reason.startswith("http "):
+            return f"ERROR: {reason}"
+        return f"ERROR: network"
+    except Exception:
+        return "ERROR: network"
+    if not any(content_type.startswith(prefix) for prefix in _ALLOWED_WEB_FETCH_CONTENT_TYPES):
+        return f"ERROR: unsupported content-type {content_type or '(missing)'}"
+    from agenticx.tools.html_extractor import extract_readable_text
+
+    html = body.decode("utf-8", errors="replace")
+    extracted = extract_readable_text(html, final_url)
+    title = str(extracted.get("title", "") or "").strip() or "(untitled)"
+    text = str(extracted.get("text", "") or "").strip()
+    total_chars = len(text)
+    truncated = False
+    if total_chars > _WEB_FETCH_BODY_CHAR_LIMIT:
+        text = text[:_WEB_FETCH_BODY_CHAR_LIMIT]
+        truncated = True
+    lines = [f"Title: {title}", f"URL: {final_url}", "", text]
+    if truncated:
+        lines.append(f"...[truncated, total ~{total_chars} chars]")
+    images = list(extracted.get("images") or [])[:max_images]
+    if images:
+        lines.append("")
+        lines.append("[discovered_images]")
+        for idx, image_url in enumerate(images, start=1):
+            lines.append(f"{idx}. {image_url}")
+    return "\n".join(lines).strip()
+
+
+async def _tool_view_image(arguments: Dict[str, Any], session: Optional[StudioSession] = None) -> str:
+    target = str(arguments.get("target", "") or "").strip()
+    note = str(arguments.get("note", "") or "").strip()
+    if not target:
+        return "ERROR: missing required parameter 'target'"
+    if not _session_vision_capable(session):
+        model = str(getattr(session, "model_name", "") or "unknown")
+        return (
+            f"ERROR: current model '{model}' does not support vision; "
+            "switch to a vision-capable model first."
+        )
+    pending = _pending_visual_attachments(session)
+    if len(pending) >= _VIEW_IMAGE_MAX_PENDING:
+        return "ERROR: too many pending visual attachments (max 4 per turn)"
+    data: bytes
+    mime: str
+    name: str
+    source = target
+    parsed = urlparse(target)
+    if target.startswith("data:image/"):
+        parsed_data = _parse_data_image_url(target)
+        if parsed_data is None:
+            return "ERROR: unsupported image type"
+        data, mime = parsed_data
+        name = "clipboard-image"
+    elif parsed.scheme in {"http", "https"}:
+        try:
+            data, content_type, final_url = await _fetch_http_bytes(
+                target,
+                timeout=10.0,
+                max_bytes=_VIEW_IMAGE_MAX_BYTES,
+            )
+        except ValueError as exc:
+            reason = str(exc)
+            if reason == "too-large":
+                return "ERROR: image exceeds 8MB limit"
+            if reason.startswith("http "):
+                return f"ERROR: {reason}"
+            return "ERROR: network"
+        except Exception:
+            return "ERROR: network"
+        mime = _detect_image_mime(data) or (
+            content_type if content_type.startswith("image/") else None
+        )
+        if not mime:
+            return "ERROR: unsupported image type"
+        source = final_url
+        name = _filename_from_url(final_url, mime)
+    elif parsed.scheme in {"file", ""} or target.startswith("/") or (len(target) > 2 and target[1] == ":"):
+        try:
+            path = _resolve_workspace_path(target, session, pick_existing=True)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        if not path.exists() or not path.is_file():
+            return f"ERROR: file not found: {path}"
+        data = path.read_bytes()
+        if len(data) > _VIEW_IMAGE_MAX_BYTES:
+            return "ERROR: image exceeds 8MB limit"
+        mime = _detect_image_mime(data)
+        if not mime:
+            return "ERROR: unsupported image type"
+        name = path.name
+        source = str(path)
+    else:
+        return "ERROR: only http(s) URLs, data:image/* URLs, and local file paths are supported"
+    if len(data) > _VIEW_IMAGE_MAX_BYTES:
+        return "ERROR: image exceeds 8MB limit"
+    data_url = _data_url_from_bytes(data, mime)
+    pending.append(
+        {
+            "name": name,
+            "data_url": data_url,
+            "mime_type": mime,
+            "size": len(data),
+            "source": source,
+            "note": note,
+        }
+    )
+    size_kb = max(1, len(data) // 1024)
+    note_clause = f" ({note})" if note else ""
+    return (
+        f"[image loaded: {name} ({size_kb} KB, {mime}); "
+        f"will be visually attached in next turn{note_clause}]"
+    )
 
 
 def _tool_memory_search(arguments: Dict[str, Any]) -> str:
@@ -3769,6 +4175,98 @@ def _safe_skill_dir_name(name: str) -> Optional[str]:
 
 def _agent_created_skill_root() -> Path:
     return Path.home() / ".agenticx" / "skills"
+
+
+def _skill_url_allowlist() -> List[str]:
+    defaults = [
+        "raw.githubusercontent.com",
+        "gist.githubusercontent.com",
+        "registry.clawhub.ai",
+    ]
+    try:
+        from agenticx.cli.config_manager import ConfigManager
+
+        raw = ConfigManager.get_value("skill_manage.url_allowlist")
+        if isinstance(raw, list) and raw:
+            return [str(x).strip().lower() for x in raw if str(x).strip()]
+    except Exception:
+        pass
+    return defaults
+
+
+def _skill_max_url_bytes() -> int:
+    try:
+        from agenticx.cli.config_manager import ConfigManager
+
+        raw = ConfigManager.get_value("skill_manage.max_url_payload_bytes")
+        if raw is not None:
+            return max(1024, int(raw))
+    except Exception:
+        pass
+    return 1_048_576
+
+
+def _resolve_skill_content_path(path_arg: str, session: Optional[StudioSession]) -> Path:
+    """Resolve a local path for skill content (workspace or ~/.agenticx/)."""
+    agx_root = (Path.home() / ".agenticx").resolve()
+    try:
+        resolved = _resolve_workspace_path(path_arg, session, pick_existing=True)
+    except ValueError:
+        raw = _path_from_arg(path_arg)
+        if not raw.is_absolute():
+            raw = (Path.home() / raw).resolve(strict=False)
+        else:
+            raw = raw.resolve(strict=False)
+        if not _is_path_under_root(raw, agx_root) and not _desktop_unrestricted_fs_enabled():
+            raise ValueError(f"path must be under workspace or ~/.agenticx/: {raw}") from None
+        resolved = raw
+    if not resolved.is_file():
+        raise ValueError(f"file not found: {resolved}")
+    return resolved
+
+
+def _fetch_skill_content_from_url(url: str) -> str:
+    from urllib.parse import urlparse
+    import urllib.request
+
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme != "https":
+        raise ValueError("only https URLs are allowed for from_url")
+    host = (parsed.hostname or "").lower()
+    allow = _skill_url_allowlist()
+    if host not in allow:
+        raise ValueError(f"host not in skill_manage.url_allowlist: {host}")
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = resp.read()
+    max_bytes = _skill_max_url_bytes()
+    if len(data) > max_bytes:
+        raise ValueError(f"URL payload exceeds max_url_payload_bytes ({max_bytes})")
+    return data.decode("utf-8")
+
+
+def _resolve_skill_create_content(arguments: Dict[str, Any], session: Optional[StudioSession]) -> Tuple[Optional[str], Optional[str]]:
+    from_path = str(arguments.get("from_path", "") or "").strip()
+    from_url = str(arguments.get("from_url", "") or "").strip()
+    content = str(arguments.get("content", "") or "")
+    if from_path and from_url:
+        return None, "ERROR: from_path and from_url are mutually exclusive"
+    if from_path:
+        try:
+            path = _resolve_skill_content_path(from_path, session)
+            return path.read_text(encoding="utf-8"), None
+        except ValueError as exc:
+            return None, f"ERROR: {exc}"
+        except OSError as exc:
+            return None, f"ERROR: read failed: {exc}"
+    if from_url:
+        try:
+            return _fetch_skill_content_from_url(from_url), None
+        except Exception as exc:
+            return None, f"ERROR: from_url fetch failed: {exc}"
+    if not content.strip():
+        return None, "ERROR: content is required for create (or provide from_path/from_url)"
+    return content, None
 
 
 def _tool_session_search(arguments: Dict[str, Any], session: Optional[StudioSession]) -> str:
@@ -3857,9 +4355,10 @@ def _tool_skill_manage(arguments: Dict[str, Any], session: Optional[StudioSessio
         return "ERROR: skill path outside skills root"
 
     if action == "create":
-        content = str(arguments.get("content", "") or "")
-        if not content.strip():
-            return "ERROR: content is required for create"
+        content, content_err = _resolve_skill_create_content(arguments, session)
+        if content_err:
+            return content_err
+        assert content is not None
         if skill_dir.exists():
             return "ERROR: skill already exists"
         skill_dir.mkdir(parents=True, exist_ok=True)
@@ -3931,6 +4430,37 @@ def _tool_skill_manage(arguments: Dict[str, Any], session: Optional[StudioSessio
         return json.dumps({"ok": True, "action": "delete", "removed": True}, ensure_ascii=False)
 
     return "ERROR: unknown action"
+
+
+def _tool_skill_import_repo(arguments: Dict[str, Any], session: Optional[StudioSession]) -> str:
+    _ = session
+    if not _skill_manage_enabled():
+        return (
+            "ERROR: skill_import_repo is disabled. Set AGX_SKILL_MANAGE=1 "
+            "or AGX_CONFIRM_STRATEGY=auto (Run Everything hook)."
+        )
+    repo = str(arguments.get("repo", "") or "").strip()
+    if not repo:
+        return "ERROR: repo is required (owner/name)"
+    branch = str(arguments.get("branch", "main") or "main").strip() or "main"
+    path_glob = str(arguments.get("path_glob", "skills/**/SKILL.md") or "skills/**/SKILL.md").strip()
+    exclude_raw = arguments.get("exclude")
+    exclude: Optional[List[str]] = None
+    if isinstance(exclude_raw, list):
+        exclude = [str(x) for x in exclude_raw if str(x).strip()]
+    dry_run = bool(arguments.get("dry_run", False))
+    overwrite = bool(arguments.get("overwrite", False))
+    from agenticx.skills.import_repo import import_skills_from_repo, result_to_json
+
+    result = import_skills_from_repo(
+        repo=repo,
+        branch=branch,
+        path_glob=path_glob,
+        exclude=exclude,
+        dry_run=dry_run,
+        overwrite=overwrite,
+    )
+    return result_to_json(result)
 
 
 def _tool_ask_user(arguments: Dict[str, Any], *, service_mode: bool = False) -> str:
@@ -4304,7 +4834,10 @@ async def dispatch_tool_async(
             ),
             "skill_manage": (
                 "action（create / patch / delete）, name（skill 名称，可含子路径如 ima/notes）, "
-                "以及对应 action 所需的 markdown / old_string / new_string 字段"
+                "以及 content / from_path / from_url（create）或 old_string / new_string（patch）"
+            ),
+            "skill_import_repo": (
+                "repo（owner/name）, 可选 branch/path_glob/exclude/dry_run/overwrite"
             ),
             "schedule_task": (
                 "name（任务名）、frequency / time / date 至少一项、instruction（具体指令）、workspace（执行目录）"
@@ -4382,6 +4915,8 @@ async def dispatch_tool_async(
             return _tool_skill_list(session)
         if name == "skill_manage":
             return _tool_skill_manage(arguments, session)
+        if name == "skill_import_repo":
+            return _tool_skill_import_repo(arguments, session)
         if name == "todo_write":
             return _tool_todo_write(arguments, session)
         if name == "scratchpad_write":
@@ -4408,7 +4943,11 @@ async def dispatch_tool_async(
         if name == "knowledge_search":
             return await asyncio.to_thread(_tool_knowledge_search, arguments, session)
         if name == "web_search":
-            return await asyncio.to_thread(_tool_web_search, arguments)
+            return await asyncio.to_thread(_tool_web_search, arguments, session)
+        if name == "web_fetch":
+            return await _tool_web_fetch(arguments, session)
+        if name == "view_image":
+            return await _tool_view_image(arguments, session)
         if name == "session_search":
             return _tool_session_search(arguments, session)
         if name == "code_search":

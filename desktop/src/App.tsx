@@ -15,6 +15,23 @@ import type { Message, ProviderEntry } from "./store";
 import { useAppStore } from "./store";
 import { stopSpeak } from "./voice/tts";
 import { matchKeybinding } from "./core/keybinding-manager";
+import { META_AGENT_DISPLAY_NAME } from "./constants/branding";
+import { resolveMetaDisplayName } from "./utils/display-name";
+import { readScopedLocalStorage, writeScopedLocalStorage } from "./utils/backend-scope";
+import { GlobalSearchHost } from "./components/global-search/GlobalSearchPanel";
+import {
+  GLOBAL_SEARCH_ADD_TO_WORKSPACE,
+  openGlobalSearch,
+  type GlobalSearchAddToWorkspaceDetail,
+} from "./components/global-search/global-search-events";
+import { Toast } from "./components/ds/Toast";
+import { addFolderToActiveWorkspace } from "./utils/global-search-workspace";
+import {
+  coerceSelectableModel,
+  normalizeAllProviders,
+  normalizeProviderEntry,
+} from "./utils/model-options";
+import { avatarPreloadKey, fetchAvatarsWithStartupRetry, fetchSessionsWithStartupRetry, mapAvatarsFromApi, runSplashCorePreload } from "./utils/splash-preload-core";
 
 const WORKSPACE_STATE_STORAGE_KEY = "agx-workspace-state-v1";
 
@@ -74,7 +91,7 @@ function toProviderEntries(
     };
     if (displayName) row.displayName = displayName;
     if (cfg.interface === "openai") row.interface = "openai";
-    result[name] = row;
+    result[name] = normalizeProviderEntry(row);
   }
   return result;
 }
@@ -232,7 +249,6 @@ export function App() {
   const setPaneSessionId = useAppStore((s) => s.setPaneSessionId);
   const setUserMode = useAppStore((s) => s.setUserMode);
   const setOnboardingCompleted = useAppStore((s) => s.setOnboardingCompleted);
-  const setCommandPaletteOpen = useAppStore((s) => s.setCommandPaletteOpen);
   const setKeybindingsPanelOpen = useAppStore((s) => s.setKeybindingsPanelOpen);
   const sidebarCollapsed = useAppStore((s) => s.sidebarCollapsed);
   const setSidebarCollapsed = useAppStore((s) => s.setSidebarCollapsed);
@@ -272,10 +288,16 @@ export function App() {
   const denyScopesRef = useRef<Set<string>>(new Set());
   const sessionInitDoneRef = useRef(false);
   const workspaceHydratedRef = useRef(false);
+  const startupRendererReadyRef = useRef(false);
   const [windowResizing, setWindowResizing] = useState(false);
   const [responsiveStage, setResponsiveStage] = useState<0 | 1 | 2>(0);
   const [startupOptimizing, setStartupOptimizing] = useState(true);
   const [configLoaded, setConfigLoaded] = useState(false);
+  const [globalSearchToastOpen, setGlobalSearchToastOpen] = useState(false);
+  const [globalSearchToastMessage, setGlobalSearchToastMessage] = useState("");
+  const [globalSearchToastVariant, setGlobalSearchToastVariant] = useState<"default" | "warning">(
+    "default"
+  );
   const windowResizeTimerRef = useRef<number | null>(null);
   const responsiveStageRef = useRef<0 | 1 | 2>(0);
   const responsiveSnapshotRef = useRef<{
@@ -298,6 +320,27 @@ export function App() {
   }>>([]);
   const autoReportingRef = useRef(false);
   const directNoticeSentRef = useRef<Set<string>>(new Set());
+  const persistReconciledPaneModels = useCallback(async () => {
+    const before = useAppStore.getState();
+    const { changedPaneIds, activeChanged } = before.reconcilePaneModels();
+    if (changedPaneIds.length === 0 && !activeChanged) return;
+    const next = useAppStore.getState();
+    if (next.activeProvider && next.activeModel) {
+      await window.agenticxDesktop.saveConfig({
+        activeProvider: next.activeProvider,
+        activeModel: next.activeModel,
+      });
+    }
+    for (const paneId of changedPaneIds) {
+      const pane = next.panes.find((item) => item.id === paneId);
+      const sid = String(pane?.sessionId ?? "").trim();
+      const provider = String(pane?.modelProvider ?? "").trim();
+      const model = String(pane?.modelName ?? "").trim();
+      if (sid && provider && model) {
+        await window.agenticxDesktop.setSessionModel({ sessionId: sid, provider, model });
+      }
+    }
+  }, []);
   // Track live automation-triggered sessions; used to poll and refresh tool/message progress.
   const automationRunningRef = useRef<Map<string, Set<string>>>(new Map());
   const automationPollTimerRef = useRef<number | null>(null);
@@ -305,6 +348,25 @@ export function App() {
     () => panes.find((pane) => pane.id === activePaneId)?.sessionId ?? sessionId,
     [activePaneId, panes, sessionId]
   );
+
+  useEffect(() => {
+    const onAddWorkspace = (event: Event) => {
+      const detail = (event as CustomEvent<GlobalSearchAddToWorkspaceDetail>).detail;
+      if (!detail?.folderPath) return;
+      void addFolderToActiveWorkspace(detail.folderPath).then((result) => {
+        if (result.ok) {
+          setGlobalSearchToastMessage("已添加至工作区");
+          setGlobalSearchToastVariant("default");
+        } else {
+          setGlobalSearchToastMessage(result.error ?? "添加工作区失败");
+          setGlobalSearchToastVariant("warning");
+        }
+        setGlobalSearchToastOpen(true);
+      });
+    };
+    window.addEventListener(GLOBAL_SEARCH_ADD_TO_WORKSPACE, onAddWorkspace);
+    return () => window.removeEventListener(GLOBAL_SEARCH_ADD_TO_WORKSPACE, onAddWorkspace);
+  }, []);
 
   useEffect(() => {
     const activePane = panes.find((pane) => pane.id === activePaneId);
@@ -459,69 +521,69 @@ export function App() {
         const savedActiveProvider = cfgEarly.activeProvider ?? "";
         const savedActiveModel = cfgEarly.activeModel ?? "";
         if (savedActiveProvider && savedActiveModel) {
-          setActiveModel(savedActiveProvider, savedActiveModel);
-          const currentPaneId = useAppStore.getState().activePaneId;
-          const currentPane = useAppStore.getState().panes.find((pane) => pane.id === currentPaneId);
-          const hasPaneModel = Boolean(currentPane?.modelProvider?.trim() && currentPane?.modelName?.trim());
-          if (!hasPaneModel) {
-            setPaneModel(currentPaneId, savedActiveProvider, savedActiveModel);
+          const coerced = coerceSelectableModel(
+            entries,
+            savedActiveProvider,
+            savedActiveModel,
+            savedActiveProvider,
+          );
+          if (coerced) {
+            setActiveModel(coerced.provider, coerced.model);
+            const currentPaneId = useAppStore.getState().activePaneId;
+            const currentPane = useAppStore.getState().panes.find((pane) => pane.id === currentPaneId);
+            const hasPaneModel = Boolean(currentPane?.modelProvider?.trim() && currentPane?.modelName?.trim());
+            if (!hasPaneModel) {
+              setPaneModel(currentPaneId, coerced.provider, coerced.model);
+            }
           }
-        } else if (defP && defEntry?.model) {
-          setActiveModel(defP, defEntry.model);
-          const currentPaneId = useAppStore.getState().activePaneId;
-          const currentPane = useAppStore.getState().panes.find((pane) => pane.id === currentPaneId);
-          const hasPaneModel = Boolean(currentPane?.modelProvider?.trim() && currentPane?.modelName?.trim());
-          if (!hasPaneModel) {
-            setPaneModel(currentPaneId, defP, defEntry.model);
+        } else if (defP) {
+          const coerced = coerceSelectableModel(entries, defP, defEntry?.model ?? "", defP);
+          if (coerced) {
+            setActiveModel(coerced.provider, coerced.model);
+            const currentPaneId = useAppStore.getState().activePaneId;
+            const currentPane = useAppStore.getState().panes.find((pane) => pane.id === currentPaneId);
+            const hasPaneModel = Boolean(currentPane?.modelProvider?.trim() && currentPane?.modelName?.trim());
+            if (!hasPaneModel) {
+              setPaneModel(currentPaneId, coerced.provider, coerced.model);
+            }
           }
         }
       } catch (err) {
         console.error("[App init] loadConfig failed:", err);
-      } finally {
-        // 配置已经载入（或出错），让 UI 立刻渲染，避免被后续会话恢复挡住。
-        setConfigLoaded(true);
       }
 
-      // Preload avatar list into the store BEFORE pane hydration, so the
-      // setPaneSessionId() fallback chain (session > avatar.default > global)
-      // can actually resolve an avatar's default_provider/default_model on
-      // cold start. Without this, the first render falls through to "未选模型"
-      // until the AvatarSidebar component finishes its own lazy refresh.
-      try {
-        const avResp = await window.agenticxDesktop.listAvatars();
-        if (avResp?.ok && Array.isArray(avResp.avatars)) {
-          useAppStore.getState().setAvatars(
-            avResp.avatars.map((a) => ({
-              id: a.id,
-              name: a.name,
-              role: a.role ?? "",
-              avatarUrl: a.avatar_url ?? "",
-              pinned: Boolean(a.pinned),
-              createdBy: a.created_by ?? "manual",
-              systemPrompt: a.system_prompt ?? "",
-              toolsEnabled: a.tools_enabled ?? {},
-              skillsEnabled:
-                a.skills_enabled && typeof a.skills_enabled === "object"
-                  ? { ...a.skills_enabled }
-                  : undefined,
-              brainsEnabled:
-                a.brains_enabled === "*"
-                  ? "*"
-                  : Array.isArray(a.brains_enabled)
-                    ? a.brains_enabled.map(String)
-                    : undefined,
-              defaultProvider: a.default_provider ?? "",
-              defaultModel: a.default_model ?? "",
-            })),
-          );
+      setConfigLoaded(true);
+
+      // Splash 预加载分身 / 会话列表 / 工作区 / 活跃 session 消息，再关 splash 进主窗。
+      await runSplashCorePreload();
+
+      if (!startupRendererReadyRef.current) {
+        startupRendererReadyRef.current = true;
+        try {
+          await window.agenticxDesktop.startupRendererReady();
+        } catch (err) {
+          console.warn("[App init] startupRendererReady failed:", err);
+          startupRendererReadyRef.current = false;
         }
-      } catch (err) {
-        console.error("[App init] preload avatars failed:", err);
+      }
+
+      // Fallback when splash preload did not populate avatars (timeout / disabled).
+      if (useAppStore.getState().avatars.length === 0) {
+        try {
+          const avatars = await fetchAvatarsWithStartupRetry(() =>
+            window.agenticxDesktop.listAvatars()
+          );
+          if (avatars.length > 0) {
+            useAppStore.getState().setAvatars(avatars);
+          }
+        } catch (err) {
+          console.error("[App init] preload avatars fallback failed:", err);
+        }
       }
 
       let recovered = false;
       try {
-        const raw = window.localStorage.getItem(WORKSPACE_STATE_STORAGE_KEY);
+        const raw = readScopedLocalStorage(WORKSPACE_STATE_STORAGE_KEY);
         const parsed = raw ? JSON.parse(raw) : null;
         const saved = normalizePersistedWorkspaceState(parsed);
         const sessionsCache = new Map<string, SessionListItem[]>();
@@ -529,13 +591,34 @@ export function App() {
         const getSessionsForAvatar = async (avatarId?: string | null): Promise<SessionListItem[]> => {
           const key = (avatarId ?? "").trim();
           if (sessionsCache.has(key)) return sessionsCache.get(key) ?? [];
+          const preloadState = useAppStore.getState();
+          const preloadKey = avatarPreloadKey(avatarId);
+          if (
+            preloadState.corePreloadAttempted &&
+            Object.prototype.hasOwnProperty.call(
+              preloadState.preloadedSessionsByAvatarKey,
+              preloadKey
+            )
+          ) {
+            const raw = preloadState.preloadedSessionsByAvatarKey[preloadKey];
+            const normalized = (Array.isArray(raw) ? raw : []).filter((item) =>
+              isSessionItemMatchingAvatar(item as SessionListItem, key || undefined)
+            ) as SessionListItem[];
+            sessionsCache.set(key, normalized);
+            return normalized;
+          }
           try {
-            const listed = await window.agenticxDesktop.listSessions(key || undefined);
-            if (!listed.ok || !Array.isArray(listed.sessions) || listed.sessions.length === 0) {
+            const rawSessions = await fetchSessionsWithStartupRetry(
+              (avatarKey) => window.agenticxDesktop.listSessions(avatarKey),
+              key || undefined
+            );
+            if (rawSessions.length === 0) {
               sessionsCache.set(key, []);
               return [];
             }
-            const normalized = listed.sessions.filter((item) => isSessionItemMatchingAvatar(item, key || undefined));
+            const normalized = rawSessions.filter((item) =>
+              isSessionItemMatchingAvatar(item as SessionListItem, key || undefined)
+            ) as SessionListItem[];
             sessionsCache.set(key, normalized);
             return normalized;
           } catch {
@@ -669,6 +752,15 @@ export function App() {
             if (activePane?.modelProvider && activePane?.modelName) {
               activeState.setActiveModel(activePane.modelProvider, activePane.modelName);
             }
+            if (activePane) {
+              const activeSid = String(activePane.sessionId ?? "").trim();
+              if (activeSid) {
+                const cached = activeState.getCachedSessionMessages(activeSid);
+                if (cached && cached.length > 0) {
+                  activeState.setPaneMessages(activePane.id, cached);
+                }
+              }
+            }
             const metaPane = hydratedPanes.find((pane) => pane.id === "pane-meta");
             const nextSessionId =
               (metaPane?.sessionId ?? "").trim() ||
@@ -687,7 +779,7 @@ export function App() {
       }
 
       if (!recovered) {
-        let sessionCreated = false;
+        let sessionBound = false;
         const latestSid = await (async () => {
           try {
             const listed = await window.agenticxDesktop.listSessions();
@@ -704,29 +796,18 @@ export function App() {
             setPaneSessionId("pane-meta", sid);
             await refreshMcpStatus(sid).catch(() => {});
             await ensureMcpAutoConnectOnStartup(sid).catch(() => {});
-            sessionCreated = true;
+            sessionBound = true;
             recovered = true;
           } catch (err) {
             console.error("[App init] reuse latest session failed:", err);
           }
         }
-        for (let attempt = 0; attempt < 3; attempt++) {
-          if (sessionCreated) break;
-          try {
-            const sid = await requestSession(base, token);
-            setSessionId(sid);
-            setPaneSessionId("pane-meta", sid);
-            await refreshMcpStatus(sid).catch(() => {});
-            await ensureMcpAutoConnectOnStartup(sid).catch(() => {});
-            sessionCreated = true;
-            break;
-          } catch (err) {
-            console.error(`[App init] /api/session failed, attempt ${attempt + 1}:`, err);
-            await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-          }
-        }
-        if (!sessionCreated) {
-          console.error("[App init] all session creation attempts failed");
+        if (!sessionBound) {
+          // Align with ChatPane lazy-create: no empty server session on cold start.
+          setSessionId("");
+          setPaneSessionId("pane-meta", "");
+          await refreshMcpStatus("").catch(() => {});
+          recovered = true;
         }
       }
 
@@ -742,6 +823,7 @@ export function App() {
       if ((!paneProvider || !paneModel) && cfgProvider && cfgModel) {
         bootState.setPaneModel(bootState.activePaneId, cfgProvider, cfgModel);
       }
+      await persistReconciledPaneModels();
 
       window.agenticxDesktop.onOpenSettings(() => openSettings());
       workspaceHydratedRef.current = true;
@@ -780,7 +862,7 @@ export function App() {
       })),
     };
     try {
-      window.localStorage.setItem(WORKSPACE_STATE_STORAGE_KEY, JSON.stringify(snapshot));
+      writeScopedLocalStorage(WORKSPACE_STATE_STORAGE_KEY, JSON.stringify(snapshot));
     } catch {
       // ignore storage failures
     }
@@ -1076,7 +1158,7 @@ export function App() {
           store.addPaneMessage(
             matchingPane.id,
             "tool",
-            `⚠️ 子智能体已结束，但 Machi 自动汇报暂未成功。先给你直接结果：\n${lines}`,
+            `⚠️ 子智能体已结束，但 ${META_AGENT_DISPLAY_NAME} 自动汇报暂未成功。先给你直接结果：\n${lines}`,
             "meta"
           );
         };
@@ -1450,8 +1532,8 @@ export function App() {
       const action = matchKeybinding(event, userMode);
       if (!action) return;
       event.preventDefault();
-      if (action === "open-command-palette") {
-        setCommandPaletteOpen(true);
+      if (action === "open-global-search") {
+        openGlobalSearch();
       } else if (action === "open-settings") {
         openSettings();
       } else if (action === "clear-messages") {
@@ -1472,7 +1554,6 @@ export function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
     userMode,
-    setCommandPaletteOpen,
     setKeybindingsPanelOpen,
     openSettings,
     clearMessages,
@@ -1513,20 +1594,9 @@ export function App() {
     defaultProvider: string;
     providers: Record<string, ProviderEntry>;
   }) => {
-    const resolveFallbackModel = (): { provider: string; model: string } | null => {
-      const candidates = Object.entries(result.providers)
-        .filter(([, entry]) => entry.enabled !== false)
-        .map(([provider, entry]) => {
-          const model = entry.model || entry.models[0] || "";
-          return { provider, model };
-        })
-        .filter((row) => row.model);
-      if (candidates.length === 0) return null;
-      const preferred = candidates.find((row) => row.provider === result.defaultProvider);
-      return preferred ?? candidates[0];
-    };
+    const normalizedProviders = normalizeAllProviders(result.providers);
 
-    for (const [name, entry] of Object.entries(result.providers)) {
+    for (const [name, entry] of Object.entries(normalizedProviders)) {
       const hasCustomVendorMeta = Boolean(entry.displayName?.trim()) || entry.interface === "openai";
       if (
         !hasCustomVendorMeta &&
@@ -1553,36 +1623,27 @@ export function App() {
     }
     await window.agenticxDesktop.setDefaultProvider(result.defaultProvider);
 
-    const defEntry = result.providers[result.defaultProvider];
+    const defEntry = normalizedProviders[result.defaultProvider];
     updateSettings({
       defaultProvider: result.defaultProvider,
-      providers: result.providers,
+      providers: normalizedProviders,
       provider: result.defaultProvider,
       model: defEntry?.model ?? "",
       apiKey: defEntry?.apiKey ?? "",
     });
 
-    // Only switch active model if user hasn't manually chosen a different one yet
-    const curProvider = useAppStore.getState().activeProvider;
-    const curModel = useAppStore.getState().activeModel;
-    const currentEntry = result.providers[curProvider];
-    const currentModelStillVisible =
-      !!curProvider &&
-      !!curModel &&
-      currentEntry?.enabled !== false &&
-      (currentEntry?.model === curModel || currentEntry?.models.includes(curModel));
-    if (!currentModelStillVisible) {
-      const fallback = resolveFallbackModel();
-      if (fallback) {
-        setActiveModel(fallback.provider, fallback.model);
-        const currentPaneId = useAppStore.getState().activePaneId;
-        setPaneModel(currentPaneId, fallback.provider, fallback.model);
-      }
-    }
+    await persistReconciledPaneModels();
+    const nextState = useAppStore.getState();
     await window.agenticxDesktop.saveConfig({
       provider: result.defaultProvider,
       model: defEntry?.model ?? "",
       apiKey: defEntry?.apiKey ?? "",
+      ...(nextState.activeProvider && nextState.activeModel
+        ? {
+            activeProvider: nextState.activeProvider,
+            activeModel: nextState.activeModel,
+          }
+        : {}),
     });
     stopSpeak();
   };
@@ -1772,7 +1833,7 @@ export function App() {
       const state = useAppStore.getState();
       const sameSid = state.panes.filter((pane) => String(pane.sessionId ?? "").trim() === sid);
       if (sameSid.length === 0) return;
-      // 定时任务会话只应刷新 automation:* 窗格，避免与 Machi 窗格误绑同一 sessionId 时被错误覆盖
+      // 定时任务会话只应刷新 automation:* 窗格，避免与 Near 窗格误绑同一 sessionId 时被错误覆盖
       const autoPanes = sameSid.filter((p) => String(p.avatarId ?? "").startsWith("automation:"));
       const targets = autoPanes.length > 0 ? autoPanes : sameSid;
       try {
@@ -1809,7 +1870,7 @@ export function App() {
         }
         return existingByAvatar.id;
       }
-      // 必须与当前任务的 automation:<id> 一致，不能把 Machi/分身窗格当成定时窗格复用
+      // 必须与当前任务的 automation:<id> 一致，不能把 Near/分身窗格当成定时窗格复用
       const existingBySession = state.panes.find(
         (pane) => (pane.sessionId || "").trim() === sid && pane.avatarId === avatarId
       );
@@ -1915,11 +1976,11 @@ export function App() {
         feishuBindingSidRef.current = newSid;
 
         if (!newSid) {
-          // _desktop was cleared (/unbind) — switch back to the Meta/Machi pane
+          // _desktop was cleared (/unbind) — switch back to the Meta/Near pane
           if (!prevSid) return; // was already unbound at startup, nothing to do
           const state = useAppStore.getState();
           // Prefer the pane whose session was previously bound (to deactivate it),
-          // then fall back to the first pane with no avatarId (Meta/Machi),
+          // then fall back to the first pane with no avatarId (Meta/Near),
           // then fall back to panes[0].
           const metaPane =
             state.panes.find((p) => !p.avatarId || p.avatarId === "") ??
@@ -1941,8 +2002,12 @@ export function App() {
         } else {
           const avatarId = (desk?.avatar_id ?? "").trim() || null;
           const rawName = (desk?.avatar_name ?? "").trim();
-          // avatar_id 为空表示飞书默认路由到 Machi；勿用「分身」占位，否则顶栏/气泡会与元智能体不一致且无 meta 头像
-          const avatarName = rawName || (avatarId ? "分身" : "Machi");
+          // avatar_id 为空表示飞书默认路由到 Near；勿用「分身」占位，否则顶栏/气泡会与元智能体不一致且无 meta 头像
+          const avatarName = rawName
+            ? resolveMetaDisplayName(rawName)
+            : avatarId
+              ? "分身"
+              : META_AGENT_DISPLAY_NAME;
           const reusableMetaPane =
             !avatarId
               ? state.panes.find((pane) => !String(pane.avatarId ?? "").trim())
@@ -1999,9 +2064,7 @@ export function App() {
       }`}
     >
       {!configLoaded ? (
-        <div className="flex h-full min-h-0 w-full items-center justify-center text-sm text-text-faint">
-          正在加载配置…
-        </div>
+        <div className="h-full min-h-0 w-full" aria-hidden />
       ) : focusMode && apiBase ? (
         <VoiceFocusMode />
       ) : focusMode ? (
@@ -2043,9 +2106,7 @@ export function App() {
           </div>
         </>
       ) : (
-        <div className="flex flex-1 items-center justify-center text-text-faint">
-          正在连接 AgenticX 服务...
-        </div>
+        <div className="flex-1" aria-hidden />
       )}
 
       <ConfirmDialog
@@ -2101,6 +2162,13 @@ export function App() {
         onForwardFavorite={handleForwardFavorite}
       />
       <TokenDashboardPanel open={tokenDashboardOpen} onClose={() => closeTokenDashboard()} />
+      <GlobalSearchHost />
+      <Toast
+        open={globalSearchToastOpen}
+        message={globalSearchToastMessage}
+        variant={globalSearchToastVariant}
+        onClose={() => setGlobalSearchToastOpen(false)}
+      />
     </div>
   );
 }

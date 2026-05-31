@@ -21,6 +21,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from agenticx.cli.agent_tools import (
+    PENDING_VISUAL_ATTACHMENTS_KEY,
     STUDIO_TOOLS,
     studio_tools_for_session,
     _TOOL_REQUIRED_PARAMS,
@@ -30,6 +31,15 @@ from agenticx.cli.agent_tools import (
 from agenticx.cli.studio_mcp import build_mcp_tools_context
 from agenticx.cli.studio_skill import get_all_skill_summaries
 from agenticx.runtime.compactor import ContextCompactor
+from agenticx.runtime.tool_result_budget import (
+    apply_tool_result_budget,
+    approx_tokens,
+    archive_tool_result,
+    get_result_class,
+    load_config as load_tool_result_budget_config,
+    persist_context_stats,
+    record_tool_result_meta,
+)
 from agenticx.runtime.tool_orchestrator import partition_tool_calls
 from agenticx.runtime.confirm import ConfirmGate
 from agenticx.runtime.events import EventType, RuntimeEvent
@@ -79,6 +89,7 @@ def _build_user_goal_anchor(
     max_rounds: int,
     tools_used_so_far: int,
     messages_total_chars: int,
+    tool_result_tokens_session: int = 0,
 ) -> Optional[Dict[str, Any]]:
     """Build user goal anchor message for long-horizon task context management (FR-2/FR-3).
 
@@ -88,6 +99,8 @@ def _build_user_goal_anchor(
     # NFR-6: Escape hatch to disable anchor injection
     if os.environ.get("AGX_GOAL_ANCHOR_DISABLE", "").strip() == "1":
         return None
+
+    session._goal_anchor_prepend = False
 
     user_intent_raw = getattr(session, "current_user_intent", None)
     # NFR-4: Skip if None or whitespace-only (including empty string)
@@ -104,12 +117,17 @@ def _build_user_goal_anchor(
     # inputs from blowing up the per-round anchor cost. Minimal mode caps independently below.
     user_intent_full = str(user_intent_raw)[:2000]
 
+    restrengthen_threshold = _env_int_runtime("AGX_ANCHOR_RESTRENGTHEN_THRESHOLD", 12000)
+    force_prepend = tool_result_tokens_session >= restrengthen_threshold
+
     is_first_round = round_idx == 1 and tools_used_so_far == 0
     is_complex = (
         tools_used_so_far >= full_trigger_tools
         or messages_total_chars >= full_trigger_chars
         or agent_msg_count >= 8
+        or force_prepend
     )
+    session._goal_anchor_prepend = bool(force_prepend and not is_first_round)
 
     if is_first_round:
         # First round: minimal anchor (≤80 chars as per FR-3)
@@ -154,6 +172,7 @@ def _build_user_goal_anchor(
         mode,
     )
 
+    session._goal_anchor_mode = mode
     return {"role": "system", "content": anchor_text}
 
 
@@ -499,6 +518,55 @@ def _serialize_scratchpad(session: StudioSession) -> str:
     return "\n".join(lines)
 
 
+def _inject_pending_visual_attachments(
+    session: StudioSession,
+    messages: List[Dict[str, Any]],
+    *,
+    is_system_trigger: bool,
+) -> None:
+    scratchpad = getattr(session, "scratchpad", None)
+    if not isinstance(scratchpad, dict):
+        return
+    pending = scratchpad.pop(PENDING_VISUAL_ATTACHMENTS_KEY, [])
+    if not isinstance(pending, list) or not pending:
+        return
+    content_blocks: List[Dict[str, Any]] = [
+        {
+            "type": "text",
+            "text": "<system-injected> attached images requested via view_image tool:",
+        },
+    ]
+    simplified: List[Dict[str, Any]] = []
+    for item in pending:
+        if not isinstance(item, dict):
+            continue
+        data_url = str(item.get("data_url", "")).strip()
+        if not data_url.startswith("data:image/"):
+            continue
+        content_blocks.append({"type": "image_url", "image_url": {"url": data_url}})
+        simplified.append(
+            {
+                "name": str(item.get("name", "") or "image"),
+                "mime_type": str(item.get("mime_type", "") or "image/png"),
+                "size": int(item.get("size", 0) or 0),
+                "source": str(item.get("source", "") or ""),
+            }
+        )
+    if len(content_blocks) <= 1:
+        return
+    injected = {"role": "user", "content": content_blocks}
+    messages.append(injected)
+    session.agent_messages.append(injected)
+    if not is_system_trigger:
+        session.chat_history.append(
+            {
+                "role": "user",
+                "content": "<system-injected> attached images requested via view_image tool:",
+                "visual_attachments": simplified,
+            }
+        )
+
+
 def _build_agent_system_prompt(session: StudioSession) -> str:
     mcp_context = ""
     if session.mcp_hub is not None:
@@ -546,6 +614,7 @@ def _build_agent_system_prompt(session: StudioSession) -> str:
         "应用 `allowed_domains` 限制域名以降低风险。需要逐步可见过程时，可改用 `browser_navigate`、"
         "`browser_get_state`、`browser_click` 等低层工具分步执行。\n"
         "- 未连接 MCP 或缺少对应工具时，说明如何配置（如 `~/.agenticx/mcp.json`），不要假装已执行浏览器操作。\n\n"
+        f"{_credential_safety_block_for_agent()}"
         "## 安全与确认规则（必须遵守）\n"
         "- bash_exec 仅对白名单命令自动执行；非白名单命令必须先征得用户确认。\n"
         "- file_write 与 file_edit 必须先展示 unified diff，再征得用户确认。\n"
@@ -554,6 +623,15 @@ def _build_agent_system_prompt(session: StudioSession) -> str:
         "- 对中间结果优先写入 scratchpad_write，后续步骤先 scratchpad_read 复用。\n"
         "- 优先最小改动，避免无关重构。\n"
     )
+
+
+def _credential_safety_block_for_agent() -> str:
+    try:
+        from agenticx.runtime.prompts.credential_safety import CREDENTIAL_SAFETY_BLOCK
+
+        return f"{CREDENTIAL_SAFETY_BLOCK}\n"
+    except Exception:
+        return ""
 
 
 def _parse_tool_arguments(raw_args: Any) -> Dict[str, Any]:
@@ -590,11 +668,31 @@ def _summarize_tool_calls_for_history(tool_calls: List[Dict[str, Any]]) -> List[
     return summarized
 
 
+def _message_content_is_empty(content: Any) -> bool:
+    """True when message content carries no visible text for strict chat APIs."""
+    if content is None:
+        return True
+    if isinstance(content, str):
+        return not content.strip()
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if str(block.get("type", "")).strip() != "text":
+                continue
+            if str(block.get("text", "")).strip():
+                return False
+        return True
+    return not str(content).strip()
+
+
 def _sanitize_context_messages(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Repair history to satisfy strict tool-call pairing providers.
 
     Rules:
+    - Drop assistant rows with empty content and no tool_calls (Kimi/Moonshot 400).
+    - Assistant tool_calls rows with empty content get a single-space placeholder.
     - Keep tool messages only when their tool_call_id is declared by some assistant tool_calls.
     - Keep assistant tool_calls only when each call id has a corresponding tool response in history.
       Unmatched calls are removed from that assistant message.
@@ -617,6 +715,9 @@ def _sanitize_context_messages(messages: Sequence[Dict[str, Any]]) -> List[Dict[
 
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls:
+            if _message_content_is_empty(msg.get("content")):
+                idx += 1
+                continue
             sanitized.append(msg)
             idx += 1
             continue
@@ -656,12 +757,17 @@ def _sanitize_context_messages(messages: Sequence[Dict[str, Any]]) -> List[Dict[
         if kept_calls:
             msg_copy = dict(msg)
             msg_copy["tool_calls"] = kept_calls
+            if _message_content_is_empty(msg_copy.get("content")):
+                msg_copy["content"] = " "
             sanitized.append(msg_copy)
             sanitized.extend(contiguous_tool_rows)
         else:
             # Remove dangling tool_calls but keep assistant content text.
             msg_copy = dict(msg)
             msg_copy.pop("tool_calls", None)
+            if _message_content_is_empty(msg_copy.get("content")):
+                idx = j
+                continue
             sanitized.append(msg_copy)
 
         # Skip contiguous tool block, whether kept or dropped.
@@ -977,6 +1083,12 @@ class AgentRuntime:
         self._pending_loop_nudge = None
         self._last_persist_time = time.time()
         self._tools_since_persist = 0
+        try:
+            from agenticx.studio.references import reset_turn_references
+
+            reset_turn_references(session)
+        except Exception:
+            pass
         # Reset per-turn exploratory tracking so each turn starts with a
         # fresh "schema discovery" budget.
         self._recent_exploratory_fps.clear()
@@ -1166,9 +1278,13 @@ class AgentRuntime:
                 messages = _sanitize_context_messages(messages)
                 if provider_name.strip().lower() == "minimax":
                     messages = _merge_consecutive_simple_roles_for_minimax(messages)
-                # P1-T4 (v2): Inject ephemeral user goal anchor as a temporary view for THIS LLM call only.
-                # Critical: do NOT mutate `messages` itself—anchor must not survive into the next round
-                # (NFR-3 ephemeral semantics). All downstream LLM calls in this round use messages_for_llm.
+                budget_cfg = load_tool_result_budget_config()
+                messages, budget_stats = apply_tool_result_budget(
+                    messages,
+                    current_round=round_idx,
+                    session=session,
+                    cfg=budget_cfg,
+                )
                 messages_total_chars = sum(
                     len(str(m.get("content", ""))) for m in messages if isinstance(m, dict)
                 )
@@ -1178,11 +1294,40 @@ class AgentRuntime:
                     max_rounds=self.max_tool_rounds,
                     tools_used_so_far=len(executed_tool_names),
                     messages_total_chars=messages_total_chars,
+                    tool_result_tokens_session=budget_stats.tool_result_tokens_session,
                 )
                 if anchor_message:
-                    messages_for_llm = list(messages) + [anchor_message]
+                    prepend = bool(getattr(session, "_goal_anchor_prepend", False))
+                    if prepend:
+                        insert_idx = 0
+                        for i, m in enumerate(messages):
+                            if isinstance(m, dict) and str(m.get("role", "")).lower() == "system":
+                                insert_idx = i + 1
+                            else:
+                                break
+                        messages_for_llm = list(messages)
+                        messages_for_llm.insert(insert_idx, anchor_message)
+                    else:
+                        messages_for_llm = list(messages) + [anchor_message]
                 else:
                     messages_for_llm = messages
+                context_payload = {
+                    "round": round_idx,
+                    "prompt_tokens_approx": approx_tokens(
+                        "\n".join(str(m.get("content", "")) for m in messages_for_llm if isinstance(m, dict))
+                    ),
+                    "tool_result_tokens_round": budget_stats.tool_result_tokens_round,
+                    "tool_result_tokens_session": budget_stats.tool_result_tokens_session,
+                    "archived_tool_calls": budget_stats.archived_replaced,
+                    "anchor_mode": getattr(session, "_goal_anchor_mode", None),
+                    "anchor_prepend": bool(getattr(session, "_goal_anchor_prepend", False)),
+                }
+                persist_context_stats(session, context_payload)
+                yield RuntimeEvent(
+                    type=EventType.CONTEXT_STATS.value,
+                    data=context_payload,
+                    agent_id=agent_id,
+                )
                 if provider_name.strip().lower() == "minimax":
                     messages_for_llm = _merge_consecutive_simple_roles_for_minimax(messages_for_llm)
                 response_text = ""
@@ -1564,6 +1709,11 @@ class AgentRuntime:
                                 "Stopping to preserve results."
                             ),
                             "detector": "token_budget",
+                            "budget_exceeded": True,
+                            "budget_source": budget_source,
+                            "current": budget_current,
+                            "max_allowed": budget_max,
+                            "unattended_useless": True,
                         },
                         agent_id=agent_id,
                     )
@@ -1811,12 +1961,32 @@ class AgentRuntime:
                     _hist_assistant: Dict[str, Any] = {"role": "assistant", "content": final_text}
                     if sug_list:
                         _hist_assistant["suggested_questions"] = list(sug_list)
+                    try:
+                        from agenticx.studio.references import turn_reference_payload
+
+                        _ref_payload = turn_reference_payload(session)
+                        if _ref_payload.get("references"):
+                            _hist_assistant["references"] = list(_ref_payload["references"])
+                        if _ref_payload.get("searched_queries"):
+                            _hist_assistant["searched_queries"] = list(_ref_payload["searched_queries"])
+                    except Exception:
+                        pass
                     session.chat_history.append(_hist_assistant)
                 await self.hooks.run_on_agent_end(final_text, session)
                 _um = usage_metadata_from_llm_response(response)
                 _final_data: dict[str, Any] = {"text": final_text}
                 if sug_list:
                     _final_data["suggested_questions"] = list(sug_list)
+                try:
+                    from agenticx.studio.references import turn_reference_payload
+
+                    _ref_payload = turn_reference_payload(session)
+                    if _ref_payload.get("references"):
+                        _final_data["references"] = list(_ref_payload["references"])
+                    if _ref_payload.get("searched_queries"):
+                        _final_data["searched_queries"] = list(_ref_payload["searched_queries"])
+                except Exception:
+                    pass
                 if _um:
                     _final_data["usage_metadata"] = {
                         **_um,
@@ -2291,8 +2461,28 @@ class AgentRuntime:
                         status_query_total = max(0, status_query_total - 1)
                         repeated_status_query_count = 0
                 result = await self.hooks.run_after_tool_call(tool_name, result, session)
-                result = _maybe_persist_large_tool_result(session, tool_call_id, tool_name, str(result))
-                result = self.compactor.micro_compact_tool_result(tool_name, str(result))
+                budget_cfg = load_tool_result_budget_config()
+                raw_result = str(result)
+                rclass = get_result_class(tool_name, raw_result)
+                archive_path = None
+                if rclass in {"large", "blob"} or approx_tokens(raw_result) >= budget_cfg.large_threshold_tokens:
+                    archive_path = archive_tool_result(
+                        session,
+                        round_idx=round_idx,
+                        tool_call_id=tool_call_id,
+                        tool_name=tool_name,
+                        content=raw_result,
+                        cfg=budget_cfg,
+                    )
+                result = self.compactor.micro_compact_tool_result(tool_name, raw_result)
+                record_tool_result_meta(
+                    session,
+                    round_idx=round_idx,
+                    tool_call_id=tool_call_id,
+                    tool_name=tool_name,
+                    content=raw_result,
+                    archive_path=archive_path,
+                )
                 # Learning counters for SessionReviewHook threshold checks
                 session._total_tool_calls = getattr(session, "_total_tool_calls", 0) + 1
                 if tool_name == "skill_manage":
@@ -2437,9 +2627,25 @@ class AgentRuntime:
                 self._tools_since_persist += 1
                 self._maybe_mid_turn_persist()
 
+                _tool_result_data: dict[str, Any] = {
+                    "name": tool_name,
+                    "result": result,
+                    "tool_call_id": tool_call_id,
+                }
+                try:
+                    from agenticx.studio.references import structured_payload_for_tool_result
+
+                    _structured = structured_payload_for_tool_result(
+                        session, tool_name, arguments, result
+                    )
+                    if _structured:
+                        _tool_result_data["structured"] = _structured
+                except Exception:
+                    pass
+
                 yield RuntimeEvent(
                     type=EventType.TOOL_RESULT.value,
-                    data={"name": tool_name, "result": result, "tool_call_id": tool_call_id},
+                    data=_tool_result_data,
                     agent_id=agent_id,
                 )
 
@@ -2540,6 +2746,12 @@ class AgentRuntime:
                         agent_id=agent_id,
                     )
                     return
+
+            _inject_pending_visual_attachments(
+                session,
+                messages,
+                is_system_trigger=_is_system_trigger,
+            )
 
         message = (
             "已达到最大工具调用轮数，已暂停自动执行。"

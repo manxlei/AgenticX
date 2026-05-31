@@ -64,6 +64,7 @@ from agenticx.memory.session_store import SessionStore, session_fts_enabled
 from agenticx.runtime import AsyncConfirmGate
 from agenticx.runtime.team_manager import AgentTeamManager, SubAgentContext
 from agenticx.utils.atomic_writer import atomic_write_json
+from agenticx.studio.session_event_hub import SessionEventHub
 
 EventEmitter = Callable[[Any], Awaitable[None]]
 SummarySink = Callable[[str, SubAgentContext], Awaitable[None]]
@@ -104,6 +105,7 @@ class ManagedSession:
     archived: bool = False
     taskspaces: list[dict[str, str]] = field(default_factory=list)
     execution_state: str = "idle"  # idle | running | interrupted | failed
+    event_hub: SessionEventHub | None = None
 
     def get_confirm_gate(self, agent_id: str = "meta") -> AsyncConfirmGate:
         if not agent_id or agent_id == "meta":
@@ -216,6 +218,35 @@ class SessionManager:
         if managed is not None:
             managed.execution_state = state
             managed.updated_at = time.time()
+            if state in {"idle", "interrupted", "failed"}:
+                self.clear_event_hub(session_id)
+
+    def ensure_event_hub(self, session_id: str) -> SessionEventHub:
+        managed = self.get(session_id, touch=False)
+        if managed is None:
+            raise KeyError(f"unknown session_id: {session_id}")
+        hub = managed.event_hub
+        if hub is None or hub.is_closed or hub.is_runtime_done:
+            managed.event_hub = SessionEventHub(session_id)
+        return managed.event_hub
+
+    def get_event_hub(self, session_id: str) -> SessionEventHub | None:
+        managed = self._sessions.get(session_id)
+        if managed is None:
+            return None
+        hub = managed.event_hub
+        if hub is None or hub.is_closed:
+            return None
+        return hub
+
+    def clear_event_hub(self, session_id: str) -> None:
+        managed = self._sessions.get(session_id)
+        if managed is None:
+            return
+        hub = managed.event_hub
+        if hub is not None:
+            hub.close()
+        managed.event_hub = None
 
     def _normalize_execution_state_for_listing(self, session_id: str, state: Any) -> str:
         """Normalize execution_state for session list display.
@@ -317,6 +348,9 @@ class SessionManager:
         existed_in_persistence = self._session_exists_in_persistence(sid)
         managed = self._sessions.pop(sid, None)
         if managed is not None:
+            if managed.event_hub is not None:
+                managed.event_hub.close()
+                managed.event_hub = None
             if managed.team_manager is not None:
                 managed.team_manager.shutdown_now()
             # MCP hub is global; do NOT kill child processes on session delete.
@@ -335,8 +369,9 @@ class SessionManager:
             if avatar_id and getattr(managed, "avatar_id", None) != avatar_id:
                 continue
             hist = getattr(managed.studio_session, "chat_history", None) or []
-            # 之前跳过 len(hist)==0 会把「刚创建、尚未写入首条消息」的会话从列表里藏起来，
-            # 桌面历史侧栏无法立刻显示当前会话；保留空会话条目以便 UI 及时对齐。
+            # Lazy-create UX: hide memory-only shells until the user sends at least one message.
+            if not self._session_has_listable_chat_history(hist):
+                continue
             seen_session_ids.add(sid)
             result.append({
                 "session_id": sid,
@@ -370,6 +405,35 @@ class SessionManager:
             )
             result.append(row)
             seen_session_ids.add(sid)
+        if result:
+            session_ids = [
+                str(row.get("session_id", "")).strip()
+                for row in result
+                if str(row.get("session_id", "")).strip()
+            ]
+            indexed_message_ts = self._session_store._max_message_timestamps_sync(session_ids)
+            summary_activity_ts = self._session_store._recover_activity_from_summaries_bulk_sync(
+                session_ids
+            )
+            for row in result:
+                sid = str(row.get("session_id", "")).strip()
+                managed = self._sessions.get(sid)
+                chat_history = (
+                    getattr(managed.studio_session, "chat_history", None) if managed else None
+                )
+                disk_message_ts = 0.0
+                if managed is None:
+                    disk_message_ts = self._last_message_activity_from_disk(sid)
+                row["updated_at"] = self._resolve_list_activity_at(
+                    chat_history=chat_history,
+                    metadata_updated_at=float(row.get("updated_at") or 0),
+                    metadata_created_at=float(row.get("created_at") or 0),
+                    indexed_message_ts=float(indexed_message_ts.get(sid, 0) or 0),
+                    metadata_last_activity_at=float(row.get("last_activity_at") or 0),
+                    disk_message_ts=disk_message_ts,
+                    summary_activity_ts=float(summary_activity_ts.get(sid, 0) or 0),
+                    live_touch_at=float(managed.updated_at) if managed is not None else 0.0,
+                )
         result.sort(
             key=lambda row: (
                 1 if row.get("pinned") else 0,
@@ -709,7 +773,10 @@ class SessionManager:
         for sid, each in self._sessions.items():
             if self._taskspace_scope_key_for_managed(each) != scope_key:
                 continue
-            each.updated_at = time.time()
+            # Persist the new taskspace list but do NOT bump updated_at: workspace
+            # mutations are scope-level config changes, not session activity. Touching
+            # updated_at here would bulk-pollute Today bucketing for all sibling
+            # sessions (see plan 2026-05-28-near-history-bucket-taskspace-pollution).
             self._persist_session_state(sid, each.studio_session)
         return dict(taskspace)
 
@@ -730,7 +797,8 @@ class SessionManager:
         for sid, each in self._sessions.items():
             if self._taskspace_scope_key_for_managed(each) != scope_key:
                 continue
-            each.updated_at = time.time()
+            # See add_taskspace: workspace mutation must not bump updated_at,
+            # otherwise every sibling session would be shoved into Today.
             self._persist_session_state(sid, each.studio_session)
         return True
 
@@ -874,6 +942,15 @@ class SessionManager:
             if first:
                 managed.session_name = self._build_auto_title(first)
         managed.created_at = self._to_float(metadata.get("created_at"), managed.created_at)
+        # Restore last-activity timestamp from persisted metadata so the desktop
+        # history panel can correctly bucket sessions into Today / Previous 7 days
+        # after restart or on-demand reload. Without this, ManagedSession defaults
+        # to time.time() and every loaded session looks like it was just active.
+        restored_updated_at = self._to_float(metadata.get("updated_at"), 0.0)
+        if restored_updated_at > 0:
+            managed.updated_at = restored_updated_at
+        elif managed.created_at > 0:
+            managed.updated_at = managed.created_at
         managed.pinned = bool(metadata.get("pinned", False))
         managed.archived = bool(metadata.get("archived", False))
         managed.taskspaces = self._sanitize_taskspaces(session_id, metadata.get("taskspaces"))
@@ -908,6 +985,13 @@ class SessionManager:
             self._session_store._save_scratchpad_sync(session_id, scratchpad)
             summary = self._build_session_summary(session)
             managed_ref = self._sessions.get(session_id)
+            metadata_updated_at = float(getattr(managed_ref, "updated_at", time.time()) or time.time())
+            metadata_created_at = float(getattr(managed_ref, "created_at", time.time()) or time.time())
+            last_activity_at = self._resolve_list_activity_at(
+                chat_history=getattr(session, "chat_history", None),
+                metadata_updated_at=metadata_updated_at,
+                metadata_created_at=metadata_created_at,
+            )
             metadata = {
                 "provider": session.provider_name or "",
                 "model": session.model_name or "",
@@ -916,8 +1000,9 @@ class SessionManager:
                 "session_name": getattr(managed_ref, "session_name", None),
                 "avatar_id": getattr(managed_ref, "avatar_id", None),
                 "avatar_name": getattr(managed_ref, "avatar_name", None),
-                "created_at": getattr(managed_ref, "created_at", time.time()),
-                "updated_at": getattr(managed_ref, "updated_at", time.time()),
+                "created_at": metadata_created_at,
+                "updated_at": metadata_updated_at,
+                "last_activity_at": last_activity_at,
                 "pinned": bool(getattr(managed_ref, "pinned", False)),
                 "archived": bool(getattr(managed_ref, "archived", False)),
                 "taskspaces": list(getattr(managed_ref, "taskspaces", []) or []),
@@ -940,6 +1025,13 @@ class SessionManager:
 
     def _save_messages_snapshot(self, session_id: str, messages: list[dict]) -> None:
         path = self._messages_path(session_id)
+        # Stamp ms-epoch timestamp on messages missing one (in-memory + disk).
+        now_ms = int(time.time() * 1000)
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            if not item.get("timestamp"):
+                item["timestamp"] = now_ms
         atomic_write_json(path, messages)
 
     def _load_messages_snapshot(self, session_id: str) -> list[dict]:
@@ -1132,6 +1224,38 @@ class SessionManager:
                     row["suggested_questions"] = [
                         str(x).strip() for x in raw_sq[:5] if str(x).strip()
                     ]
+                raw_refs = item.get("references")
+                if isinstance(raw_refs, list) and raw_refs:
+                    clean_refs: list[dict[str, Any]] = []
+                    for ref in raw_refs[:50]:
+                        if not isinstance(ref, dict):
+                            continue
+                        rid = ref.get("id")
+                        title = str(ref.get("title", "") or "").strip()
+                        url = str(ref.get("url", "") or "").strip()
+                        if not title and not url:
+                            continue
+                        entry: dict[str, Any] = {
+                            "id": int(rid) if rid is not None else len(clean_refs) + 1,
+                            "title": title or url,
+                            "url": url,
+                            "snippet": str(ref.get("snippet", "") or "").strip()[:240],
+                            "source": str(ref.get("source", "") or "web").strip() or "web",
+                        }
+                        provider = str(ref.get("provider", "") or "").strip()
+                        domain = str(ref.get("domain", "") or "").strip()
+                        if provider:
+                            entry["provider"] = provider
+                        if domain:
+                            entry["domain"] = domain
+                        clean_refs.append(entry)
+                    if clean_refs:
+                        row["references"] = clean_refs
+                raw_queries = item.get("searched_queries")
+                if isinstance(raw_queries, list) and raw_queries:
+                    row["searched_queries"] = [
+                        str(x).strip() for x in raw_queries[:20] if str(x).strip()
+                    ]
             normalized.append(row)
         return normalized
 
@@ -1181,7 +1305,109 @@ class SessionManager:
         if not first:
             return
         managed.session_name = self._build_auto_title(first)
-        managed.updated_at = time.time()
+
+    @staticmethod
+    def _session_has_listable_chat_history(chat_history: list | None) -> bool:
+        """True when the session has at least one visible user/assistant message."""
+        for item in chat_history or []:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip().lower()
+            if role not in {"user", "assistant"}:
+                continue
+            if str(item.get("content", "")).strip():
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_epoch_seconds(value: Any) -> float:
+        try:
+            ts = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if ts <= 0:
+            return 0.0
+        if ts > 1e11:
+            ts /= 1000.0
+        return ts
+
+    @classmethod
+    def _last_message_activity_from_history(cls, chat_history: list | None) -> float:
+        best = 0.0
+        for item in chat_history or []:
+            if not isinstance(item, dict):
+                continue
+            for key in ("timestamp", "created_at", "ts"):
+                ts = cls._normalize_epoch_seconds(item.get(key))
+                if ts > best:
+                    best = ts
+        return best
+
+    def _last_message_activity_from_disk(self, session_id: str) -> float:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0.0
+        path = self._messages_path(sid)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return 0.0
+        cached = getattr(self, "_disk_activity_cache", {}).get(sid)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        activity = self._last_message_activity_from_history(self._load_messages_snapshot(sid))
+        cache = getattr(self, "_disk_activity_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_disk_activity_cache", cache)
+        cache[sid] = (mtime, activity)
+        return activity
+
+    @classmethod
+    def _resolve_list_activity_at(
+        cls,
+        *,
+        chat_history: list | None,
+        metadata_updated_at: float,
+        metadata_created_at: float,
+        indexed_message_ts: float = 0.0,
+        metadata_last_activity_at: float = 0.0,
+        disk_message_ts: float = 0.0,
+        summary_activity_ts: float = 0.0,
+        live_touch_at: float = 0.0,
+    ) -> float:
+        """Pick the best last-activity timestamp for session list bucketing."""
+        message_based = max(
+            cls._last_message_activity_from_history(chat_history),
+            cls._normalize_epoch_seconds(indexed_message_ts),
+            cls._normalize_epoch_seconds(disk_message_ts),
+        )
+        touch_at = cls._normalize_epoch_seconds(live_touch_at)
+        if message_based > 0:
+            # Real chat timestamps are the source of truth. We deliberately ignore
+            # touch_at here even when it's larger, because historically taskspace
+            # mutations and other non-activity code paths bulk-bumped updated_at
+            # and shoved unrelated sessions into Today. The "just sent, no message
+            # written yet" case is covered by the frontend sessionHistoryHints
+            # optimistic bump, not by touch_at on the backend.
+            return message_based
+        summary_based = cls._normalize_epoch_seconds(summary_activity_ts)
+        if summary_based > 0:
+            if touch_at > summary_based:
+                return touch_at
+            return summary_based
+        meta_last = cls._normalize_epoch_seconds(metadata_last_activity_at)
+        if meta_last > 0:
+            if touch_at > meta_last:
+                return touch_at
+            return meta_last
+        if touch_at > 0:
+            return touch_at
+        if metadata_updated_at > 0:
+            return metadata_updated_at
+        if metadata_created_at > 0:
+            return metadata_created_at
+        return 0.0
 
     def _build_fork_name(self, base_name: Optional[str]) -> str:
         text = str(base_name or "").strip()
@@ -1238,6 +1464,7 @@ class SessionManager:
                 continue
             created_at = self._to_float(metadata.get("created_at"), self._iso_to_epoch(item.get("created_at")))
             updated_at = self._to_float(metadata.get("updated_at"), self._iso_to_epoch(item.get("created_at")))
+            last_activity_at = self._to_float(metadata.get("last_activity_at"), updated_at)
             rows.append(
                 {
                     "session_id": sid,
@@ -1246,6 +1473,7 @@ class SessionManager:
                     "session_name": self._sanitize_session_name(metadata.get("session_name")),
                     "updated_at": updated_at,
                     "created_at": created_at,
+                    "last_activity_at": last_activity_at,
                     "pinned": bool(metadata.get("pinned", False)),
                     "archived": bool(metadata.get("archived", False)),
                     "execution_state": str(metadata.get("execution_state", "idle") or "idle"),

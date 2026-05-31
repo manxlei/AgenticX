@@ -1,15 +1,15 @@
 {
   "name": "agenticx-desktop",
-  "version": "0.2.0",
+  "version": "0.2.4",
   "private": true,
-  "description": "Machi - AgenticX Desktop",
+  "description": "Near — AgenticX Desktop",
   "author": "DemonDamon",
-  "productName": "Machi",
+  "productName": "Near",
   "main": "dist-electron/main.js",
   "scripts": {
-    "dev": "concurrently \"vite\" \"tsc -p electron/tsconfig.json --watch\" \"wait-on tcp:5173 dist-electron/main.js && electron .\"",
+    "dev": "node -e \"try{require('fs').copyFileSync('electron/splash.html','dist-electron/splash.html')}catch(e){}\" && concurrently \"vite\" \"tsc -p electron/tsconfig.json --watch\" \"wait-on tcp:5173 dist-electron/main.js && electron .\"",
     "icons:sync": "bash ./scripts/sync-icons.sh",
-    "build": "vite build && tsc -p electron/tsconfig.json",
+    "build": "vite build && tsc -p electron/tsconfig.json && cp electron/splash.html dist-electron/splash.html",
     "start": "electron .",
     "build:mac": "npm run build && electron-builder --mac",
     "build:mac:arm64": "npm run build && electron-builder --mac --arm64",
@@ -39,6 +39,7 @@
     "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0",
+    "undici": "^6.26.0",
     "whisper-wasm": "^0.0.1",
     "zustand": "^5.0.3"
   },

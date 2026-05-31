@@ -1,9 +1,10 @@
 /**
- * Stall detection thresholds and helpers for long-running Machi tasks.
+ * Stall detection thresholds and helpers for long-running Near tasks.
  */
 
 import type { ParsedTodo, TodoItem } from "../components/TodoUpdateCard";
 import type { Message } from "../store";
+import { assistantBodyText, looksLikeUnfinishedAssistantBody } from "./budget-incomplete-message";
 
 /** Default stall warning threshold (seconds) — overridable via Settings → 工具 → 长任务停滞与续跑. */
 export const DEFAULT_STALL_DETECT_SILENCE_SECONDS = 90;
@@ -35,9 +36,10 @@ export type StallPhase = "none" | "stall" | "exhausted";
 export function messageLooksLikeAssistantFinal(message: Message | undefined): boolean {
   if (!message) return false;
   if (message.role !== "assistant") return false;
-  const content = String(message.content ?? "").trim();
-  if (!content) return false;
   if (message.id === "__stream__") return false;
+  const content = assistantBodyText(message);
+  if (!content) return false;
+  if (looksLikeUnfinishedAssistantBody(content)) return false;
   return true;
 }
 
@@ -45,7 +47,9 @@ export function messageLooksLikeAssistantFinal(message: Message | undefined): bo
 export function shouldAllowStallAutoNudge(
   stallState: StallPhase,
   executionState: string | undefined,
+  budgetExceeded = false,
 ): boolean {
+  if (budgetExceeded) return false;
   if (stallState !== "stall") return false;
   const state = (executionState || "").trim();
   return state === "running" || state === "interrupted" || state === "idle";
@@ -54,22 +58,37 @@ export function shouldAllowStallAutoNudge(
 /**
  * Align sticky task bar with session execution: when the agent is no longer
  * running but todo_write still has in_progress, stop ghost spinners.
+ *
+ * Engineering fallback for "model forgot to call todo_write at the end":
+ * when `promotePending` is true (caller has verified the agent continued
+ * working after the last todo snapshot AND produced a complete final
+ * assistant reply), residual `pending` items are also promoted to
+ * `completed`. This prevents the sticky bar from being stuck at e.g. 1/2
+ * after the agent actually delivered everything but skipped the closing
+ * todo update.
  */
 export function resolveStickyTodoDisplay(
   parsed: ParsedTodo,
   liveness: "active" | "stalled" | "idle",
-  executionState?: string
+  executionState?: string,
+  opts?: { promotePending?: boolean }
 ): ParsedTodo {
   if (liveness === "active" || liveness === "stalled") {
     return parsed;
   }
   const state = (executionState || "").trim();
+  const promotePending = !!opts?.promotePending && state !== "interrupted";
   const items: TodoItem[] = parsed.items.map((item) => {
-    if (item.status !== "in_progress") return item;
-    if (state === "interrupted") {
-      return { ...item, status: "pending" };
+    if (item.status === "in_progress") {
+      if (state === "interrupted") {
+        return { ...item, status: "pending" };
+      }
+      return { ...item, status: "completed" };
     }
-    return { ...item, status: "completed" };
+    if (item.status === "pending" && promotePending) {
+      return { ...item, status: "completed" };
+    }
+    return item;
   });
   const completed = items.filter((item) => item.status === "completed").length;
   const total = parsed.total > 0 ? parsed.total : items.length;

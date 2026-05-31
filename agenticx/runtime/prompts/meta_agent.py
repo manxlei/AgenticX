@@ -15,6 +15,10 @@ from agenticx.cli.studio import StudioSession
 from agenticx.cli.studio_skill import get_all_skill_summaries
 from agenticx.skills.meta_skill import MetaSkillInjector
 from agenticx.runtime.prompts.code_mode import build_code_dev_prompt_blocks
+from agenticx.runtime.prompts.credential_safety import (
+    CREDENTIAL_SAFETY_BLOCK,
+    CREDENTIAL_SAFETY_MCP_HINT,
+)
 from agenticx.workspace.loader import load_workspace_context
 
 
@@ -474,7 +478,8 @@ def _build_kb_retrieval_policy_block() -> str:
         f"- 当前检索模式：`{mode}`；默认 Top-K：`{top_k}`。{mode_hint}\n"
         f"- 除非用户显式指定，优先省略 `top_k` 参数，让系统自动采用默认 Top-K={top_k}。\n"
         "- 返回 JSON 形如 `{ok, hits:[{id,score,text,source:{uri,title,chunk_index}}], used_top_k, source:'local'}`。\n"
-        "- 回答必须基于 `hits[].text` 给出，并在结尾用行内引用格式标注来源（例如：“根据 `notes.md` 第 3 段…”）。若 `hits` 为空，明确告知用户未在知识库命中，并询问是否需要兜底到一般知识。\n"
+        "- 回答必须基于 `hits[].text` 给出，并在句末用 `[N]` 标注来源编号（N 与本轮 references id 对应）。若 `hits` 为空，明确告知用户未在知识库命中，并询问是否需要兜底到一般知识。\n"
+        "- 多来源并列：`[1][2]`；不要造 `【1】`、`(来源 1)`、`[来源1]` 等变体。\n"
         "- 不要把 `hits` 原始 JSON 复读给用户；只呈现有用片段与来源。\n"
         "- 与记忆的边界：长期文档资料走 `knowledge_search`；个人偏好/动作项走 `memory_search`/`memory_append`，不要混用。\n\n"
     )
@@ -502,7 +507,26 @@ def _build_web_search_capability_block() -> str:
         "## 联网搜索\n"
         "- 你 **内置** `web_search` 工具，可检索公开网页，获取最新资讯、实时数据、以及超出你知识截止日期的信息。\n"
         "- 当用户问题明显依赖时效性、当前事实或外部网页时，应 **主动** 调用 `web_search`，无需用户额外开启开关。\n"
-        "- 需要登录态、复杂页面交互或深度正文提取时，仍可依据 MCP 章节使用已连接的 browser-use / firecrawl 等能力。\n\n"
+        "- 需要登录态、复杂页面交互或深度正文提取时，仍可依据 MCP 章节使用已连接的 browser-use / firecrawl 等能力。\n"
+        "## 引用规范\n"
+        "- 每条来自 `web_search` / `knowledge_search` 的事实，必须在句末用 `[N]` 标注来源编号，N 与本轮返回的 references id 对应。\n"
+        "- 多来源并列：`[1][2]`。\n"
+        "- 不要造 `【1】`、`(来源 1)`、`[来源1]` 等变体；不要在角标前后加多余空格。\n"
+        "- 模型自身常识不需要角标。\n\n"
+    )
+
+
+def _build_url_vision_capability_block() -> str:
+    """Describe built-in web_fetch + view_image workflow for URL visual tasks."""
+    return (
+        "## URL content and visual inspection\n"
+        "- When the user provides a URL whose content matters, prefer `web_fetch(url=...)` to "
+        "retrieve the page text plus its `[discovered_images]` list.\n"
+        "- If visual analysis is required (e.g. user asks about an image, cover, screenshot), "
+        "follow up with `view_image(target=...)` using either an image URL from "
+        "`[discovered_images]`, a local file path produced by other tools, or a `data:image/*` URL.\n"
+        "- Only call `view_image` when visual content is necessary to answer; do not "
+        "preemptively view every image. Each turn caps total visual attachments at 4.\n\n"
     )
 
 
@@ -657,6 +681,7 @@ def build_meta_agent_system_prompt(
         "- `mcp_call` 参数对象字段应使用 `arguments`（兼容 `args`）；调用前先核对目标工具所需字段。\n"
         "- 若存在配置但未连接，先明确告知用户需在 MCP 管理接口完成连接。\n"
         "- 若用户明确提供外部 mcp.json 路径，先调用 `mcp_import` 导入，再连接。\n"
+        f"{CREDENTIAL_SAFETY_MCP_HINT}"
         "- MCP 连接失败时，要求子智能体进入闭环：读取错误 -> 诊断原因 -> 执行修复 -> 重试连接（最多 3 轮）。\n"
         "- 修复优先级：依赖缺失、命令路径错误、环境变量缺失、配置字段错误。\n"
         "- 向用户汇报时必须给出可验证结果：已连接服务器名、可用工具数量、失败原因与下一步建议。\n"
@@ -690,21 +715,23 @@ def build_meta_agent_system_prompt(
         "- 修复棘手错误或发现非显然工作流后，主动提议保存为 skill。\n"
         "- 创建/删除 skill 前需与用户确认。\n"
         "- 简单的一次性任务无需保存。\n\n"
-        "## skill_manage 使用规范（必须遵守）\n"
-        "- 安装/创建 skill 时，必须调用 `skill_manage` 工具，**所有参数必须在同一次调用中完整填写，禁止发出空参数 `{}`**。\n"
-        "- create 操作必须同时提供三个字段：`action='create'`、`name=<skill目录名>`、`content=<完整SKILL.md文本>`。\n"
+        "## skill_manage / skill_import_repo 使用规范（必须遵守）\n"
+        "- 安装/创建 skill 时，必须调用 `skill_manage` 或批量时使用 `skill_import_repo`，**所有参数必须在同一次调用中完整填写，禁止发出空参数 `{}`**。\n"
+        "- **单包 / 小文件 create**：`action='create'`、`name=<skill目录名>`、`content=<完整SKILL.md文本>`（仅当 SKILL.md 足够小）。\n"
+        "- **大文件 / bulk create**：禁止把 SKILL.md 全文塞进 `content` 经 LLM context 中转。优先：\n"
+        "  - `skill_import_repo(repo='owner/name', dry_run=true)` 预览 → `skill_import_repo(..., dry_run=false)` 一次安装；或\n"
+        "  - `skill_manage(action='create', name=..., from_url=<raw.githubusercontent.com/.../SKILL.md>)`；或\n"
+        "  - `bash_exec` 下载到本地后 `skill_manage(from_path=<绝对路径>)`。\n"
         "- SKILL.md 内容必须以 YAML frontmatter 开头：`---\\nname: <名称>\\ndescription: <描述>\\n---`，后接技能正文。\n"
-        "- skill 名称规则：只含字母/数字/连字符/下划线，支持子路径如 `ima/notes`，禁止空格和前导点。\n"
-        "- 安装流程（用户给出 ZIP 包 URL 时）：\n"
-        "  1. `bash_exec`: 下载并解压 ZIP，找到 SKILL.md 文件路径。\n"
-        "  2. `file_read`: 读取 SKILL.md 全文内容到变量。\n"
-        "  3. `skill_manage(action='create', name=<名称>, content=<读到的内容>)`: 完整一次调用，不得拆开。\n"
+        "- skill 名称规则：只含字母/数字/连字符/下划线，支持子路径如 `engineering/tdd`，禁止空格和前导点。\n"
+        "- ZIP 单包安装：`bash_exec` 下载解压 → `skill_manage(from_path=...)` 或 `from_url`，**不要** `file_read` 全文再 `content=`。\n"
         "- **禁止在 `<think>` 里想好参数后发空调用**；若上一次 skill_manage 报参数缺失，必须重新构造完整参数重试，不得再次发空。\n\n"
         "- 若用户提到“上报 bug/发邮件给团队”，先确认是否发送，再调用 `send_bug_report_email`；若邮箱未配置，先指导配置 notifications.email.*。\n\n"
         "## 配置安全红线（必须遵守）\n"
         "- 严禁通过 `file_write` / `file_edit` 直接修改 `~/.agenticx/config.yaml`。\n"
         "- 当用户要求“帮我配置邮箱”时，只能调用 `update_email_config`，且仅允许写入 notifications.email.* 白名单字段。\n"
         "- 禁止修改 provider/model/mcp/权限策略等非邮件配置项；如用户有此诉求，必须先解释风险并征求明确确认。\n\n"
+        f"{CREDENTIAL_SAFETY_BLOCK}\n"
         "## 记忆管理（重要）\n"
         "- 当用户说\u201c帮我记住/记一下/remember/保存这个信息\u201d时，**必须**调用 `memory_append(target='long_term', content='...')` 将信息写入持久记忆。\n"
         "- 禁止把用户要求记住的信息写到随意文件（如 ~/xxx.md）；所有记忆必须通过 `memory_append` 写入 workspace 索引范围内。\n"
@@ -713,6 +740,7 @@ def build_meta_agent_system_prompt(
         "- 需要回忆历史信息时，调用 `memory_search(query='...')` 查询。\n\n"
         f"{kb_retrieval_block}"
         f"{_build_web_search_capability_block()}"
+        f"{_build_url_vision_capability_block()}"
         f"{_build_followup_questions_block()}"
         "## 子智能体完成后的主动汇报（关键）\n"
         "- 当「当前子智能体状态」或「历史子智能体结果」中出现 completed 或 failed 的子智能体，你 **必须在本轮回复中主动汇报**，包括：\n"

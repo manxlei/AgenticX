@@ -113,16 +113,52 @@ else
   echo "[start-dev] skip auto migration (AGX_AUTO_DB_MIGRATE=$AUTO_MIGRATE)."
 fi
 
-# 4) 子进程管理
+# 4) 子进程管理（Ctrl+C 须能一次退出；turbo/next 会起多层子进程，只 kill 父 PID 不够）
 PIDS=()
+SHUTTING_DOWN=0
+
+kill_process_tree() {
+  local pid="$1"
+  local child
+  kill -0 "$pid" 2>/dev/null || return 0
+  while IFS= read -r child; do
+    [ -n "$child" ] && kill_process_tree "$child"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  kill -TERM "$pid" 2>/dev/null || true
+}
+
+force_kill_process_tree() {
+  local pid="$1"
+  local child
+  kill -0 "$pid" 2>/dev/null || return 0
+  while IFS= read -r child; do
+    [ -n "$child" ] && force_kill_process_tree "$child"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  kill -KILL "$pid" 2>/dev/null || true
+}
+
 cleanup() {
-  echo; echo "[start-dev] stopping services..."
+  if [ "$SHUTTING_DOWN" -eq 1 ]; then
+    for pid in "${PIDS[@]:-}"; do
+      force_kill_process_tree "$pid"
+    done
+    exit 130
+  fi
+  SHUTTING_DOWN=1
+  trap - INT TERM EXIT
+  echo
+  echo "[start-dev] stopping services... (再按一次 Ctrl+C 强制结束)"
   for pid in "${PIDS[@]:-}"; do
-    kill "$pid" 2>/dev/null || true
+    kill_process_tree "$pid"
+  done
+  sleep 0.5
+  for pid in "${PIDS[@]:-}"; do
+    force_kill_process_tree "$pid"
   done
   wait 2>/dev/null || true
+  exit 130
 }
-trap cleanup INT TERM EXIT
+trap cleanup INT TERM
 
 wait_for_http() {
   local label="$1"
@@ -140,32 +176,44 @@ wait_for_http() {
 }
 
 # 5) 先拉起 Next 应用（gateway 依赖 admin internal API，须 admin 就绪后再启 gateway）
-TURBO_ARGS=(run dev "--ui=$TURBO_UI")
+# 用 pnpm --parallel + --filter，不用 turbo run dev：本机若 clone 了 customers/*，
+# pnpm workspace 会链到 enterprise 目录外，turbo 2.9+ discovery 会直接失败。
+PNPM_DEV_FILTERS=(
+  --filter=@agenticx/app-web-portal
+  --filter=@agenticx/app-admin-console
+)
 if [ "$ALL_APPS" -eq 0 ]; then
-  TURBO_ARGS+=(
-    --filter=@agenticx/app-web-portal
-    --filter=@agenticx/app-admin-console
-  )
   SCOPE="enterprise only (web-portal :3000 + admin-console :3001)"
 else
+  PNPM_DEV_FILTERS+=(
+    --filter=@customer-hechuang/portal
+    --filter=@customer-hechuang/admin
+  )
   SCOPE="ALL workspace apps (enterprise + customers/*)"
 fi
 
 echo "[start-dev] booting Next apps → $SCOPE"
+if [ "$TURBO_UI" = "tui" ]; then
+  echo "[start-dev] 提示：pnpm parallel 无 Turbo TUI；要看纯日志可加 --ui=stream（行为相同）。"
+fi
 (
   cd "$ENTERPRISE_DIR"
-  exec pnpm exec turbo "${TURBO_ARGS[@]}"
+  exec pnpm "${PNPM_DEV_FILTERS[@]}" --parallel dev
 ) &
 PIDS+=("$!")
 
-wait_for_http "admin-console" "http://127.0.0.1:3001" 90 || true
-wait_for_http "web-portal" "http://127.0.0.1:3000" 90 || true
+# 根路径 / 会 307 重定向，curl -f 可能判失败；用稳定 200 页面探活
+wait_for_http "admin-console" "http://127.0.0.1:3001/login" 90 || true
+wait_for_http "web-portal" "http://127.0.0.1:3000/auth" 90 || true
 
 # 6) admin 就绪后再拉起 gateway（避免 policy/providers 远程拉取 connection refused）
+# Go 访问 https 上游时优先读 HTTP_PROXY/HTTPS_PROXY（大写）。macOS/Clash 常把大写指到
+# 7890、shell 小写指到 7897，导致 proxyconnect 127.0.0.1:7890 connection refused。
+# 仅对 gateway 子进程去掉失效的大写代理，保留小写 http_proxy/https_proxy（7897）。
 echo "[start-dev] booting gateway (:8088) ..."
 (
   cd "$ENTERPRISE_DIR/apps/gateway"
-  exec go run ./cmd/gateway
+  exec env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY go run ./cmd/gateway
 ) &
 PIDS+=("$!")
 
@@ -175,7 +223,7 @@ if ! wait_for_http "gateway" "${GATEWAY_BASE_URL:-http://127.0.0.1:8088}/healthz
 fi
 
 echo
-echo "[start-dev] all services launching. Ctrl+C 结束。"
+echo "[start-dev] all services launching. Ctrl+C 结束（约 1s 内退出；卡住可再按一次强制杀进程树）。"
 echo "  - web-portal    http://localhost:3000"
 echo "  - admin-console http://localhost:3001"
 echo "  - gateway       ${GATEWAY_BASE_URL:-http://127.0.0.1:8088}/healthz"
